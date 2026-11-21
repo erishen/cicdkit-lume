@@ -13,10 +13,15 @@ import "./store.lume" as store;
 
 let MARKERS = ["go.mod", "package.json", "requirements.txt", "pyproject.toml", "Pipfile", "setup.py", "pom.xml", "build.gradle", "Cargo.toml"];
 
-// read_file(目录) 给 null、files(不存在的目录) 给 []：目录存在性只能查父目录条目。
+// read_file(目录) 给 null、files(不存在的目录) 给 []，光这两条判不出目录是否存在；
+// 而「查父目录条目」在条目超过 1024 个的父目录里会漏（files() 有 1024 上限，
+// 无文档），实测 /var/folders/.../T 就是这种情况。
+// 所以顺序是：能读出内容 → 文件；自身有条目 → 目录；最后才回落到父目录条目
+// （只为兜住「空目录且父目录很干净」这种边角）。
 export func path_exists(path) {
   let s = str(path);
   if (read_file(s) != null) { return true; }
+  if (len(files(s)) > 0) { return true; }
   let parts = split(s, "/");
   if (len(parts) == 0) { return false; }
   let base = str(parts[len(parts) - 1]);

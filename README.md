@@ -249,6 +249,7 @@ curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm?secret=$CICD_HOOK_KEY" 
 - body 全部可选：`tag`（覆盖自动时间戳 tag）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）。
 - 成功返回 `202` 和 `run_id` —— 只是**受理**，进度照样去 `/api/runs/:id` 看。
 - 触发的是 `pipeline`（构建 + 部署），`trigger` 记为 `webhook`，方便在运行列表里区分人点还是机器点。
+- 自测：`scripts/test_gate.sh` 覆盖 503 / 401 / 404 / 400 四条拒绝路径（`CICD_HOOK_KEY=testkey` 起临时实例）。
 
 **建议**：对外暴露时把 webhook 单独走内网或加 `HTPASSWD_FILE`；密钥一旦泄漏，等于把「随时触发发布」的能力给了对方。发布本身仍受 `CICD_DEPLOY_APPROVAL` 约束吗？——**不受**：webhook 走 `jobs.start(..., "pipeline")` 与人工点「流水线」同一条路径，闸门只管 `/deploy`。需要更严时把 `method` 不传、只让它构建。
 
@@ -290,9 +291,12 @@ make docker-down
 
 ## 还没做 / 已知取舍
 
-- A2A 六端点、`/api/webhook/:id`、`/api/generate` 未实现（控制面已无 cicdkit 可转，
-  要做只能在本地重写）。
-- `tag_strategy=git-sha` 已放弃，统一时间戳 tag。
+- A2A 六端点（`/.well-known/agent-card.json`、`/a2a`、`/peer/health|tools|invoke|relay`）
+  未移植：它整套建立在 Go 侧的 peer 签名/白名单体系上（`CICDKIT_PEER_*`），Linux
+  进程间互调的语义搬进 lume 意义不大。需要 agent 互调时另起一个 lume 侧 peer 面。
+- `tag_strategy=git-sha` 已放弃，统一时间戳 tag（webhook 可用 body 的 `tag` 指定）。
+- `X-Webhook-Secret` 头不支持，密钥只走 query。
+- 生成器只补 Dockerfile 与 k8s 清单两类；nginx/静态站、compose 文件不生成。
 - 清空运行不会删日志文件，只清库记录。
 - `interrupted` 是新增的运行终态，旧 UI 不认它时按「失败」展示即可。
 

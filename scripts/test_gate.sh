@@ -172,6 +172,21 @@ expect_body '无法识别项目语言' "生成脚手架：错误说明原因"
 call POST "/api/projects/nope/generate?role=human_admin"
 expect_code 404 "生成脚手架：项目不存在"
 
+# 8.1) 真跑一次落盘：临时 go 项目 → 预览不写、apply 才写、二次幂等
+mkdir -p "$DATA/gate-src"
+printf 'module gate\n' > "$DATA/gate-src/go.mod"
+call POST "/api/projects?role=human_admin" '{"id":"gate-gen","name":"gate gen","build":{"context":"'"$DATA"'/gate-src"},"deploy":{"method":"local-k3s","container_port":8090}}'
+expect_code 200 "生成脚手架：准备 go 项目 → 200"
+call POST "/api/projects/gate-gen/generate?role=human_admin"
+expect_code 200 "生成脚手架：预览 → 200"
+expect_body '"needs_any":true' "生成脚手架：预览标出待补文件"
+if [ -f "$DATA/gate-src/Dockerfile" ]; then fail=$((fail+1)); echo "✗ 生成脚手架：预览不应落盘"; else ok "生成脚手架：预览不落盘"; fi
+call POST "/api/projects/gate-gen/generate?role=human_admin&apply=1"
+expect_code 200 "生成脚手架：apply → 200"
+if [ -f "$DATA/gate-src/Dockerfile" ] && [ -f "$DATA/gate-src/k8s/deployment.yaml" ]; then ok "生成脚手架：两个文件已落盘"; else fail=$((fail+1)); echo "✗ 生成脚手架：文件没写出来"; fi
+call POST "/api/projects/gate-gen/generate?role=human_admin"
+expect_body '"needs_any":false' "生成脚手架：二次调用幂等"
+
 # 9) 静态站
 call GET "/"
 expect_code 200 "静态：index.html 正常伺服"

@@ -339,6 +339,32 @@ function ProjectsPage({ role }: { role: string }) {
     }
   }
 
+  // 补脚手架：先预览，确认后才落盘（已有文件永不覆盖，所以可以放心点）
+  const scaffold = async (p: Project) => {
+    setBusy(p.id + ':generate')
+    setNotice(null)
+    try {
+      const plan = await API.generate(p.id, false, role)
+      if (!plan.needs_any) {
+        setNotice({ id: p.id, kind: 'ok', text: 'Dockerfile / 清单都已存在，无需补齐' })
+        return
+      }
+      const files: string[] = []
+      if (plan.dockerfile) files.push(plan.dockerfile.path)
+      if (plan.manifest) files.push(plan.manifest.path)
+      if (!window.confirm(`将为「${p.name}」生成：\n\n${files.join('\n')}\n\n已有文件不会被覆盖。继续？`)) {
+        return
+      }
+      await API.generate(p.id, true, role)
+      setNotice({ id: p.id, kind: 'ok', text: `已生成 ${files.length} 个文件` })
+      load()
+    } catch (e: any) {
+      setNotice({ id: p.id, kind: 'err', text: e.message || String(e) })
+    } finally {
+      setBusy('')
+    }
+  }
+
   const remove = async (p: Project) => {
     if (!window.confirm(`删除项目「${p.name}」？\n运行/部署历史会保留，但项目配置不可恢复。`)) return
     setBusy(p.id + ':delete')
@@ -455,6 +481,13 @@ function ProjectsPage({ role }: { role: string }) {
                     onClick={() => trigger(p, 'validate')}
                   >
                     {busy === p.id + ':validate' ? '校验中…' : '校验'}
+                  </button>
+                  <button
+                    className="btn ghost"
+                    disabled={busy !== ''}
+                    onClick={() => scaffold(p)}
+                  >
+                    {busy === p.id + ':generate' ? '生成中…' : '补脚手架'}
                   </button>
                   <button className="btn ghost" disabled={busy !== ''} onClick={() => setEditing(p)}>
                     编辑

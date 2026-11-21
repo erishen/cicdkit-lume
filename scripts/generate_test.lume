@@ -27,6 +27,15 @@ print("generate: language");
 ok("识别 go", generate.lang_of(ctx) == "go");
 ok("空目录 → unknown", generate.lang_of(base + "/nothing") == "unknown");
 
+print("generate: 目录存在性（父目录条目超过 files() 的 1024 上限）");
+let big = base + "/big";
+mkdir(big);
+let n = 0;
+while (n < 1050) { write_file(big + "/f" + str(n) + ".txt", "x"); n = n + 1; }
+mkdir(big + "/child");
+write_file(big + "/child/keep.txt", "x");
+ok("大父目录里的子目录仍判存在", generate.path_exists(big + "/child"));
+
 print("generate: dockerfile 模板");
 let df = generate.dockerfile_for("go");
 ok("go 模板多阶段", len(str_match("FROM golang:", df)) > 0 and len(str_match("CGO_ENABLED=0", df)) > 0);

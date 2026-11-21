@@ -293,6 +293,21 @@ export const API = {
       method: 'POST',
       body: JSON.stringify(body || {}),
     }),
+  // 补脚手架：不传 apply 只预览（返回要写的文件内容，不落盘）
+  generate: (id: string, apply: boolean, role?: string) =>
+    request<{
+      ok: boolean
+      err?: string
+      needs_any: boolean
+      dockerfile?: { path: string; content: string } | null
+      manifest?: { path: string; content: string } | null
+      config_updates?: Record<string, string>
+    }>(
+      `/api/projects/${encodeURIComponent(id)}/generate${apply ? '?apply=1' : ''}${
+        role ? (apply ? '&' : '?') + 'role=' + encodeURIComponent(role) : ''
+      }`,
+      { method: 'POST' },
+    ),
   deploy: (id: string, role: string, body?: unknown) =>
     request<unknown>(`/api/projects/${encodeURIComponent(id)}/deploy${roleQuery(role)}`, {
       method: 'POST',
