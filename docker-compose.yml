@@ -11,8 +11,11 @@ services:
   cicdkit-lume:
     build:
       context: .
+      # lume 二进制来源。本机默认取自编的 lume-bin:0.14.0（在 lume 仓库
+      # 用 `docker build --target lume-build` 产出，已含动态路由全走 worker
+      # 池与池指标）；想回到共享基座镜像：LUME_BIN_IMAGE=windgl-china-lume:latest。
       args:
-        LUME_BIN_IMAGE: ${LUME_BIN_IMAGE:-windgl-china-lume:latest}
+        LUME_BIN_IMAGE: ${LUME_BIN_IMAGE:-lume-bin:0.14.0}
     image: cicdkit-lume:dev
     container_name: cicdkit-lume
     ports:
