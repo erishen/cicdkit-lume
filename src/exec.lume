@@ -17,6 +17,7 @@
 //   3. helm 的 --set 顺序与 cicdkit 一致（helm_values 先，镜像键后）。
 
 import "validate.lume" as validate;
+import "secrets.lume" as secrets;
 
 // ---------- runner 客户端 ----------
 
@@ -166,14 +167,29 @@ export func build_steps(p, tag) {
   let target = trim(str(get(build, "target", "")));
   if (len(target) > 0) { push(argv, "--target"); push(argv, target); }
   let args = get(build, "build_args", null);
+  let env = {};
   if (args != null) {
     let ks = keys(args);
     // keys() 的顺序不稳定，排序让日志可复现（--build-arg 之间无依赖）。
     let sorted = sort(ks);
     let i = 0;
     while (i < len(sorted)) {
-      push(argv, "--build-arg");
-      push(argv, sorted[i] + "=" + str(get(args, sorted[i], "")));
+      let name = str(sorted[i]);
+      let val = str(get(args, sorted[i], ""));
+      // `secret:<名字>`：值走 step.env（docker 的 `--build-arg K` 从环境读），
+      // argv 里只留参数名，日志/ps 里看不到密钥本身。
+      if (secrets.is_ref(val)) {
+        let r = secrets.resolve(val);
+        if (not get(r, "ok", false)) {
+          return { ok: false, steps: [], image_ref: "", err: "构建参数 " + name + "：" + str(get(r, "err", "无法解析")) };
+        }
+        push(argv, "--build-arg");
+        push(argv, name);
+        put(env, name, str(get(r, "value", "")));
+      } else {
+        push(argv, "--build-arg");
+        push(argv, name + "=" + val);
+      }
       i = i + 1;
     }
   }
@@ -189,7 +205,9 @@ export func build_steps(p, tag) {
   if (len(ctx) == 0) { ctx = "."; }
   push(argv, ctx);
 
-  push(steps, { label: "build", argv: argv, timeout_s: 2400 });
+  let step = { label: "build", argv: argv, timeout_s: 2400 };
+  if (len(keys(env)) > 0) { put(step, "env", env); }
+  push(steps, step);
   return { ok: true, steps: steps, image_ref: ref, err: "" };
 }
 

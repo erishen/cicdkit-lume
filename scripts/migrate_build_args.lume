@@ -1,0 +1,97 @@
+// scripts/migrate_build_args.lume —— 把清洗后留下的 `********` 换成 `secret:<名字>` 引用
+//
+// 背景：历史明文密钥清洗（scripts/sanitize_secrets.lume）把 build_args 里的
+// 密钥整值换成了 `********`。那是「先止血」，但值没了就意味着这些项目的构建
+// 再也拿不到密钥。本脚本把它们改写成引用，真实值放进 $LUME_DATA/secrets/<名字>，
+// 由 exec.build_steps 在构建时填充到 step.env（不进 argv，也不进日志）。
+//
+//   LUME_DATA=./.data ./vendor/lume/bin/lume scripts/migrate_build_args.lume        # 干跑
+//   APPLY=1 LUME_DATA=./.data ./vendor/lume/bin/lume scripts/migrate_build_args.lume # 落库
+//
+// 名字规则：<项目名净化>_<参数名小写>，例如 lume-crm + LLM_API_KEY →
+// lume_crm_llm_api_key，对应 .data/secrets/lume_crm_llm_api_key。
+// 干跑会列出「还需要自己写入哪些文件」，不打印任何真实值。
+
+import "../src/store.lume" as store;
+import "../src/redact.lume" as redact;
+import "../src/secrets.lume" as secrets;
+
+store.init();
+
+// env() 未设置返回 null，而 str(null) 是 "null" 不是空串——
+// 直接 trim(str(env(...))) 会让干跑判断失效（第一版就踩了，干跑把库改了）。
+let raw_apply = env("APPLY");
+let apply = "";
+if (raw_apply != null) { apply = trim(str(raw_apply)); }
+let dry = len(apply) == 0 or apply == "0";
+print("mode: " + (dry ? "dry-run（不写库）" : "APPLY（写库）"));
+
+func sanitize_name(s) {
+  let src = lower(trim(str(s)));
+  let out = "";
+  let i = 0;
+  while (i < len(src)) {
+    let c = substr(src, i, 1);
+    if (str_match("^[a-z0-9]$", c)) { out = out + c; }
+    else if (len(out) == 0 or substr(out, len(out) - 1, 1) != "_") { out = out + "_"; }
+    i = i + 1;
+  }
+  // 去掉尾部下划线，避免出现 `lume_crm__llm...`
+  while (len(out) > 0 and substr(out, len(out) - 1, 1) == "_") { out = substr(out, 0, len(out) - 1); }
+  if (len(out) == 0) { out = "project"; }
+  return out;
+}
+
+let rows = store.project_rows();
+let changed = 0;
+let needed = [];
+let skipped = 0;
+let i = 0;
+while (i < len(rows)) {
+  let p = json(get(rows[i], "json", "{}"));
+  let b = get(p, "build", {});
+  let args = get(b, "build_args", null);
+  if (args == null) { i = i + 1; } else {
+    let ks = sort(keys(args));
+    let touched = false;
+    let j = 0;
+    while (j < len(ks)) {
+      let k = str(ks[j]);
+      let v = str(get(args, ks[j], ""));
+      if (v == redact.masked()) {
+        let nm = sanitize_name(str(get(p, "name", get(p, "id", "project"))) + "_" + k);
+        let ref = "secret:" + nm;
+        put(args, k, ref);
+        touched = true;
+        let r = secrets.resolve(ref);
+        let state = "已存在";
+        if (not get(r, "ok", false)) { state = "待写入"; push(needed, { name: nm, project: str(get(p, "name", "")) }); }
+        print("  " + str(get(p, "id", "")) + " " + str(get(p, "name", "")) + " build_args." + k + ": " + redact.masked() + " → " + ref + "（" + state + "）");
+      } else if (secrets.is_ref(v)) {
+        skipped = skipped + 1;
+      }
+      j = j + 1;
+    }
+    if (touched) {
+      changed = changed + 1;
+      if (not dry) {
+        put(p, "build", b);
+        let up = store.put_project(p, true);
+        if (not get(up, "ok", false)) { print("  !! 写库失败 " + str(get(p, "id", "")) + "：" + str(get(up, "err", ""))); }
+      }
+    }
+    i = i + 1;
+  }
+}
+
+print("");
+print("projects changed: " + str(changed) + "，已是引用而跳过: " + str(skipped));
+if (len(needed) > 0) {
+  print("还需要写入这些密钥文件（值只有你知道，脚本不猜）：");
+  let n = 0;
+  while (n < len(needed)) {
+    print("  make secret NAME=" + str(get(needed[n], "name", "")) + " VALUE=…   # " + str(get(needed[n], "project", "")));
+    n = n + 1;
+  }
+}
+if (dry) { print("干跑结束；确认上面映射无误后加 APPLY=1 重跑。"); }

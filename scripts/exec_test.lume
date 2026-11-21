@@ -4,6 +4,7 @@
 // 错了 kubectl 只会报个语焉不详的参数错，helm 少个 --set 就是发布了旧镜像。
 
 import "../src/exec.lume" as exec;
+import "../src/store.lume" as store;
 
 // 注意：LUME 的标量赋值在函数内只改副本，全局计数必须放 map 里共享。
 let st = { checks: 0, fails: 0 };
@@ -74,6 +75,23 @@ no("login argv 不含口令", join(login.argv, " "), "s3cret");
 let bstep = b.steps[1];
 eq("build argv", join(bstep.argv, " "),
    "docker build -f Dockerfile --build-arg A=1 --build-arg B=2 --platform linux/amd64 -t registry.example.com/team/demo:20261121-120000 ./");
+
+// ---------- 构建参数里的密钥引用（secret:<名字>）----------
+let sp = base();
+put(get(sp, "build", {}), "build_args", { "NORMAL": "v", "LLM_API_KEY": "secret:llm_key_demo" });
+let miss = exec.build_steps(sp, "20261121-120000");
+eq("缺密钥文件 → 拒绝构建", miss.ok, false);
+contains("缺密钥文件 → 说明路径", miss.err, "/secrets/llm_key_demo");
+
+mkdir(store.data_dir() + "/secrets");
+write_file(store.data_dir() + "/secrets/llm_key_demo", "sk-demo-xyz\n");
+let hit = exec.build_steps(sp, "20261121-120000");
+eq("有密钥文件 → 构建可行", hit.ok, true);
+let bs2 = hit.steps[1];
+no("argv 里没有密钥值", join(bs2.argv, " "), "sk-demo-xyz");
+contains("argv 只留参数名", join(bs2.argv, " "), "--build-arg LLM_API_KEY ");
+eq("值落到 step.env", str(get(get(bs2, "env", {}), "LLM_API_KEY", "")), "sk-demo-xyz");
+eq("普通参数仍在 argv", int(len(str_match("NORMAL=v", join(bs2.argv, " ")))), 1);
 
 let psteps = exec.push_steps(p, b.image_ref);
 eq("push steps", len(psteps), 1);

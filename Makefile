@@ -23,7 +23,7 @@ WORK  ?= $(HOME)/Workspace
 DATA  ?= ./.data
 RUNNER_PORT ?= 8899
 
-.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan preflight remap remap-apply sanitize sanitize-apply docker docker-logs docker-down clean
+.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan preflight remap remap-apply sanitize sanitize-apply migrate-args migrate-args-apply secret docker docker-logs docker-down clean
 
 vendor:
 	@bash scripts/vendor_lume.sh
@@ -71,7 +71,7 @@ smoke:
 # 三层自测：存储 34 项、执行计划 61 项、闸门/降级（临时实例，不碰真实上游）。
 test: vendor
 	@rm -rf /tmp/lume_test_store && LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
-	@$(LUME) scripts/exec_test.lume
+	@rm -rf /tmp/lume_test_exec && LUME_DATA=/tmp/lume_test_exec $(LUME) scripts/exec_test.lume
 	@rm -rf /tmp/lume_test_gen && LUME_DATA=/tmp/lume_test_gen $(LUME) scripts/generate_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 
@@ -85,6 +85,24 @@ sanitize-apply:
 	@cp $(DATA)/store.db $(DATA)/store.db.bak.$$(date +%Y%m%d%H%M%S)
 	@LUME_DATA=$(DATA) APPLY=1 $(LUME) scripts/sanitize_secrets.lume
 	@ls -1 $(DATA)/store.db.bak.* | tail -1
+
+# build_args 里的 `********` → `secret:<名字>` 引用（真实值放 $(DATA)/secrets/）。
+# 默认干跑；apply 前先备份 store.db。之后用 make secret 把值写回去。
+migrate-args:
+	@LUME_DATA=$(DATA) $(LUME) scripts/migrate_build_args.lume
+
+migrate-args-apply:
+	@cp $(DATA)/store.db $(DATA)/store.db.bak.$$(date +%Y%m%d%H%M%S)
+	@LUME_DATA=$(DATA) APPLY=1 $(LUME) scripts/migrate_build_args.lume
+
+# 写入一个构建密钥：make secret NAME=lume_crm_llm_api_key VALUE=sk-...
+# 文件落在 $(DATA)/secrets/<名字>，目录 0700；值不进项目配置、不进 argv、不进日志。
+secret:
+	@test -n "$(NAME)" || (echo "用法：make secret NAME=<名字> VALUE=<值>" >&2; exit 2)
+	@test -n "$(VALUE)" || (echo "VALUE 为空，拒绝写入" >&2; exit 2)
+	@mkdir -p $(DATA)/secrets && chmod 700 $(DATA)/secrets
+	@umask 077; printf '%s\n' '$(VALUE)' > $(DATA)/secrets/$(NAME)
+	@echo "✓ 已写入 $(DATA)/secrets/$(NAME)"
 
 # 切换前体检：build.context / Dockerfile / kubeconfig / ssh key 在本机上是否真的存在。
 # 有阻断项返回非 0。容器视角的路径映射用 remap / remap-apply（见 README）。

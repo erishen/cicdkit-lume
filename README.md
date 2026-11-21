@@ -230,8 +230,28 @@ make sanitize-apply    # 先备份 store.db 再写库
   map 形态（`build_args: {LLM_API_KEY: "sk-..."}`）整值换成 `********`，不留 `sk-********` 残形。
 - 历史运行/部署的 json 里存着当初执行过的命令行，也会按字符串级脱敏（报告里单列 `history:`）。
 - 幂等：清洗完再跑一次全部 `clean`。
-- **是有损操作**：这些参数会变成掩码，依赖它们注入密钥的构建会失效——要么改成从
-  环境变量/secret 文件读取，要么确认该构建不再需要。清洗后 `plan_dump` 仍能正常生成计划。
+- **是有损操作**：这些参数会变成掩码 `********`，依赖它们注入密钥的构建会失效。
+  修法见下一节：`make migrate-args-apply` 把掩码改成 `secret:<名字>` 引用，值放
+  `.data/secrets/`，构建照旧、日志里不再出现密钥。
+
+### 构建参数里的密钥（`secret:<名字>`）
+
+清洗把 `build_args` 里的密钥换成了 `********`，值没了构建就跑不起来。现在改成**引用**：
+
+```bash
+make migrate-args        # 干跑：列出 ******** → secret:<名字> 的映射
+make migrate-args-apply  # 落库（先备份 store.db）
+make secret NAME=lume_crm_llm_api_key VALUE=sk-...   # 真实值只写进 .data/secrets/<名字>（0600）
+```
+
+- 引用写法：`build_args` 的某个值写成 `secret:<名字>`，对应 `<LUME_DATA>/secrets/<名字>`（一行）。
+- 解析在 `src/secrets.lume`，翻译发生在 `exec.build_steps`：命令行只留 `--build-arg LLM_API_KEY`（不带 `=值`），值进 step 的 `env`，docker 会从进程环境读——所以**argv、日志、`ps` 输出里都没有密钥**（runner 只打印 argv，不打印 env）。
+- 为什么不用控制面环境变量：Lume 的 `env()` 把名字里含 `API_KEY / TOKEN / SECRET / PASSWORD / CREDENTIAL` 的变量屏蔽成 `null`，而构建参数恰好最爱叫 `*_API_KEY`，走环境变量根本读不到。
+- 文件缺失时**不降级成空值**，直接拒绝构建并指出该建哪个文件：`构建参数 LLM_API_KEY：缺少密钥文件 ./.data/secrets/lume_crm_llm_api_key`。
+- 名字规则 `<项目名净化>_<参数名小写>`，只允许 `[A-Za-z0-9._-]`（它会拼进路径，`/` 与 `..` 一律拒）。
+- 文件 `0600` 是宿主机直跑（`make dev` / `make runner`）的默认。走 compose 时控制面是
+  uid 10001，读不了宿主机 0600 的文件，会报「密钥文件不可读（权限或容器 uid 不匹配）」——
+  此时 `chmod 0644 .data/secrets/*` 再 `chmod 0755 .data/secrets`，或改成用容器自己的卷存密钥。
 
 ## 外部 CI 触发（webhook）
 
