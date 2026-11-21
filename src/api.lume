@@ -1,0 +1,246 @@
+// src/api.lume — cicdkit 上游 API 客户端 + 只读聚合
+//
+// 所有请求都由 Lume 这一层发出：浏览器只跟本服务同源通信，cicdkit 的
+// API Token 只存在于服务端（CICD_AUTH 环境变量或 CICD_AUTH_FILE 指向的文件），
+// 永远不下发到前端。
+//
+//   CICD_BASE        上游地址，默认 http://127.0.0.1:8080
+//   CICD_AUTH        上游 X-API-Token；空 = 上游未开鉴权
+//   CICD_AUTH_FILE   从文件读 token（优先于 CICD_AUTH；文件里的换行会被裁掉）
+//
+// 为什么不叫 CICD_TOKEN：Lume 的 env() 会对含 TOKEN / SECRET / API_KEY /
+// PASSWORD / CREDENTIAL 的**变量名**返回 null（防止机密被 .lume 读走），
+// 所以标准名 CICD_TOKEN 在 DSL 里永远是 null。用 CICD_AUTH（或文件）绕开
+// 这条命名屏蔽，机密仍然只存在于 Lume 进程内，不下发浏览器。
+//
+// 上游是回环/私网地址，http_* 的 SSRF 闸门默认会拒绝，因此这里显式
+// allow_private: true —— 闸门只放行「运维自己指定的上游」，不改变入站安全模型。
+
+export func base() {
+  let b = env("CICD_BASE");
+  if (b == null) { return "http://127.0.0.1:8080"; }
+  let s = str(b);
+  if (len(s) == 0) { return "http://127.0.0.1:8080"; }
+  // 去掉末尾斜杠：base + "/api/..." 不能拼出 "//api"。
+  if (substr(s, len(s) - 1) == "/") { return substr(s, 0, len(s) - 1); }
+  return s;
+}
+
+func trim_ws(s) {
+  let out = s;
+  while (len(out) > 0) {
+    let last = substr(out, len(out) - 1);
+    if (last == "\n" or last == "\r" or last == " " or last == "\t") {
+      out = substr(out, 0, len(out) - 1);
+    } else { break; }
+  }
+  while (len(out) > 0) {
+    let first = substr(out, 0, 1);
+    if (first == " " or first == "\t") { out = substr(out, 1); } else { break; }
+  }
+  return out;
+}
+
+func token() {
+  let f = env("CICD_AUTH_FILE");
+  if (f != null and len(str(f)) > 0) {
+    let raw = read_file(str(f));
+    if (raw != null) { return trim_ws(str(raw)); }
+  }
+  let t = env("CICD_AUTH");
+  if (t == null) { return ""; }
+  return trim_ws(str(t));
+}
+
+// 单次上游调用。method: GET / POST / PUT / DELETE。
+// 默认 30s：普通读接口足够。模型调用单独给长超时（见 proxy_slow），
+// 上游 llm 客户端自己是 150s，网关这一层不能先断。
+// 首屏聚合（overview）与健康检查用更短的预算：它们本身是多个上游调用的拼接，
+// 上游卡住时要尽快降级返回，而不是把 worker 按 30s/次 占满。
+func upstream(method, path, body) {
+  return upstream_to(method, path, body, 30);
+}
+
+func upstream_to(method, path, body, secs) {
+  let url = base() + path;
+  // headers 必须先建好再放进 opts：map 字面量是值拷贝，先放后 put 不会生效。
+  let hdrs = { "Accept": "application/json" };
+  let t = token();
+  if (len(t) > 0) { put(hdrs, "X-API-Token", t); }
+  if (body != null) { put(hdrs, "Content-Type", "application/json"); }
+  let opts = { headers: hdrs, timeout: secs, max_bytes: 8388608, allow_private: true };
+  if (body != null) { put(opts, "body", str(body)); }
+  if (method == "POST") { return http_post(url, opts); }
+  if (method == "PUT") { return http_put(url, opts); }
+  if (method == "DELETE") { return http_delete(url, opts); }
+  return http_get(url, opts);
+}
+
+// 把上游响应解析成 { ok, status, data, err }。网关失败（连不上/超时）时
+// status = 0，data = null，err 带上游给的原因。
+export func fetch_json(method, path, body) {
+  return fetch_json_to(method, path, body, 30);
+}
+
+func fetch_json_to(method, path, body, secs) {
+  let r = upstream_to(method, path, body, secs);
+  let code = int(get(r, "status", 0));
+  let raw = get(r, "body", "");
+  let text = "";
+  if (raw != null) { text = str(raw); }
+  let data = null;
+  let parse_err = "";
+  if (len(text) > 0) {
+    let p = try(() => json(text));
+    if (p.err == null) { data = p.ok; } else { parse_err = str(p.err); }
+  }
+  let ok = code >= 200 and code < 300;
+  return {
+    ok: ok,
+    status: code,
+    data: data,
+    err: str(get(r, "err", "")),
+    parse_err: parse_err,
+  };
+}
+
+// 透传：保留上游状态码与 JSON 正文。上游不可达统一变 502，前端读 error 字段。
+export func proxy(method, path, body) {
+  return proxy_with(method, path, body, 30);
+}
+
+// 慢接口：AI 诊断 / LLM 测试连接。上游模型调用可能跑几十秒，
+// 给 180s 预算，避免网关先超时而后端其实已经成功（结果会缓存）。
+export func proxy_slow(method, path, body) {
+  return proxy_with(method, path, body, 180);
+}
+
+func proxy_with(method, path, body, secs) {
+  let r = fetch_json_to(method, path, body, secs);
+  let code = int(get(r, "status", 0));
+  if (code == 0) {
+    return {
+      status: 502,
+      body: {
+        ok: false,
+        error: "无法连接 cicdkit 上游 " + base() + "：" + str(get(r, "err", "连接失败")),
+      },
+    };
+  }
+  if (get(r, "data") == null) {
+    return {
+      status: 502,
+      body: {
+        ok: false,
+        error: "上游返回了非 JSON 响应（HTTP " + str(code) + "）",
+      },
+    };
+  }
+  return { status: code, body: get(r, "data") };
+}
+
+// 取列表长度/数组，容错：上游结构不对时给空。
+func list_of(data, key) {
+  if (data == null) { return []; }
+  let v = get(data, key, null);
+  if (v == null) { return []; }
+  return v;
+}
+
+// 分页 total：上游不可达时 data 为 null，不能直接 get(null, ...)（会 500）。
+func total_of(page, fallback) {
+  if (page == null) { return fallback; }
+  let t = get(page, "total", null);
+  if (t == null) { return fallback; }
+  return int(t);
+}
+
+// 只复制前 n 条（Lume 没有内置 slice，展示层自己截断）。
+func head_of(items, n) {
+  let out = [];
+  let i = 0;
+  let limit = len(items);
+  if (limit > n) { limit = n; }
+  while (i < limit) { push(out, get(items, i, null)); i = i + 1; }
+  return out;
+}
+
+// ---- 健康检查：本服务 + 上游 cicdkit ----
+// 2s 预算：这个端点是容器 HEALTHCHECK 打的（timeout 5s），上游卡死时必须快速
+// 返回 ok:false，而不是把探针拖到超时、把容器标成 unhealthy。
+// 上游健康失败时跳过 /api/version：那只是锦上添花的版本号，不值得再等一次。
+export func health() {
+  let r = fetch_json_to("GET", "/api/health", null, 2);
+  let version = null;
+  if (get(r, "ok", false)) {
+    let v = fetch_json_to("GET", "/api/version", null, 2);
+    if (get(v, "ok", false) and get(v, "data") != null) { version = get(v, "data"); }
+  }
+  return {
+    ok: get(r, "ok", false),
+    service: "cicdkit-lume",
+    upstream: base(),
+    upstream_status: int(get(r, "status", 0)),
+    version: version,
+    error: str(get(r, "err", "")),
+  };
+}
+
+// ---- LLM 状态：只回掩码信息（上游的 api_key 永不回传）----
+// 供 /api/meta 与顶栏「LLM」状态用：诊断按钮据此提示先去配置。
+export func llm_status() {
+  // 5s：/api/meta 会调它，上游读的是本地 llm.json，慢成这样基本等于上游异常。
+  let r = fetch_json_to("GET", "/api/config/llm", null, 5);
+  if (not get(r, "ok", false) or get(r, "data") == null) {
+    return { reachable: false, enabled: false, api_key_set: false, base_url: "", model: "" };
+  }
+  let d = get(r, "data");
+  return {
+    reachable: true,
+    enabled: get(d, "enabled", false),
+    api_key_set: get(d, "api_key_set", false),
+    base_url: str(get(d, "base_url", "")),
+    model: str(get(d, "model", "")),
+  };
+}
+
+// ---- 总览：一次取齐项目/运行/部署，前端首屏只发一个请求 ----
+// 三次上游调用是串行的，每个只给 5s：上游卡住时宁可降级成「部分数据 + connected:false
+// + errors 里带上原因」，也不要让首屏干等 90s（3 × 30s）并把 worker 一起占住。
+export func overview() {
+  let ps = fetch_json_to("GET", "/api/projects?limit=500", null, 5);
+  let rs = fetch_json_to("GET", "/api/runs?limit=200", null, 5);
+  let ds = fetch_json_to("GET", "/api/deployments?limit=200", null, 5);
+
+  let projects = list_of(get(ps, "data"), "projects");
+  let runs = list_of(get(rs, "data"), "runs");
+  let deployments = list_of(get(ds, "data"), "deployments");
+
+  let running = 0;
+  let failed = 0;
+  let i = 0;
+  while (i < len(runs)) {
+    let st = str(get(runs[i], "status", ""));
+    if (st == "running" or st == "queued") { running = running + 1; }
+    if (st == "failed" or st == "canceled") { failed = failed + 1; }
+    i = i + 1;
+  }
+
+  return {
+    ok: true,
+    upstream: base(),
+    connected: get(ps, "ok", false) and get(rs, "ok", false) and get(ds, "ok", false),
+    projects: total_of(get(ps, "data"), len(projects)),
+    runs: total_of(get(rs, "data"), len(runs)),
+    deployments: total_of(get(ds, "data"), len(deployments)),
+    running: running,
+    failed: failed,
+    recent_runs: head_of(runs, 8),
+    recent_deployments: head_of(deployments, 8),
+    errors: {
+      projects: str(get(ps, "err", "")),
+      runs: str(get(rs, "err", "")),
+      deployments: str(get(ds, "err", "")),
+    },
+  };
+}

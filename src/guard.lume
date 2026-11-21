@@ -1,0 +1,102 @@
+// src/guard.lume — 发布动作的审批闸门（lume-core/lib/approval.lume）
+//
+// CI/CD 里「构建」可重跑，「发布」有副作用且不可逆，两者不该同权。
+// lume-core 的 approval.lume 用「角色 → 动作集合」（职责分离）而不是等级数字：
+// 终审者 human_admin 拥有 approve，但**没有** execute —— 审批人不能顺手执行，
+// 操作员 agent_operator 有 execute，但没有 approve。
+//
+// 模式由环境变量控制（默认 off，行为与 cicdkit 原版一致）：
+//   CICD_DEPLOY_APPROVAL=off      不校验（本机/单人开发）
+//   CICD_DEPLOY_APPROVAL=approve  发布需 human_admin（对外/生产）
+//   CICD_DEPLOY_APPROVAL=execute  发布需 agent_operator（团队内信任圈）
+//
+// 角色由前端在 ?role= 里声明（Lume 的 req 不暴露请求头，所以不用 X- 头）。
+// 这是**流程门禁**，不是身份认证：真正的身份边界由 LUME 的 htpasswd /
+// 反向代理提供；闸门只保证「点发布的人自报了哪个角色」，供单人/小团队用。
+
+// import 路径相对于本文件目录：src/ → ../vendor/lume-core/lib/
+import "../vendor/lume-core/lib/approval.lume" as approval;
+
+func mode() {
+  let m = env("CICD_DEPLOY_APPROVAL");
+  if (m == null) { return "off"; }
+  let s = str(m);
+  if (s == "approve" or s == "execute") { return s; }
+  return "off";
+}
+
+// 返回 { allowed, mode, role, action, chain, reason }
+export func deploy_allowed(req) {
+  let m = mode();
+  if (m == "off") {
+    return {
+      allowed: true, mode: m, role: "off", action: "deploy",
+      chain: [], reason: "",
+    };
+  }
+  let role = "";
+  let qp = get(req, "query_params", null);
+  if (qp != null) { role = str(get(qp, "role", "")); }
+  let action = "approve";
+  if (m == "execute") { action = "execute"; }
+  let chain = approval.chain_for("medium");
+
+  if (len(role) == 0) {
+    return {
+      allowed: false, mode: m, role: role, action: action, chain: chain,
+      reason: "发布已被审批闸门拦截：请在 ?role= 声明角色（本动作需要 " + action + "）",
+    };
+  }
+  if (not approval.known_role(role)) {
+    return {
+      allowed: false, mode: m, role: role, action: action, chain: chain,
+      reason: "未知角色 " + role + "（known: agent_operator / agent_reviewer / agent_reviewer_second / human_admin）",
+    };
+  }
+  if (not approval.can(role, action)) {
+    return {
+      allowed: false, mode: m, role: role, action: action, chain: chain,
+      reason: "角色 " + role + " 不能执行 " + action + "；标准审批链：" + join(chain, " → "),
+    };
+  }
+  return {
+    allowed: true, mode: m, role: role, action: action, chain: chain, reason: "",
+  };
+}
+
+// 单一角色门禁：某个动作必须由指定角色发起。用于「改动上游凭据」这类
+// 与发布不同、但同样不该让任意角色顺手做的事（例如写 LLM 配置）。
+// 返回结构刻意与 deploy_allowed 一致，前端只认 allowed / reason。
+export func role_allowed(req, role, label) {
+  let got = "";
+  let qp = get(req, "query_params", null);
+  if (qp != null) { got = str(get(qp, "role", "")); }
+  if (len(got) == 0) {
+    return {
+      allowed: false, role: got, action: role,
+      reason: label + "需要 ?role=" + role,
+    };
+  }
+  if (not approval.known_role(got)) {
+    return {
+      allowed: false, role: got, action: role,
+      reason: "未知角色 " + got + "（known: agent_operator / agent_reviewer / agent_reviewer_second / human_admin）",
+    };
+  }
+  if (got != role) {
+    return {
+      allowed: false, role: got, action: role,
+      reason: label + "需要 " + role + "，当前声明的是 " + got,
+    };
+  }
+  return { allowed: true, role: got, action: role, reason: "" };
+}
+
+// GET /api/meta 用：让前端知道闸门当前模式与默认审批链。
+export func policy() {
+  return {
+    mode: mode(),
+    chain: approval.chain_for("medium"),
+    roles: ["agent_operator", "agent_reviewer", "agent_reviewer_second", "human_admin"],
+  };
+}

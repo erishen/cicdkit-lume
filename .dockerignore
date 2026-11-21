@@ -1,0 +1,13 @@
+node_modules
+.git
+.gitignore
+logs
+.data
+vendor/lume/bin
+vendor/.vendor-stamp
+www/app.js
+www/app.js.map
+*.log
+.env
+.env.local
+.DS_Store

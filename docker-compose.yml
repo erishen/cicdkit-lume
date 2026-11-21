@@ -1,0 +1,35 @@
+# cicdkit-lume —— 本机容器运行（宿主机 127.0.0.1:18107）
+#
+# 与已在运行的 cicdkit 容器（compose 项目 cicdkit，网络 cicdkit_default）对接：
+# 容器内用 http://cicdkit:8080 访问上游，Token 走挂载的文件而不是命令行。
+#
+#   make docker            # 构建 + 起容器
+#   make docker-logs       # 跟日志
+#   make docker-down       # 停掉
+
+services:
+  cicdkit-lume:
+    build:
+      context: .
+      args:
+        LUME_BIN_IMAGE: ${LUME_BIN_IMAGE:-windgl-china-lume:latest}
+    image: cicdkit-lume:dev
+    container_name: cicdkit-lume
+    ports:
+      - "127.0.0.1:18107:18107"
+    environment:
+      CICD_BASE: ${CICD_BASE:-http://cicdkit:8080}
+      CICD_DEPLOY_APPROVAL: ${CICD_DEPLOY_APPROVAL:-off}
+      # 文件不存在时 token() 退回空串（上游未开鉴权的情况）。
+      CICD_AUTH_FILE: /app/.data/upstream.token
+      LUME_BIND: 0.0.0.0
+      LUME_PORT: "18107"
+    volumes:
+      - ./.data:/app/.data:ro
+    networks:
+      - cicdkit_default
+    restart: unless-stopped
+
+networks:
+  cicdkit_default:
+    external: true
