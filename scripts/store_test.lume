@@ -114,6 +114,26 @@ ok("exit_code 已记录", int(get(after, "exit_code", 0)) == 1);
 let runs = store.list_runs("proj-t1", 10, 0);
 ok("运行列表总数", int(get(runs, "total", 0)) == 1);
 
+// 运行历史保留：runs 表和 logs 目录不能只涨不跌（SQLite 又不允许建索引）。
+let trim_base = now();
+let tk = 0;
+while (tk < 4) {
+  let rid = "run-trim-" + str(tk);
+  store.put_run({ id: rid, project_id: "proj-t1", project_name: "demo-app", trigger: "manual",
+    status: "success", created_ts: trim_base + tk });
+  store.write_log(rid, "log of " + rid + "\n");
+  tk = tk + 1;
+}
+let trimmed = store.trim_runs(3);
+ok("按保留条数裁掉多余历史", int(trimmed) > 0);
+let left = store.list_runs("", 50, 0);
+ok("裁完后总数不超过保留条数", int(get(left, "total", 0)) <= 3);
+let gone = store.read_log_tail("run-trim-0", 0, 4096);
+ok("被裁掉的运行日志已清空", len(str(get(gone, "log", ""))) == 0);
+let kept = store.read_log_tail("run-trim-3", 0, 4096);
+ok("保留的最近一条日志还在", contains(str(get(kept, "log", "")), "run-trim-3"));
+ok("CICD_RUN_KEEP 默认 300", int(store.run_keep()) == 300);
+
 // ---- 部署 / 知识库 ----
 print("store: deployments + kb");
 store.put_deployment({ project_id: "proj-t1", project_name: "demo-app", method: "ssh",
@@ -156,7 +176,8 @@ ok("命中计数与路径", int(get(acc, "n", 0)) == 2 and len(get(acc, "items",
 
 // ---- 清空 ----
 print("store: clear");
-ok("清空运行", int(store.clear_runs()) == 1);
+// 上面的保留策略留下 3 条，清空必须把它们全删掉（不是只删 1 条）。
+ok("清空运行", int(store.clear_runs()) == 3);
 ok("运行已空", int(get(store.list_runs("", 10, 0), "total", 0)) == 0);
 ok("清空部署", int(store.clear_deployments()) == 1);
 ok("删除项目", int(store.delete_project("proj-t1")) == 1);

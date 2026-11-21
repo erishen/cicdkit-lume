@@ -166,6 +166,8 @@ export func start(project, kind, opts) {
     started_ts: now(),
     started_at: store.fmt_iso(now()),
   });
+  // 新运行已经落库、提交成功，这里顺手把超龄历史清掉（失败不影响本次运行）。
+  try(() => store.trim_runs(store.run_keep()));
   return { ok: true, run_id: rid, err: "", image_ref: image, target: target };
 }
 

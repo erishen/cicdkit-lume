@@ -235,6 +235,37 @@ export func finish_run(id, status, exit_code, ended_ts) {
 }
 
 // 清空运行记录（DELETE 必须带 WHERE，护栏要求；这里用恒真条件代替）。
+// 运行历史保留条数（CICD_RUN_KEEP，默认 300）。
+export func run_keep() {
+  let d = env("CICD_RUN_KEEP");
+  if (d == null) { return 300; }
+  let k = int(d);
+  if (k <= 0) { return 300; }
+  return k;
+}
+
+// 只留最近的 keep 条运行，更早的连同日志文件一起清掉。
+// 没有这一步，runs 表和 logs 目录只涨不跌；而 SQLite 这边不允许 CREATE INDEX，
+// 列表查询会随历史条数线性变慢，磁盘也一直被旧日志占着。
+export func trim_runs(keep) {
+  let k = int(keep);
+  if (k < 1) { k = 1; }
+  let rows = sql_query(db(),
+    "SELECT id FROM runs ORDER BY created_ts DESC, id DESC LIMIT -1 OFFSET " + str(k), []);
+  let n = 0;
+  for (row in rows) {
+    let rid = str(get(row, "id", ""));
+    if (len(rid) == 0) { continue; }
+    sql_write(db(), "DELETE FROM runs WHERE id = ?", [rid]);
+    // DSL 没有 remove_file，只能把日志原子地截成 0 字节（记录已经没了，内容留着也没人引用）。
+    let p = run_log_path(rid);
+    let got = try(() => read_file(p));
+    if (got.err != null or got.ok != null) { write_file(p, ""); }
+    n = n + 1;
+  }
+  return n;
+}
+
 export func clear_runs() {
   let n = sql_write(db(), "DELETE FROM runs WHERE id <> ''");
   // 日志文件一并清空，否则 data 目录只涨不跌。DSL 没有 remove_file，

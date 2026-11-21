@@ -103,6 +103,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_SSH_USER/PORT/KEY_PATH/CONTAINER/CONTAINER_PORT/PROBE_PORT/RUN_ARGS/COMMAND` | 空 | 部署字段的兜底值 |
 | `CICD_DEPLOY_APPROVAL` | `off` | `off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
 | `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
+| `CICD_RUN_KEEP` | `300` | 运行历史保留条数；每次起新运行时把更早的记录连同日志一起清掉 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
