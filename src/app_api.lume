@@ -54,11 +54,14 @@ export func health() {
   let alive = false;
   let are = try(() => exec.alive());
   if (are.err == null) { alive = bool(are.ok); }
+  // runner 连不上时别再报 200：这个字段就是给面板/监控看的。
+  let up_status = 0;
+  if (alive) { up_status = 200; }
   return {
     ok: st_ok and alive,
     service: "cicdkit-lume",
     upstream: exec.runner_base(),
-    upstream_status: 200,
+    upstream_status: up_status,
     runner_ok: alive,
     store_ok: st_ok,
     version: { version: "native", mode: "lume-control-plane" },

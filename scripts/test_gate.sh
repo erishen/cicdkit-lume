@@ -136,6 +136,7 @@ expect_body '"connected":false' "总览：标出 runner 未连接"
 call GET "/api/health"
 expect_code 200 "健康：本进程仍在服务"
 expect_body '"runner_ok":false' "健康：runner 不可达体现在 runner_ok 字段"
+expect_body '"upstream_status":0' "健康：runner 不可达时不再谎报 200"
 
 # 6) 新建 / 删除走本地库
 call POST "/api/projects"
