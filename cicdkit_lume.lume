@@ -44,9 +44,12 @@ if (lc_port == null) { lc_port = "8096"; }
 
 server {
   port = int(lc_port);
-  // 8 = agent-httpd 慢路径 worker 池的默认值。本服务的每个 /api/* 都是一次同步
-  // 出站调用，会独占一个 worker；只有 2 个时，两个慢请求（AI 诊断/LLM 测试，
-  // 预算 180s）就能把整个 API 层堵死。静态资源走主事件循环，不受影响。
+  // 8 = agent-httpd 慢路径 worker 池容量。每个 /api/* 都是一次同步出站调用，
+  // 独占一个 worker（GET 与 POST 同等对待：框架把动态路由整体送进池，不再
+  // 在主事件循环里内联执行）；只有 2 个时，两个慢请求（AI 诊断/LLM 测试，
+  // 预算 180s）就能把整个 API 层堵死。静态资源与 SPA 回退仍在主循环，
+  // 只有 >64KB 的大文件流式响应会占用一个 worker。池满后排队超过 5s 的
+  // 请求收到 503 + Retry-After（框架侧 SLOW_QUEUE_WAIT_SECONDS）。
   workers = 8;
   bind = str(lc_bind);
   docroot = "./www";
