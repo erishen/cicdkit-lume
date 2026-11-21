@@ -36,7 +36,7 @@ LOCAL_LUME="$ROOT/../../lume/lume"
 LOCAL_CORE="$ROOT/../../lume/lume-core"
 
 if [ "$CHECK_ONLY" = "1" ]; then
-  [ -x "$LUME_BIN" ] || { echo "✗ 缺少 $LUME_BIN（先跑 make vendor）" >&2; exit 1; }
+  [ -x "$LUME_BIN" ] || { echo "✗ 缺少 ${LUME_BIN}（先跑 make vendor）" >&2; exit 1; }
   [ -f "$CORE_LIB/approval.lume" ] || { echo "✗ 缺少 $CORE_LIB/approval.lume（先跑 make vendor）" >&2; exit 1; }
   "$LUME_BIN" --check "$ROOT/cicdkit_lume.lume" >/dev/null 2>&1 \
     || { echo "✗ $LUME_BIN --check cicdkit_lume.lume 失败（二进制/库版本不匹配？）" >&2; exit 1; }

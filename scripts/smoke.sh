@@ -5,16 +5,20 @@ set -uo pipefail
 
 BASE="${1:-http://127.0.0.1:8096}"
 fail=0
+# 每次请求单独一个输出文件，失败时打印的才是这次的响应，而不是上一轮残留。
+out="$(mktemp -t cicdkit-lume-smoke)"
+trap 'rm -f "$out"' EXIT
 
 check() {
   local path="$1" expect="${2:-200}" code
-  code="$(curl -s -o /tmp/cicdkit-lume-smoke.out -w '%{http_code}' --max-time 8 "$BASE$path" || echo 000)"
+  : > "$out"
+  # curl 连不上时也会往 -w 里写 000；不能再用 || echo 000 追加，否则拼成 "000000"。
+  code="$(curl -s -o "$out" -w '%{http_code}' --max-time 8 "$BASE$path" 2>/dev/null)" || code=000
   if [ "$code" = "$expect" ]; then
     echo "✓ GET $path → $code"
   else
-    echo "✗ GET $path → $code（期望 $expect）" >&2
-    head -c 400 /tmp/cicdkit-lume-smoke.out >&2 || true
-    echo >&2
+    echo "✗ GET $path → ${code}（期望 ${expect}）" >&2
+    if [ -s "$out" ]; then head -c 400 "$out" >&2; echo >&2; fi
     fail=1
   fi
 }
