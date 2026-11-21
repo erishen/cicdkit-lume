@@ -7,6 +7,7 @@
 #   make run      只启动（假定 ui 已构建）
 #   make stop     停掉本端口上的服务
 #   make smoke    对运行中的服务做一次 HTTP 冒烟
+#   make test     起临时实例验证闸门 403 / 上游 502 降级（不碰真实上游）
 #   make docker   构建镜像并起容器（127.0.0.1:18107）
 #   make docker-logs / docker-down
 #
@@ -17,7 +18,7 @@ LUME  ?= vendor/lume/bin/lume
 PORT  ?= 8096
 CICD_BASE ?= http://127.0.0.1:8080
 
-.PHONY: vendor check ui node_modules run dev stop smoke clean docker docker-logs docker-down
+.PHONY: vendor check ui node_modules run dev stop smoke test clean docker docker-logs docker-down
 
 vendor:
 	@bash scripts/vendor_lume.sh
@@ -46,6 +47,9 @@ stop:
 
 smoke:
 	@bash scripts/smoke.sh http://127.0.0.1:$(PORT)
+
+test: vendor
+	@bash scripts/test_gate.sh "$(LUME)"
 
 # 容器：http://127.0.0.1:18107，接入 cicdkit 容器的 cicdkit_default 网络。
 docker:

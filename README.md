@@ -57,6 +57,7 @@ CICD_BASE=http://127.0.0.1:8080 CICD_AUTH='<your-token>' make dev
 ```bash
 make check      # lume --check：语法 + 类型
 make ui         # esbuild 打包 → www/app.js
+make test       # 起临时实例验证闸门 403 / 上游 502 降级（不碰真实上游）
 make smoke      # 对运行中的服务做一次只读冒烟
 make stop       # 停掉 8096 上的服务
 ```
