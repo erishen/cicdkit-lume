@@ -29,6 +29,8 @@ export func data_dir() {
 
 export func db() { return data_dir() + "/store.db"; }
 export func log_dir() { return data_dir() + "/logs"; }
+// 归档目录：被 CICD_RUN_KEEP 裁掉的运行，日志搬到这里，随时能恢复。
+export func archive_dir() { return data_dir() + "/logs-archive"; }
 export func run_log_path(id) { return log_dir() + "/" + str(id) + ".log"; }
 
 export func fmt_iso(ts) { return strftime("%Y-%m-%dT%H:%M:%S%z", ts); }
@@ -47,6 +49,8 @@ export func init() {
   sql_write(db(), "CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, method TEXT, status TEXT, image_ref TEXT, created_ts INTEGER, json TEXT)");
   sql_write(db(), "CREATE TABLE IF NOT EXISTS kb (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, stage TEXT, signature TEXT, error_keyword TEXT, created_ts INTEGER, json TEXT)");
   sql_write(db(), "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_ts INTEGER)");
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS runs_archive (id TEXT PRIMARY KEY, project_id TEXT, json TEXT, archived_ts INTEGER, log_archived INTEGER, log_bytes INTEGER)");
+  mkdir(archive_dir());
 }
 
 // ---------- id ----------
@@ -244,26 +248,93 @@ export func run_keep() {
   return k;
 }
 
-// 只留最近的 keep 条运行，更早的连同日志文件一起清掉。
+// 只留最近的 keep 条运行；更早的不删，而是搬进 runs_archive + logs-archive，
+// 之后可以用 restore_run(id) 原样恢复（这是"可回滚"的那一半）。
 // 没有这一步，runs 表和 logs 目录只涨不跌；而 SQLite 这边不允许 CREATE INDEX，
 // 列表查询会随历史条数线性变慢，磁盘也一直被旧日志占着。
-export func trim_runs(keep) {
+//
+// 取日志的顺序也很关键：先把内容写进归档文件，再把原文件截成 0 字节
+// （DSL 没有 remove_file / rename_file，写归档是唯一能保住内容的办法）。
+export func archive_runs(keep) {
   let k = int(keep);
   if (k < 1) { k = 1; }
   let rows = sql_query(db(),
-    "SELECT id FROM runs ORDER BY created_ts DESC, id DESC LIMIT -1 OFFSET " + str(k), []);
+    "SELECT id, project_id, json FROM runs ORDER BY created_ts DESC, id DESC LIMIT -1 OFFSET " + str(k), []);
   let n = 0;
   for (row in rows) {
     let rid = str(get(row, "id", ""));
     if (len(rid) == 0) { continue; }
+    let arc = 0;
+    let bytes = 0;
+    let got = try(() => read_file(run_log_path(rid)));
+    if (got.err != null) {
+      // read_file 抛错说明日志超过 16 MiB：这种归档不了，原文件留着别动，
+      // 至少不会丢内容（log_archived=0 让界面/接口能说清楚）。
+      bytes = -1;
+    } else if (got.ok != null) {
+      let txt = str(got.ok);
+      arc = 1;
+      if (len(txt) > 0) {
+        write_file(archive_dir() + "/" + rid + ".log", txt);
+        bytes = len(txt);
+      }
+      write_file(run_log_path(rid), "");
+    }
+    sql_write(db(),
+      "INSERT OR REPLACE INTO runs_archive (id, project_id, json, archived_ts, log_archived, log_bytes) VALUES (?, ?, ?, " + str(now()) + ", " + str(arc) + ", " + str(bytes) + ")",
+      [rid, str(get(row, "project_id", "")), str(get(row, "json", ""))]);
     sql_write(db(), "DELETE FROM runs WHERE id = ?", [rid]);
-    // DSL 没有 remove_file，只能把日志原子地截成 0 字节（记录已经没了，内容留着也没人引用）。
-    let p = run_log_path(rid);
-    let got = try(() => read_file(p));
-    if (got.err != null or got.ok != null) { write_file(p, ""); }
     n = n + 1;
   }
   return n;
+}
+
+// 兼容旧名字（jobs.start 之前调的是 trim_runs）。
+export func trim_runs(keep) { return archive_runs(keep); }
+
+export func list_archive(limit) {
+  let rows = sql_query(db(),
+    "SELECT id, project_id, json, archived_ts, log_archived, log_bytes FROM runs_archive ORDER BY archived_ts DESC, id DESC LIMIT " + str(int(limit)), []);
+  let out = [];
+  for (row in rows) {
+    let r = parse_json(get(row, "json", ""), {});
+    push(out, {
+      id: str(get(row, "id", "")),
+      project_id: str(get(row, "project_id", "")),
+      project_name: str(get(r, "project_name", "")),
+      status: str(get(r, "status", "")),
+      image_ref: str(get(r, "image_ref", "")),
+      archived_ts: int(get(row, "archived_ts", 0)),
+      log_archived: int(get(row, "log_archived", 0)) == 1,
+      log_bytes: int(get(row, "log_bytes", 0)),
+    });
+  }
+  return out;
+}
+
+// 从归档里把一条运行连日志一起搬回来。返回 {ok, err, log_bytes}。
+export func restore_run(id) {
+  let rows = sql_query(db(),
+    "SELECT json, log_archived, log_bytes FROM runs_archive WHERE id = ?", [str(id)]);
+  if (len(rows) == 0) { return { ok: false, err: "归档里没有这个运行: " + str(id), log_bytes: 0 }; }
+  let row = rows[0];
+  let run = parse_json(str(get(row, "json", "")), null);
+  if (run == null) { return { ok: false, err: "归档记录已损坏: " + str(id), log_bytes: 0 }; }
+  let pr = put_run(run);
+  if (not get(pr, "ok", false)) { return { ok: false, err: str(get(pr, "err", "写回运行记录失败")), log_bytes: 0 }; }
+  let bytes = 0;
+  if (int(get(row, "log_bytes", 0)) > 0) {
+    let src = archive_dir() + "/" + str(id) + ".log";
+    let got = try(() => read_file(src));
+    if (got.ok != null) {
+      let txt = str(got.ok);
+      bytes = len(txt);
+      write_file(run_log_path(str(id)), txt);
+      write_file(src, "");
+    }
+  }
+  sql_write(db(), "DELETE FROM runs_archive WHERE id = ?", [str(id)]);
+  return { ok: true, err: "", log_bytes: bytes };
 }
 
 export func clear_runs() {

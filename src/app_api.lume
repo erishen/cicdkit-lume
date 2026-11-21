@@ -438,6 +438,21 @@ export func run_log(id, from) {
   return { status: 200, body: r };
 }
 
+// 归档列表：CICD_RUN_KEEP 裁掉的运行搬到了这里，随时可以恢复。
+export func run_archive(limit) {
+  let entries = store.list_archive(limit);
+  return { status: 200, body: { entries: entries, total: len(entries) } };
+}
+
+// 从归档恢复一条运行（连日志一起搬回 logs/）。
+export func run_restore(id) {
+  let r = store.restore_run(id);
+  if (not get(r, "ok", false)) {
+    return { status: 404, body: { ok: false, error: str(get(r, "err", "归档里没有这个运行")) } };
+  }
+  return { status: 200, body: { ok: true, restored: str(id), log_bytes: int(get(r, "log_bytes", 0)) } };
+}
+
 export func run_cancel(id) {
   let c = jobs.cancel(id);
   if (not get(c, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(c, "err", "")) } }; }

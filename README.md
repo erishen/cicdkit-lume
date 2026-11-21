@@ -93,7 +93,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `LUME_DATA` | `./.data` | 数据目录：`store.db` + `logs/` |
+| `LUME_DATA` | `./.data` | 数据目录：`store.db` + `logs/` + `logs-archive/`（归档的运行日志） |
 | `RUNNER_BASE` | `http://127.0.0.1:8899` | runner 地址 |
 | `RUNNER_AUTH` | 空 | runner 令牌；**不能**叫 `RUNNER_TOKEN`（Lume `env()` 屏蔽含 TOKEN 的名字） |
 | `RUNNER_AUTH_FILE` | 空 | 从文件读令牌，优先于 `RUNNER_AUTH` |
@@ -103,7 +103,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_SSH_USER/PORT/KEY_PATH/CONTAINER/CONTAINER_PORT/PROBE_PORT/RUN_ARGS/COMMAND` | 空 | 部署字段的兜底值 |
 | `CICD_DEPLOY_APPROVAL` | `off` | `off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
 | `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
-| `CICD_RUN_KEEP` | `300` | 运行历史保留条数；每次起新运行时把更早的记录连同日志一起清掉 |
+| `CICD_RUN_KEEP` | `300` | 运行历史保留条数；超出的**归档**（不删除），可用 `make restore ID=...` 恢复 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
@@ -162,6 +162,8 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
 | `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |
 | `POST /api/runs/:id/cancel` | 取消（转给 runner） |
+| `GET /api/runs/archive` | 归档列表（被 `CICD_RUN_KEEP` 收走的运行，含日志大小） |
+| `POST /api/runs/:id/restore` | 从归档恢复运行 + 日志（需 `?role=human_admin`） |
 | `DELETE /api/runs` | 清空运行记录（需 `?role=human_admin`） |
 | `GET /api/deployments`、`DELETE /api/deployments` | 部署历史 / 清空 |
 | `GET /api/config/llm`、`PUT`、`POST /api/config/llm/test` | LLM 配置（掩码）/ 保存 / 连通性测试 |
@@ -324,6 +326,9 @@ make docker-down
   带 `truncated` / `log_note`，前端顶部提示，完整日志去看控制面的 `<LUME_DATA>/logs/<run_id>.log`。
 - **`write_file` 也有 16 MiB 上限**：控制面侧无法用 DSL 自己生成超大文件（自测里的 17 MiB 日志样本由 Makefile 用 dd 预置）。
   runner 是 Go 写的，写日志不受这条限制，但控制面读回来时仍受 16 MiB 读取上限约束，所以才有上面的封顶。
+- **归档不会自动清理**：`runs_archive` + `logs-archive/` 是"防误删"的缓冲，不参与 `CICD_RUN_KEEP`。
+  归档量大了需要手动处理（归档的日志内容进 `logs-archive/`，恢复后又被截成 0 字节，占用很小）。
+  超过 16 MiB 的日志归档不了，`log_archived=false` 且原文件保留在 `logs/` 里。
 - **SQLite 不能建索引**：DDL 护栏只允许 `CREATE TABLE`，`CREATE INDEX` 被拒。当前 200 来条记录无所谓，
   记录量上百倍增长后列表查询会变慢，到那时得换存储层而不是硬扛。
 - **runner 的任务表只在内存里**：重启即丢，控制面会把还在跑的运行标成 `interrupted`（不会再标成 running 干等）。

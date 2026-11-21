@@ -115,23 +115,40 @@ let runs = store.list_runs("proj-t1", 10, 0);
 ok("运行列表总数", int(get(runs, "total", 0)) == 1);
 
 // 运行历史保留：runs 表和 logs 目录不能只涨不跌（SQLite 又不允许建索引）。
-let trim_base = now();
+// 关键要求是"可回滚"：超龄的不是删掉，而是进归档，能原样恢复。
+let trim_base = now() + 5;
 let tk = 0;
 while (tk < 4) {
-  let rid = "run-trim-" + str(tk);
+  let rid = "run-arc-" + str(tk);
   store.put_run({ id: rid, project_id: "proj-t1", project_name: "demo-app", trigger: "manual",
     status: "success", created_ts: trim_base + tk });
   store.write_log(rid, "log of " + rid + "\n");
   tk = tk + 1;
 }
-let trimmed = store.trim_runs(3);
-ok("按保留条数裁掉多余历史", int(trimmed) > 0);
+let archived = store.archive_runs(3);
+ok("超龄历史进归档", int(archived) > 0);
 let left = store.list_runs("", 50, 0);
-ok("裁完后总数不超过保留条数", int(get(left, "total", 0)) <= 3);
-let gone = store.read_log_tail("run-trim-0", 0, 4096);
-ok("被裁掉的运行日志已清空", len(str(get(gone, "log", ""))) == 0);
-let kept = store.read_log_tail("run-trim-3", 0, 4096);
-ok("保留的最近一条日志还在", contains(str(get(kept, "log", "")), "run-trim-3"));
+ok("归档后总数不超过保留条数", int(get(left, "total", 0)) <= 3);
+let alist = store.list_archive(100);
+ok("归档列表能看到被收走的运行", len(alist) > 0);
+ok("归档记录带项目名", len(str(get(alist[0], "project_name", ""))) > 0);
+let gone = store.read_log_tail("run-arc-0", 0, 4096);
+ok("被归档的运行已从列表消失（日志文件已清空）", len(str(get(gone, "log", ""))) == 0);
+let kept = store.read_log_tail("run-arc-3", 0, 4096);
+ok("保留的最近一条日志还在", contains(str(get(kept, "log", "")), "run-arc-3"));
+
+// 回滚：从归档恢复，运行记录和日志都要原样回来。
+let rr = store.restore_run("run-arc-0");
+ok("恢复归档运行成功", bool(get(rr, "ok", false)) == true);
+ok("日志一起恢复", int(get(rr, "log_bytes", 0)) > 0);
+ok("恢复后运行记录回来了", store.get_run("run-arc-0") != null);
+let restored_log = store.read_log_tail("run-arc-0", 0, 4096);
+ok("恢复后日志内容一致", contains(str(get(restored_log, "log", "")), "run-arc-0"));
+let alist2 = store.list_archive(100);
+let still = false;
+for (e in alist2) { if (str(get(e, "id", "")) == "run-arc-0") { still = true; } }
+ok("恢复后归档里不再留这条", not still);
+ok("恢复不存在的归档会报错", bool(get(store.restore_run("no-such-run"), "ok", true)) == false);
 ok("CICD_RUN_KEEP 默认 300", int(store.run_keep()) == 300);
 
 // ---- 部署 / 知识库 ----
@@ -176,8 +193,8 @@ ok("命中计数与路径", int(get(acc, "n", 0)) == 2 and len(get(acc, "items",
 
 // ---- 清空 ----
 print("store: clear");
-// 上面的保留策略留下 3 条，清空必须把它们全删掉（不是只删 1 条）。
-ok("清空运行", int(store.clear_runs()) == 3);
+// 上面的保留策略留下 3 条、恢复回来 1 条，清空必须把它们全删掉。
+ok("清空运行", int(store.clear_runs()) == 4);
 ok("运行已空", int(get(store.list_runs("", 10, 0), "total", 0)) == 0);
 ok("清空部署", int(store.clear_deployments()) == 1);
 ok("删除项目", int(store.delete_project("proj-t1")) == 1);

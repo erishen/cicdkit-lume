@@ -105,6 +105,14 @@ secret:
 	@umask 077; printf '%s\n' '$(VALUE)' > $(DATA)/secrets/$(NAME)
 	@echo "✓ 已写入 $(DATA)/secrets/$(NAME)"
 
+# 运行历史归档（CICD_RUN_KEEP 收走的那些），可列出、可恢复。
+archive:
+	@LUME_DATA=$(DATA) $(LUME) scripts/archive_admin.lume
+
+restore:
+	@test -n "$(ID)" || (echo "用法：make restore ID=<run_id>" >&2; exit 2)
+	@out=$$(LUME_DATA=$(DATA) ACTION=restore RUN_ID=$(ID) $(LUME) scripts/archive_admin.lume); echo "$$out"; case "$$out" in 恢复失败*) exit 1;; esac
+
 # 切换前体检：build.context / Dockerfile / kubeconfig / ssh key 在本机上是否真的存在。
 # 有阻断项返回非 0。容器视角的路径映射用 remap / remap-apply（见 README）。
 preflight:

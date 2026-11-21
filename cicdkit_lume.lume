@@ -226,6 +226,17 @@ delete "/api/runs", (req) => {
   return api.run_clear();
 };
 
+// 归档列表必须排在 /api/runs/:id 之前，否则 "archive" 会被当成一个 run id。
+get "/api/runs/archive", (req) => {
+  return api.run_archive(qint(req, "limit", 200));
+};
+
+post "/api/runs/:id/restore", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "恢复归档运行");
+  if (not get(gate, "allowed", false)) { return denied(gate, "恢复归档运行"); }
+  return api.run_restore(str(get(req.params, "id", "")));
+};
+
 // 日志尾放在 :id 之前也无所谓（路径段数不同），但按具体优先写更清楚。
 get "/api/runs/:id/log", (req) => {
   return api.run_log(str(get(req.params, "id", "")), qint(req, "from", 0));

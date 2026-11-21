@@ -1,0 +1,43 @@
+// scripts/archive_admin.lume — 归档运维（命令行）
+//
+//   make archive                 列出被 CICD_RUN_KEEP 收走的运行
+//   make restore ID=<run_id>     恢复到运行列表（连日志一起搬回）
+//
+// 走 env 传参（LUME 的 CLI 没有 argv）：ACTION=list|restore，RUN_ID=<id>。
+// LUME 也没有 exit()，失败只在输出里表态 "恢复失败: ..."，Makefile 用 grep 判非零。
+
+import "../src/store.lume" as store;
+
+store.init();
+
+let act = "list";
+let a = env("ACTION");
+if (a != null and len(trim(str(a))) > 0) { act = trim(str(a)); }
+
+if (act == "restore") {
+  let rid = "";
+  let r = env("RUN_ID");
+  if (r != null) { rid = trim(str(r)); }
+  if (len(rid) == 0) {
+    print("恢复失败: 缺少 RUN_ID（make restore ID=<run_id>）");
+  } else {
+    let got = store.restore_run(rid);
+    if (bool(get(got, "ok", false))) {
+      print("已恢复 " + rid + "（日志 " + str(int(get(got, "log_bytes", 0))) + " 字节）");
+    } else {
+      print("恢复失败: " + str(get(got, "err", "")));
+    }
+  }
+} else {
+  let rows = store.list_archive(500);
+  if (len(rows) == 0) {
+    print("归档为空（CICD_RUN_KEEP=" + str(store.run_keep()) + "，超龄运行才会进归档）");
+  } else {
+    print("归档 " + str(len(rows)) + " 条（最多显示 500）:");
+    for (e in rows) {
+      print("  " + str(get(e, "id", "")) + "  " + str(get(e, "project_name", "")) + "  " +
+        str(get(e, "status", "")) + "  log=" + str(bool(get(e, "log_archived", false))) +
+        "/" + str(int(get(e, "log_bytes", 0))) + "B");
+    }
+  }
+}
