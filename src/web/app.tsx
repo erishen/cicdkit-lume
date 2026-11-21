@@ -1183,6 +1183,7 @@ function RunDrawer({
   const [error, setError] = useState('')
   const [canceling, setCanceling] = useState(false)
   const [showDiag, setShowDiag] = useState(false)
+  const [logNote, setLogNote] = useState('')
   const fromRef = useRef(0)
   const preRef = useRef<HTMLPreElement | null>(null)
 
@@ -1214,6 +1215,7 @@ function RunDrawer({
           setLogText((prev) => prev + (d.log || ''))
         }
         fromRef.current = d.log_len || 0
+        setLogNote(d.log_note || '')
         setStatus(d.status || '')
         if (d.stages) setStages(d.stages)
         setProbe(d.probe)
@@ -1301,6 +1303,7 @@ function RunDrawer({
 
         {showDiag && <DiagnosePanel runId={runId} onClose={() => setShowDiag(false)} />}
 
+        {logNote && <div className="notice warn">{logNote}</div>}
         <pre className="log" ref={preRef}>
           {logText || '（日志为空：运行可能尚未开始，或上游历史记录没有日志）'}
         </pre>

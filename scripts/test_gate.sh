@@ -189,6 +189,12 @@ if [ -f "$DATA/gate-src/Dockerfile" ] && [ -f "$DATA/gate-src/k8s/deployment.yam
 call POST "/api/projects/gate-gen/generate?role=human_admin"
 expect_body '"needs_any":false' "生成脚手架：二次调用幂等"
 
+# 8.2) 目录浏览的根目录校验：前缀越界与 .. 逃逸都必须 403
+call GET "/api/fs/list?dir=${DATA}/../etc"
+expect_code 403 "目录浏览：.. 逃逸被拒"
+call GET "/api/fs/list?dir=${DATA}x"
+expect_code 403 "目录浏览：同前缀兄弟目录被拒"
+
 # 9) 静态站
 call GET "/"
 expect_code 200 "静态：index.html 正常伺服"

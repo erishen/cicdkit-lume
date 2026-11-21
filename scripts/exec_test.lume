@@ -93,6 +93,17 @@ contains("argv 只留参数名", join(bs2.argv, " "), "--build-arg LLM_API_KEY "
 eq("值落到 step.env", str(get(get(bs2, "env", {}), "LLM_API_KEY", "")), "sk-demo-xyz");
 eq("普通参数仍在 argv", int(len(str_match("NORMAL=v", join(bs2.argv, " ")))), 1);
 
+// ---------- runner 状态查询：连不上 ≠ job 丢了 ----------
+let st1 = exec.status("job-xyz");
+eq("runner 不可达 → ok=false", get(st1, "ok", true), false);
+eq("runner 不可达 → missing=false（不能误判成 job 丢失）", get(st1, "missing", true), false);
+eq("runner 不可达 → 带错误原因", len(str(get(st1, "err", ""))) > 0, true);
+
+let cn = exec.cancel("job-xyz");
+eq("取消：runner 不可达 → ok=false", get(cn, "ok", true), false);
+eq("取消：runner 不可达 → missing=false", get(cn, "missing", true), false);
+has("取消：错误信息说明送达失败", get(cn, "err", ""), "cannot reach");
+
 let psteps = exec.push_steps(p, b.image_ref);
 eq("push steps", len(psteps), 1);
 eq("push argv", join(psteps[0].argv, " "), "docker push registry.example.com/team/demo:20261121-120000");

@@ -71,7 +71,7 @@ smoke:
 # 三层自测：存储 34 项、执行计划 61 项、闸门/降级（临时实例，不碰真实上游）。
 test: vendor
 	@rm -rf /tmp/lume_test_store && LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
-	@rm -rf /tmp/lume_test_exec && LUME_DATA=/tmp/lume_test_exec $(LUME) scripts/exec_test.lume
+	@rm -rf /tmp/lume_test_exec && LUME_DATA=/tmp/lume_test_exec RUNNER_BASE=http://127.0.0.1:9 $(LUME) scripts/exec_test.lume
 	@rm -rf /tmp/lume_test_gen && LUME_DATA=/tmp/lume_test_gen $(LUME) scripts/generate_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 

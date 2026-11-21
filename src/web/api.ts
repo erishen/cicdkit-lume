@@ -102,6 +102,8 @@ export interface RunLog {
   status: string
   stages?: StageResult[]
   reset: boolean
+  truncated?: boolean
+  log_note?: string
   probe?: { status?: string; status_code?: number; url?: string; latency_ms?: number }
   diagnosis?: { text?: string; adopted?: boolean; rejected?: boolean }
 }

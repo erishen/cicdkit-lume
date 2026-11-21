@@ -201,13 +201,20 @@ export func sync(run_id) {
   let r = store.get_run(run_id);
   if (r == null) { return null; }
   let status = str(get(r, "status", ""));
-  if (status == "success" or status == "failed" or status == "canceled") { return r; }
+  // interrupted 也是终态：已经认了失败就别再每次轮询都去问 runner。
+  if (status == "success" or status == "failed" or status == "canceled" or status == "interrupted") { return r; }
 
   let job_id = str(get(r, "job_id", ""));
-  let job = exec.status(job_id);
+  let probe = exec.status(job_id);
+  if (not get(probe, "missing", false) and not get(probe, "ok", false)) {
+    // 连不上 runner（超时/拒绝连接）不是「job 丢了」，保持原状态继续等；
+    // 否则一次网络抖动就会把正在跑的构建标成 interrupted。
+    return r;
+  }
+  let job = get(probe, "job", null);
   if (job == null) {
     // runner 重启会丢 job 表：这时不能再等，标成 interrupted 让人重新跑。
-    if (status == "running") {
+    if (status == "running" or status == "queued") {
       let ts = now();
       return store.patch_run(run_id, {
         status: "interrupted",
@@ -229,7 +236,9 @@ export func sync(run_id) {
         started_at: store.fmt_iso(now()),
         stages: get(r2, "stages", []),
       });
-    } else {
+    } else if (stringify(get(r2, "stages", [])) != stringify(get(r, "stages", []))) {
+      // 阶段没变就不写库：这个函数每 1.5s 被日志轮询调用一次，
+      // 无条件 patch 等于持续制造「读-改-写」窗口，白耗 WAL 还容易丢更新。
       store.patch_run(run_id, { stages: get(r2, "stages", []) });
     }
     return r2;
@@ -294,8 +303,24 @@ export func cancel(run_id) {
     return { ok: false, err: "运行已结束（" + status + "），无法取消" };
   }
   let job_id = str(get(r, "job_id", ""));
-  if (len(job_id) > 0) { exec.cancel(job_id); }
   let ts = now();
+  if (len(job_id) > 0) {
+    let c = exec.cancel(job_id);
+    if (get(c, "missing", false)) {
+      store.patch_run(run_id, {
+        status: "interrupted",
+        error: "runner 上找不到这个 job（runner 可能重启过）",
+        ended_ts: ts,
+        ended_at: store.fmt_iso(ts),
+      });
+      return { ok: false, err: "job 已不在 runner 上，已标记为 interrupted" };
+    }
+    if (not get(c, "ok", false)) {
+      // 取消请求没送到 runner 就不要把本地改成 canceled：
+      // 前端显示已取消、容器里还在构建是最难排查的一种状态不一致。
+      return { ok: false, err: "取消请求未能送达 runner：" + str(get(c, "err", "")) };
+    }
+  }
   store.patch_run(run_id, {
     status: "canceled",
     canceled: true,

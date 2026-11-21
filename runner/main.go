@@ -278,16 +278,36 @@ func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
 }
 
 // prune 只保留最近 200 个已结束的任务，避免长跑进程内存只涨不跌。
+// 运行中/排队中的任务一律保留在 order 里：第一版直接切 order 尾部，
+// 把还在跑的任务 id 从 order 里切掉了 —— map 里留着、order 里没了，
+// 之后再也轮不到它被清理，等于反向泄漏。调用方持有 s.mu。
 func (s *server) prune() {
 	if len(s.order) <= 200 {
 		return
 	}
-	for _, id := range s.order[:len(s.order)-200] {
-		if j, ok := s.jobs[id]; ok && j.Status != "running" && j.Status != "queued" {
-			delete(s.jobs, id)
+	cut := len(s.order) - 200
+	keep := make([]string, 0, 200+cut)
+	live := 0
+	for i, id := range s.order {
+		j, ok := s.jobs[id]
+		if !ok {
+			continue
 		}
+		if i < cut {
+			if j.Status == "running" || j.Status == "queued" {
+				keep = append(keep, id)
+				live++
+				continue
+			}
+			delete(s.jobs, id)
+			continue
+		}
+		keep = append(keep, id)
 	}
-	s.order = s.order[len(s.order)-200:]
+	s.order = keep
+	if live > 0 {
+		log.Printf("prune: 保留 %d 个仍在运行的任务", live)
+	}
 }
 
 func sanitize(name string) string {
@@ -323,16 +343,32 @@ func nowISO() string { return time.Now().Format(time.RFC3339) }
 // ---------- 执行 ----------
 
 func (s *server) run(job *Job, timeoutS int) {
-	s.sem <- struct{}{}
-	defer func() { <-s.sem }()
-
+	// ctx 必须在等信号量之前就建好并挂到 job 上：排队中的任务也要能被取消，
+	// 否则 cancel 端点找不到 cancel 函数，只能返回一个「已取消」的假象。
 	ctx, cancel := context.WithCancel(context.Background())
 	job.mu.Lock()
 	job.cancel = cancel
+	job.mu.Unlock()
+	defer cancel()
+
+	select {
+	case s.sem <- struct{}{}:
+	case <-ctx.Done():
+		s.finish(job, 130)
+		return
+	}
+	defer func() { <-s.sem }()
+
+	job.mu.Lock()
+	if job.Status == "canceled" {
+		// 排队期间被取消：一步都不执行。
+		job.mu.Unlock()
+		s.finish(job, 130)
+		return
+	}
 	job.Status = "running"
 	job.StartedAt = nowISO()
 	job.mu.Unlock()
-	defer cancel()
 
 	f, err := os.OpenFile(job.logPath, os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
@@ -400,10 +436,19 @@ func (s *server) run(job *Job, timeoutS int) {
 		job.setStep(i, "done", 0, nowISO())
 	}
 
+	s.finish(job, exit)
+}
+
+// finish 把任务推到终态：取消、失败、成功三种收口都走这里，
+// 避免「排队取消」和「执行完」两套收尾逻辑慢慢跑偏。
+func (s *server) finish(job *Job, exit int) {
 	job.mu.Lock()
+	defer job.mu.Unlock()
 	job.Exit = exit
 	job.LogLen = fileSize(job.logPath)
-	job.EndedAt = nowISO()
+	if job.EndedAt == "" {
+		job.EndedAt = nowISO()
+	}
 	switch {
 	case job.Canceled || exit == 130:
 		job.Status = "canceled"
@@ -418,7 +463,6 @@ func (s *server) run(job *Job, timeoutS int) {
 			job.Steps[i].Status = "skipped"
 		}
 	}
-	job.mu.Unlock()
 }
 
 // execStep 直接 exec（不经 shell），stdout/stderr 逐行写入日志文件：
@@ -532,7 +576,16 @@ func (s *server) handleJob(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			job.mu.Lock()
-			if job.cancel != nil && (job.Status == "running" || job.Status == "queued") {
+			// 两种情况都要覆盖：
+			//   running —— 有 ctx，cancel() 终止进程；
+			//   queued  —— 还在等信号量（cancel 字段可能是 nil），直接改状态，
+			//              由 run() 在拿到槽位后看到 canceled 并跳过执行。
+			if job.Status == "queued" {
+				job.Status = "canceled"
+				job.Canceled = true
+				job.EndedAt = nowISO()
+			}
+			if job.cancel != nil {
 				job.cancel()
 			}
 			job.mu.Unlock()

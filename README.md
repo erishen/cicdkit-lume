@@ -311,6 +311,18 @@ make docker-down
 - lume 二进制从既有镜像取（`LUME_BIN_IMAGE`，默认 `lume-bin:0.14.2`）：
   lume 是静态 C 单二进制，release 包在本机网络下不可达。
 
+## 已知限制与运维提醒
+
+- **角色是自报的（`?role=`），不是身份认证**：`CICD_DEPLOY_APPROVAL` 挡住的是「没自报角色的手滑调用」，
+  挡不住知道 URL 的人。对外暴露必须加 `HTPASSWD_FILE` 或前置反代，把 `?role=` 当成流程标签而不是凭证。
+- **`patch_run` 是读-改-写，没有事务**（Lume 的 SQL 护栏不开放事务，也没有进程内互斥）。
+  已做的是「阶段没变化就不写库」把触发次数压到最低；单人多标签页同时盯同一运行仍有极窄的覆盖窗口。
+- **日志超过 16 MiB 只显示前 16 MiB**（`read_file` 有硬上限，无分片读），接口会带 `truncated` 和 `log_note`，
+  前端顶部有提示，完整日志去 `.data/logs/<run_id>.log` 看。
+- **SQLite 不能建索引**：DDL 护栏只允许 `CREATE TABLE`，`CREATE INDEX` 被拒。当前 200 来条记录无所谓，
+  记录量上百倍增长后列表查询会变慢，到那时得换存储层而不是硬扛。
+- **runner 的任务表只在内存里**：重启即丢，控制面会把还在跑的运行标成 `interrupted`（不会再标成 running 干等）。
+
 ## 还没做 / 已知取舍
 
 - A2A 六端点（`/.well-known/agent-card.json`、`/a2a`、`/peer/health|tools|invoke|relay`）

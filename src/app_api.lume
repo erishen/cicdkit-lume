@@ -426,6 +426,10 @@ export func run_log(id, from) {
   put(r, "log", redact.mask_log(str(get(t, "log", ""))));
   put(r, "log_len", get(t, "log_len", 0));
   put(r, "reset", get(t, "reset", false));
+  put(r, "truncated", get(t, "truncated", false));
+  if (bool(get(t, "truncated", false))) {
+    put(r, "log_note", "日志超过 16 MiB（read_file 上限），这里只显示前 16 MiB，完整内容去看 .data/logs/" + str(id) + ".log");
+  }
   return { status: 200, body: r };
 }
 
@@ -521,14 +525,20 @@ export func fs_roots() {
   return { roots: out };
 }
 
+// 目录浏览的前缀校验。两个坑都踩过（同类实现的经典写法）：
+//   1. 只比前缀会让 `/Users/x` 放行 `/Users/xyz`，必须比到 `/` 边界；
+//   2. 比前缀不挡 `..`，`/Users/x/../../etc` 前缀仍然成立，
+//      拼接后却跑出了允许根——所以含 `..` 一律拒。
 func in_root(dir) {
-  let roots = get(fs_roots(), "roots", []);
   let d = str(dir);
+  if (len(d) == 0 or contains(d, "..")) { return false; }
+  let roots = get(fs_roots(), "roots", []);
   let i = 0;
   while (i < len(roots)) {
     let r = str(roots[i]);
+    if (substr(r, len(r) - 1) == "/") { r = substr(r, 0, len(r) - 1); }
     if (d == r) { return true; }
-    if (len(d) > len(r) and substr(d, 0, len(r)) == r) { return true; }
+    if (len(d) > len(r) and substr(d, 0, len(r)) == r and substr(d, len(r), 1) == "/") { return true; }
     i = i + 1;
   }
   return false;

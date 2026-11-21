@@ -252,10 +252,14 @@ export func clear_runs() {
 }
 
 // 日志尾：from 是客户端已渲染的字节偏移；0 = 从尾部最多 tail_max 字节开始。
+// read_file 有 16 MiB 硬上限（无分片读），所以超过这个长度的日志只能给前 16 MiB。
+// 必须把这件事显式报出来：否则前端按 log_len 推进偏移，会以为日志「读完了」。
+let LOG_READ_MAX = 16777216;
+
 export func read_log_tail(run_id, from, tail_max) {
   let path = run_log_path(run_id);
   let text = read_file(path);
-  if (text == null) { return { log: "", log_len: 0, from: 0, reset: from > 0 }; }
+  if (text == null) { return { log: "", log_len: 0, from: 0, reset: from > 0, truncated: false }; }
   let src = str(text);
   let total = len(src);
   let start = int(from);
@@ -264,7 +268,8 @@ export func read_log_tail(run_id, from, tail_max) {
     if (total > int(tail_max)) { start = total - int(tail_max); } else { start = 0; }
     reset = true;
   }
-  return { log: substr(src, start, total - start), log_len: total, from: start, reset: reset };
+  let truncated = total >= LOG_READ_MAX;
+  return { log: substr(src, start, total - start), log_len: total, from: start, reset: reset, truncated: truncated };
 }
 
 export func write_log(run_id, text) {

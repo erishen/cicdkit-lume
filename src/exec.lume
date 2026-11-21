@@ -92,17 +92,28 @@ export func submit(name, steps, timeout_s) {
   return { ok: true, id: str(get(get(r, "data", {}), "id", "")), err: "" };
 }
 
+// 查 job 状态。必须把「runner 说没有这个 job」和「runner 连不上」分开：
+// 前者是 job 真丢了（runner 重启），后者只是一次网络抖动，
+// 当成丢失会把正在跑的构建误标成 interrupted。
+// → { ok, missing, job, err }
 export func status(job_id) {
-  if (len(str(job_id)) == 0) { return null; }
+  if (len(str(job_id)) == 0) { return { ok: false, missing: false, job: null, err: "job_id 为空" }; }
   let r = runner_json("GET", "/jobs/" + str(job_id), null, 5);
-  if (not get(r, "ok", false)) { return null; }
-  return get(r, "data", null);
+  let code = int(get(r, "status", 0));
+  if (code == 404) { return { ok: false, missing: true, job: null, err: "job 不存在" }; }
+  if (not get(r, "ok", false)) { return { ok: false, missing: false, job: null, err: str(get(r, "err", "runner 不可达")) }; }
+  return { ok: true, missing: false, job: get(r, "data", null), err: "" };
 }
 
+// 取消也区分「runner 说没这个 job」与「runner 连不上」：前者本地应转 interrupted，
+// 后者不能假装取消成功（否则本地显示已取消、容器里还在构建）。
+// → { ok, missing, err }
 export func cancel(job_id) {
-  if (len(str(job_id)) == 0) { return false; }
+  if (len(str(job_id)) == 0) { return { ok: false, missing: false, err: "job_id 为空" }; }
   let r = runner_json("POST", "/jobs/" + str(job_id) + "/cancel", "{}", 5);
-  return get(r, "ok", false);
+  if (int(get(r, "status", 0)) == 404) { return { ok: false, missing: true, err: "job 不存在" }; }
+  if (not get(r, "ok", false)) { return { ok: false, missing: false, err: str(get(r, "err", "runner 不可达")) }; }
+  return { ok: true, missing: false, err: "" };
 }
 
 // ---------- 计划：构建 ----------
