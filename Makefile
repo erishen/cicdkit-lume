@@ -72,6 +72,7 @@ smoke:
 test: vendor
 	@rm -rf /tmp/lume_test_store && LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
 	@$(LUME) scripts/exec_test.lume
+	@rm -rf /tmp/lume_test_gen && LUME_DATA=/tmp/lume_test_gen $(LUME) scripts/generate_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 
 # 清洗项目配置里明文存放的密钥（LLM_API_KEY / *_VISIT_PIN 等）。

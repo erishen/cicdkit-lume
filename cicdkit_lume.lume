@@ -123,6 +123,11 @@ get "/api/overview", (req) => {
   return { status: 200, body: api.overview() };
 };
 
+// ---------- webhook（外部 CI 触发，不受角色闸门，用自己的 key 校验）----------
+post "/api/webhook/:id", (req) => {
+  return api.webhook(str(get(req.params, "id", "")), body_of(req), qstr(req, "secret", ""));
+};
+
 // ---------- 项目 ----------
 
 get "/api/projects", (req) => {
@@ -163,6 +168,14 @@ post "/api/projects/:id/targets/:target/deploy", (req) => {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
   }
   return api.project_deploy(id, "{\"target\":\"" + target + "\"}");
+};
+
+// 脚手架生成：必须在 :action 之前注册，否则会被当成未知动作。
+post "/api/projects/:id/generate", (req) => {
+  let id = str(get(req.params, "id", ""));
+  let gate = guard.role_allowed(req, "human_admin", "生成项目脚手架");
+  if (not get(gate, "allowed", false)) { return denied(gate, "生成项目脚手架"); }
+  return api.project_generate(id, qstr(req, "apply", "") == "1");
 };
 
 post "/api/projects/:id/:action", (req) => {

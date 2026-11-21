@@ -9,6 +9,7 @@ import "redact.lume" as redact;
 import "validate.lume" as validate;
 import "exec.lume" as exec;
 import "jobs.lume" as jobs;
+import "generate.lume" as generate;
 
 // ---------- 小工具 ----------
 
@@ -235,6 +236,63 @@ export func project_scan(dir) {
     i = i + 1;
   }
   return { status: 200, body: { ok: true, root: root, candidates: out } };
+}
+
+// ---------- webhook（外部 CI 触发）----------
+
+// 与 cicdkit 一致：webhook 不参与角色闸门（它是机器调用），靠自己的 key 校验；
+// 未设置 CICD_HOOK_KEY 时直接拒绝，避免「忘了配 = 谁都能触发构建」。
+// 注意变量名不能含 SECRET/TOKEN（Lume 的 env() 会屏蔽那类名字）。
+export func webhook(id, raw, secret) {
+  let want = env_str("CICD_HOOK_KEY");
+  if (len(want) == 0) { return { status: 503, body: { ok: false, error: "webhook 未启用：请设置 CICD_HOOK_KEY" } }; }
+  if (str(secret) != want) { return { status: 401, body: { ok: false, error: "secret 校验失败" } }; }
+  if (len(trim(str(id))) == 0) { return { status: 400, body: { ok: false, error: "缺少项目 id" } }; }
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let method = trim(str(get(body, "method", "")));
+  if (len(method) > 0 and not validate.method_ok(method)) {
+    return { status: 400, body: { ok: false, error: "非法的部署方式覆盖: " + method } };
+  }
+  let tn = trim(str(get(body, "target", "")));
+  if (len(tn) > 0) {
+    let rd = validate.resolve_deploy(p, tn, method);
+    if (not get(rd, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(rd, "err", "目标不存在")) } }; }
+  }
+
+  let opts = {
+    trigger: "webhook",
+    tag: trim(str(get(body, "tag", ""))),
+    method: method,
+    target: tn,
+    image_ref: trim(str(get(body, "image_ref", ""))),
+  };
+  let r = jobs.start(p, "pipeline", opts);
+  if (not get(r, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(r, "err", "")) } }; }
+  return {
+    status: 202,
+    body: { ok: true, run_id: str(get(r, "run_id", "")), image_ref: str(get(r, "image_ref", "")) },
+  };
+}
+
+// ---------- 脚手架生成（补 Dockerfile / k8s 清单）----------
+
+// apply=false 只预览（前端把内容摆出来让人确认），apply=true 才写盘并回写项目配置。
+export func project_generate(id, do_apply) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let pl = generate.plan(p, jobs.work_dir());
+  if (not get(pl, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(pl, "err", "")) } }; }
+  if (not do_apply) { return { status: 200, body: pl }; }
+  let res = generate.apply(p, jobs.work_dir());
+  if (not get(res, "ok", false)) { return { status: 500, body: { ok: false, error: str(get(res, "err", "")) } }; }
+  if (not get(res, "needs_any", false)) {
+    return { status: 200, body: { ok: true, needs_any: false, message: "Dockerfile 与 k8s 清单均已存在，无需生成" } };
+  }
+  return { status: 200, body: { ok: true, needs_any: true, plan: res } };
 }
 
 // ---------- 动作 ----------

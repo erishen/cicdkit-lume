@@ -82,7 +82,9 @@ export func start(project, kind, opts) {
   let plan_err = "";
 
   if (kind == "build" or kind == "pipeline") {
-    let tag = exec.make_tag();
+    // webhook 可以带 tag 覆盖（外部 CI 通常已经有自己的构建号）。
+    let tag = trim(str(get(opts, "tag", "")));
+    if (len(tag) == 0) { tag = exec.make_tag(); }
     let b = exec.build_steps(p, tag);
     if (not get(b, "ok", false)) { return { ok: false, run_id: "", err: str(get(b, "err", "构建计划生成失败")) }; }
     image = str(get(b, "image_ref", ""));

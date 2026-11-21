@@ -103,6 +103,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_SSH_USER/PORT/KEY_PATH/CONTAINER/CONTAINER_PORT/PROBE_PORT/RUN_ARGS/COMMAND` | 空 | 部署字段的兜底值 |
 | `CICD_DEPLOY_APPROVAL` | `off` | `off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
 | `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
+| `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
 
@@ -152,7 +153,9 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `POST /api/projects/scan` | 扫描候选目录（有 Dockerfile 或 deploy/k8s/chart/） |
 | `GET/PUT /api/projects/:id` | 详情 / 保存（PUT 需 `?role=human_admin`，掩码字段不回写） |
 | `DELETE /api/projects/:id` | 删除项目（需 `?role=human_admin`） |
+| `POST /api/projects/:id/generate` | 补 `Dockerfile` / k8s 清单；`?apply=1` 才落盘（需 `?role=human_admin`） |
 | `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe` |
+| `POST /api/webhook/:id` | 外部 CI 触发流水线；`?secret=` 对 `CICD_HOOK_KEY`，不受角色闸门 |
 | `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护 |
 | `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
 | `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |
@@ -229,6 +232,35 @@ make sanitize-apply    # 先备份 store.db 再写库
 - 幂等：清洗完再跑一次全部 `clean`。
 - **是有损操作**：这些参数会变成掩码，依赖它们注入密钥的构建会失效——要么改成从
   环境变量/secret 文件读取，要么确认该构建不再需要。清洗后 `plan_dump` 仍能正常生成计划。
+
+## 外部 CI 触发（webhook）
+
+给 GitLab/Jenkins/CNB 这类外部 CI 留的入口：它们没有飞书身份、也拿不到角色，所以不走角色闸门，靠共享密钥自证。
+
+```bash
+export CICD_HOOK_KEY=$(openssl rand -hex 24)   # 不设就是不启用，接口返回 503
+curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm?secret=$CICD_HOOK_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"tag":"v1.2.3","method":"ssh","target":"阿里云"}'
+```
+
+- 只收 `POST`；`id` 缺失 400、项目不存在 404。
+- 密钥只从 query `?secret=` 取（Lume 的请求对象不暴露请求头，`X-Webhook-Secret` 这条上游兼容没做）。
+- body 全部可选：`tag`（覆盖自动时间戳 tag）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）。
+- 成功返回 `202` 和 `run_id` —— 只是**受理**，进度照样去 `/api/runs/:id` 看。
+- 触发的是 `pipeline`（构建 + 部署），`trigger` 记为 `webhook`，方便在运行列表里区分人点还是机器点。
+
+**建议**：对外暴露时把 webhook 单独走内网或加 `HTPASSWD_FILE`；密钥一旦泄漏，等于把「随时触发发布」的能力给了对方。发布本身仍受 `CICD_DEPLOY_APPROVAL` 约束吗？——**不受**：webhook 走 `jobs.start(..., "pipeline")` 与人工点「流水线」同一条路径，闸门只管 `/deploy`。需要更严时把 `method` 不传、只让它构建。
+
+## 脚手架生成
+
+`/api/projects/:id/generate` 补两样东西：`Dockerfile`（项目里没有才生成）和 k8s 清单（部署方式是 `kubectl-apply` / `local-k3s` 且没有 `manifest_path` 时才生成）。
+
+- 语言靠标记文件识别：`go.mod`→go、`package.json`→node、`requirements.txt`/`pyproject.toml`→python、`pom.xml`→java-maven、`build.gradle`→java-gradle、`Cargo.toml`→rust；都认不出就明确报错，不猜。
+- 默认只预览：返回 `dockerfile` / `manifest` 两段 `{path, content}` 和 `config_updates`，一个字都不写。
+- `?apply=1` 才落盘，并回写 `build.dockerfile`、`deploy.manifest_path`，顺带补 `deploy.container` 和 `build.image_repo`（空着才补）。
+- **已有文件永不覆盖**；所有写入都限制在该项目的 `build.context` 内（`..` 逃逸直接拒绝）。
+- 二次调用返回 `needs_any: false`，幂等。
 
 ## 自测
 

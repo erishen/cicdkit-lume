@@ -1,0 +1,326 @@
+// src/generate.lume —— 给「缺 Dockerfile / 缺 k8s 清单」的项目补脚手架
+//
+// 从 cicdkit 的 internal/generate 移植（保守策略保持一致）：
+//   * 只在文件缺失时生成，已有文件永不覆盖；
+//   * 生成物只写在 build.context 里面；
+//   * plan 只预览不落盘，apply 才写文件并回写项目配置；
+//   * 语言识别按标记文件（go.mod / package.json / requirements.txt ...）。
+//
+// 与 cicdkit 的差异：这里不猜端口映射之外的运行细节，manifest 只给最小
+// Deployment + Service，端口取 deploy.container_port（默认 8080）。
+
+import "./store.lume" as store;
+
+let MARKERS = ["go.mod", "package.json", "requirements.txt", "pyproject.toml", "Pipfile", "setup.py", "pom.xml", "build.gradle", "Cargo.toml"];
+
+// read_file(目录) 给 null、files(不存在的目录) 给 []：目录存在性只能查父目录条目。
+export func path_exists(path) {
+  let s = str(path);
+  if (read_file(s) != null) { return true; }
+  let parts = split(s, "/");
+  if (len(parts) == 0) { return false; }
+  let base = str(parts[len(parts) - 1]);
+  if (len(base) == 0) { return false; }
+  let parent = "";
+  let i = 0;
+  while (i < len(parts) - 1) {
+    parent = parent + str(parts[i]) + "/";
+    i = i + 1;
+  }
+  if (len(parent) == 0) { parent = "./"; }
+  let entries = files(parent);
+  let j = 0;
+  while (j < len(entries)) {
+    let e = str(entries[j]);
+    if (e == base or e == base + "/") { return true; }
+    j = j + 1;
+  }
+  return false;
+}
+
+// 相对路径按工作目录展开，绝对路径原样返回。
+export func abspath(path, base) {
+  let s = trim(str(path));
+  if (len(s) == 0) { return ""; }
+  if (substr(s, 0, 1) == "/") { return s; }
+  return str(base) + "/" + s;
+}
+
+export func lang_of(dir) {
+  let b = str(dir);
+  if (path_exists(b + "/go.mod")) { return "go"; }
+  if (path_exists(b + "/package.json")) { return "node"; }
+  if (path_exists(b + "/requirements.txt") or path_exists(b + "/pyproject.toml") or path_exists(b + "/Pipfile") or path_exists(b + "/setup.py")) { return "python"; }
+  if (path_exists(b + "/pom.xml")) { return "java-maven"; }
+  if (path_exists(b + "/build.gradle") or path_exists(b + "/build.gradle.kts")) { return "java-gradle"; }
+  if (path_exists(b + "/Cargo.toml")) { return "rust"; }
+  return "unknown";
+}
+
+export func dockerfile_for(lang) {
+  if (lang == "go") {
+    return "# 多阶段构建：golang 编译 → alpine 运行\n" +
+      "FROM golang:1.22-alpine AS build\n" +
+      "WORKDIR /src\n" +
+      "ARG APP_VERSION=dev\n" +
+      "ENV APP_VERSION=$APP_VERSION\n" +
+      "COPY go.mod go.sum* ./\n" +
+      "RUN go mod download 2>/dev/null || true\n" +
+      "COPY . .\n" +
+      "RUN CGO_ENABLED=0 GOOS=linux go build -ldflags=\"-s -w\" -o /out/app .\n" +
+      "\n" +
+      "FROM alpine:3.20\n" +
+      "WORKDIR /app\n" +
+      "RUN adduser -D -u 10001 appuser\n" +
+      "COPY --from=build --chown=appuser:appuser /out/app /app/app\n" +
+      "USER appuser\n" +
+      "ENV PORT=8080\n" +
+      "EXPOSE 8080\n" +
+      "ENTRYPOINT [\"/app/app\"]\n";
+  }
+  if (lang == "node") {
+    return "# Node.js：安装依赖并运行（按需调整 CMD / 端口）\n" +
+      "FROM node:24-alpine\n" +
+      "WORKDIR /app\n" +
+      "ARG APP_VERSION=dev\n" +
+      "ENV APP_VERSION=$APP_VERSION\n" +
+      "COPY package*.json ./\n" +
+      "RUN npm install --omit=dev\n" +
+      "COPY . .\n" +
+      "ENV PORT=8080\n" +
+      "EXPOSE 8080\n" +
+      "USER node\n" +
+      "CMD [\"npm\", \"start\"]\n";
+  }
+  if (lang == "python") {
+    return "# Python：pip 安装依赖后运行（按需修改 CMD 入口，如 uvicorn/gunicorn）\n" +
+      "FROM python:3.12-slim\n" +
+      "WORKDIR /app\n" +
+      "ARG APP_VERSION=dev\n" +
+      "ENV APP_VERSION=$APP_VERSION PYTHONUNBUFFERED=1\n" +
+      "COPY requirements.txt ./\n" +
+      "RUN pip install --no-cache-dir -r requirements.txt\n" +
+      "COPY . .\n" +
+      "ENV PORT=8080\n" +
+      "EXPOSE 8080\n" +
+      "CMD [\"python\", \"app.py\"]\n";
+  }
+  if (lang == "java-maven") {
+    return "# Java (Maven)：多阶段构建 jar → 运行（按需调整 jar 名与 ENTRYPOINT）\n" +
+      "FROM maven:3.9-eclipse-temurin-21 AS build\n" +
+      "WORKDIR /src\n" +
+      "COPY pom.xml ./\n" +
+      "RUN mvn -q dependency:go-offline || true\n" +
+      "COPY src ./src\n" +
+      "RUN mvn -q -DskipTests package\n" +
+      "FROM eclipse-temurin:21-jre\n" +
+      "WORKDIR /app\n" +
+      "COPY --from=build /src/target/*.jar /app/app.jar\n" +
+      "ENV PORT=8080\n" +
+      "EXPOSE 8080\n" +
+      "ENTRYPOINT [\"java\", \"-XX:MaxRAMPercentage=75.0\", \"-XX:InitialRAMPercentage=50.0\", \"-jar\", \"/app/app.jar\"]\n";
+  }
+  if (lang == "java-gradle") {
+    return "# Java (Gradle)：多阶段构建 jar → 运行（按需调整 jar 名与 ENTRYPOINT）\n" +
+      "FROM gradle:8-jdk21 AS build\n" +
+      "WORKDIR /src\n" +
+      "COPY . .\n" +
+      "RUN gradle build --no-daemon -x test\n" +
+      "FROM eclipse-temurin:21-jre\n" +
+      "WORKDIR /app\n" +
+      "COPY --from=build /src/build/libs/*.jar /app/app.jar\n" +
+      "ENV PORT=8080\n" +
+      "EXPOSE 8080\n" +
+      "ENTRYPOINT [\"java\", \"-XX:MaxRAMPercentage=75.0\", \"-jar\", \"/app/app.jar\"]\n";
+  }
+  if (lang == "rust") {
+    return "# Rust：多阶段构建 → distroless 运行\n" +
+      "FROM rust:1-slim AS build\n" +
+      "WORKDIR /src\n" +
+      "COPY Cargo.toml Cargo.lock* ./\n" +
+      "RUN cargo fetch 2>/dev/null || true\n" +
+      "COPY . .\n" +
+      "RUN cargo build --release\n" +
+      "\n" +
+      "FROM debian:bookworm-slim\n" +
+      "WORKDIR /app\n" +
+      "RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*\n" +
+      "COPY --from=build /src/target/release/* /app/app\n" +
+      "ENV PORT=8080\n" +
+      "EXPOSE 8080\n" +
+      "ENTRYPOINT [\"/app/app\"]\n";
+  }
+  return "";
+}
+
+// k8s 对象名：小写、只留 [a-z0-9-]，数字开头补 app-。
+export func k8s_name(raw) {
+  let s = lower(trim(str(raw)));
+  let out = "";
+  let i = 0;
+  while (i < len(s)) {
+    let ch = substr(s, i, 1);
+    if (len(str_match("^[a-z0-9]$", ch)) > 0) {
+      out = out + ch;
+    } else if (len(out) > 0 and substr(out, len(out) - 1, 1) != "-") {
+      out = out + "-";
+    }
+    i = i + 1;
+  }
+  out = trim(out);
+  while (len(out) > 0 and substr(out, 0, 1) == "-") { out = substr(out, 1, len(out) - 1); }
+  while (len(out) > 0 and substr(out, len(out) - 1, 1) == "-") { out = substr(out, 0, len(out) - 1); }
+  if (len(out) == 0) { out = "app"; }
+  if (len(str_match("^[0-9]", out)) > 0) { out = "app-" + out; }
+  return out;
+}
+
+export func manifest_for(name, container, port, image_repo) {
+  let n = k8s_name(name);
+  let c = container;
+  let p = port;
+  if (len(str(c)) == 0) { c = n; }
+  let repo = trim(str(image_repo));
+  if (len(repo) == 0) { repo = "local/" + n; }
+  return "# 由控制台生成的最小清单：Deployment + Service。\n" +
+    "# 发布时控制面会用 kubectl set image 把镜像换掉，所以这里的 image 只是占位。\n" +
+    "apiVersion: apps/v1\n" +
+    "kind: Deployment\n" +
+    "metadata:\n" +
+    "  name: " + n + "\n" +
+    "spec:\n" +
+    "  replicas: 1\n" +
+    "  selector:\n" +
+    "    matchLabels:\n" +
+    "      app: " + n + "\n" +
+    "  template:\n" +
+    "    metadata:\n" +
+    "      labels:\n" +
+    "        app: " + n + "\n" +
+    "    spec:\n" +
+    "      containers:\n" +
+    "        - name: " + c + "\n" +
+    "          image: " + repo + ":latest\n" +
+    "          ports:\n" +
+    "            - containerPort: " + str(p) + "\n" +
+    "---\n" +
+    "apiVersion: v1\n" +
+    "kind: Service\n" +
+    "metadata:\n" +
+    "  name: " + n + "\n" +
+    "spec:\n" +
+    "  selector:\n" +
+    "    app: " + n + "\n" +
+    "  ports:\n" +
+    "    - port: " + str(p) + "\n" +
+    "      targetPort: " + str(p) + "\n";
+}
+
+// plan：只计算「缺什么、要写哪、要改哪些配置」，不碰磁盘。
+export func plan(p, work_dir) {
+  let build = get(p, "build", {});
+  let ctx_raw = trim(str(get(build, "context", "")));
+  let ctx = abspath(ctx_raw, work_dir);
+  let out = { ok: true, err: "", needs_any: false, dockerfile: null, manifest: null, config_updates: {}, lang: "unknown", context: ctx };
+  if (len(ctx) == 0) { return { ok: false, err: "build.context 为空，无法生成" }; }
+  if (not path_exists(ctx)) { return { ok: false, err: "build.context 不存在：" + ctx }; }
+
+  let lang = lang_of(ctx);
+  put(out, "lang", lang);
+
+  // ---- Dockerfile ----
+  let df_cfg = trim(str(get(build, "dockerfile", "")));
+  let df_path = ctx + "/Dockerfile";
+  let has = false;
+  if (len(df_cfg) > 0) { has = path_exists(abspath(df_cfg, work_dir)); } else { has = path_exists(df_path); }
+  if (not has) {
+    if (lang == "unknown") {
+      return { ok: false, err: "无法识别项目语言（查了 go.mod / package.json / requirements.txt / pom.xml / build.gradle / Cargo.toml），请手写 Dockerfile" };
+    }
+    put(out, "dockerfile", { path: df_path, content: dockerfile_for(lang), reason: "缺少 Dockerfile（" + lang + "）" });
+    put(out, "needs_any", true);
+    put(get(out, "config_updates", {}), "dockerfile", df_path);
+  }
+
+  // ---- k8s 清单（只有 kubectl / local-k3s 需要）----
+  let deploy = get(p, "deploy", {});
+  let method = upper(trim(str(get(deploy, "method", ""))));
+  if (method == "KUBECTL-APPLY" or method == "LOCAL-K3S") {
+    let mp = trim(str(get(deploy, "manifest_path", "")));
+    if (len(mp) > 0 and path_exists(abspath(mp, work_dir))) {
+      // 已有清单，不动
+    } else {
+      let mpath = ctx + "/k8s/deployment.yaml";
+      let cname = str(get(deploy, "container", ""));
+      let cport = int(get(deploy, "container_port", 0));
+      if (cport == 0) { cport = 8080; }
+      let repo = trim(str(get(build, "image_repo", "")));
+      put(out, "manifest", { path: mpath, content: manifest_for(get(p, "name", get(p, "id", "")), cname, cport, repo), reason: "缺少 k8s 清单（" + method + "）" });
+      put(out, "needs_any", true);
+      put(get(out, "config_updates", {}), "manifest_path", mpath);
+    }
+  }
+  return out;
+}
+
+// apply：把 plan 里的文件写下去，并把配置回写到项目（dockerfile / manifest_path / image_repo / container）。
+export func apply(p, work_dir) {
+  let pl = plan(p, work_dir);
+  if (not get(pl, "ok", false)) { return pl; }
+  if (not get(pl, "needs_any", false)) { return pl; }
+
+  let df = get(pl, "dockerfile", null);
+  if (df != null) {
+    let dir = str(get(df, "path", ""));
+    let slash = 0;
+    let i = 0;
+    while (i < len(dir)) {
+      if (substr(dir, i, 1) == "/") { slash = i; }
+      i = i + 1;
+    }
+    if (slash > 0) { mkdir(substr(dir, 0, slash)); }
+    let w = write_file(dir, str(get(df, "content", "")));
+    if (w != true) { return { ok: false, err: "写 Dockerfile 失败：" + dir }; }
+  }
+
+  let mf = get(pl, "manifest", null);
+  if (mf != null) {
+    let dir = str(get(mf, "path", ""));
+    let slash = 0;
+    let i = 0;
+    while (i < len(dir)) {
+      if (substr(dir, i, 1) == "/") { slash = i; }
+      i = i + 1;
+    }
+    if (slash > 0) { mkdir(substr(dir, 0, slash)); }
+    let w = write_file(dir, str(get(mf, "content", "")));
+    if (w != true) { return { ok: false, err: "写 k8s 清单失败：" + dir }; }
+  }
+
+  // 回写配置：只补空字段，不覆盖已有值。
+  let np = p;
+  let build = get(np, "build", {});
+  if (get(pl, "dockerfile", null) != null) {
+    put(build, "dockerfile", str(get(get(pl, "config_updates", {}), "dockerfile", "")));
+    put(np, "build", build);
+    if (len(trim(str(get(build, "image_repo", "")))) == 0) {
+      put(build, "image_repo", k8s_name(get(np, "name", get(np, "id", ""))));
+    }
+  }
+  let deploy = get(np, "deploy", {});
+  if (get(pl, "manifest", null) != null) {
+    put(deploy, "manifest_path", str(get(get(pl, "config_updates", {}), "manifest_path", "")));
+    if (len(trim(str(get(deploy, "container", "")))) == 0) {
+      put(deploy, "container", k8s_name(get(np, "name", get(np, "id", ""))));
+    }
+    put(np, "deploy", deploy);
+  }
+  let w = store.put_project(np, false);
+  if (not get(w, "ok", false)) { return { ok: false, err: "回写项目配置失败：" + str(get(w, "err", "")) }; }
+  return pl;
+}
+
+// 给自测用的纯函数入口（不落盘）。
+export func preview_lang(dir) {
+  return lang_of(dir);
+}

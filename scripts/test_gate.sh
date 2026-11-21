@@ -40,7 +40,7 @@ BASE="http://127.0.0.1:$PORT"
 DATA="$(mktemp -d -t cicdkit-lume-test)"
 LOG="$(mktemp -t cicdkit-lume-test-log)"
 cd "$ROOT" || exit 1
-LUME_DATA="$DATA" RUNNER_BASE="$DEAD_RUNNER" CICD_DEPLOY_APPROVAL=approve \
+LUME_DATA="$DATA" RUNNER_BASE="$DEAD_RUNNER" CICD_DEPLOY_APPROVAL=approve CICD_HOOK_KEY=testkey \
   CICD_WORK_DIR="$DATA" CICD_FS_ROOTS="$DATA" \
   LUME_BIND=127.0.0.1 LUME_PORT="$PORT" \
   "$LUME" cicdkit_lume.lume >"$LOG" 2>&1 &
@@ -148,7 +148,31 @@ expect_code 200 "读取项目：新建后可见"
 call DELETE "/api/projects/gate-demo?role=human_admin"
 expect_code 200 "删除项目：human_admin 放行"
 
-# 7) 静态站
+# 7) webhook / 生成脚手架前重建一个临时项目（上一个已被删除用例清掉）
+call POST "/api/projects?role=human_admin" '{"id":"gate-hook","name":"gate hook","build":{"context":"'"$DATA"'","image_repo":"local/gate-hook"},"deploy":{"method":"ssh","ssh_host":"10.0.0.9","ssh_user":"root"}}'
+expect_code 200 "重建临时项目：human_admin 放行 → 200"
+
+# 7.1) webhook：机器调用，不参与角色闸门，只认自己的 key
+call POST "/api/webhook/gate-hook"
+expect_code 401 "webhook：缺 secret 被拒"
+call POST "/api/webhook/gate-hook?secret=wrong"
+expect_code 401 "webhook：错 secret 被拒"
+call POST "/api/webhook/nope?secret=testkey"
+expect_code 404 "webhook：项目不存在"
+call POST "/api/webhook/gate-hook?secret=testkey"
+expect_code 400 "webhook：key 对但 runner 不可达（不静默成功）"
+expect_body 'runner' "webhook：错误说明指向 runner"
+
+# 8) 脚手架生成：与写操作同级门禁；临时项目没语言标记 → 明确报错而不是乱生成
+call POST "/api/projects/gate-hook/generate"
+expect_code 403 "生成脚手架：未声明 role 被拦"
+call POST "/api/projects/gate-hook/generate?role=human_admin"
+expect_code 400 "生成脚手架：无法识别语言时明确失败"
+expect_body '无法识别项目语言' "生成脚手架：错误说明原因"
+call POST "/api/projects/nope/generate?role=human_admin"
+expect_code 404 "生成脚手架：项目不存在"
+
+# 9) 静态站
 call GET "/"
 expect_code 200 "静态：index.html 正常伺服"
 

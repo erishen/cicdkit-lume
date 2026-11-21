@@ -1,0 +1,81 @@
+// scripts/generate_test.lume —— 脚手架生成自测（纯本地，不启服务、不用 runner）
+//
+//   LUME_DATA=/tmp/lume_gen ./vendor/lume/bin/lume scripts/generate_test.lume
+//
+// 覆盖：语言识别、Dockerfile 内容、k8s 清单、只补缺不覆盖、apply 落盘并回写配置、
+// 二次 apply 幂等（needs_any=false）。目录建在 $LUME_DATA/gen 下，跑完不留垃圾。
+
+import "../src/store.lume" as store;
+import "../src/generate.lume" as generate;
+
+let st = { fails: 0, checks: 0 };
+func ok(label, cond) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (cond) { print("  ok  " + label); }
+  else { print("  FAIL " + label); put(st, "fails", int(get(st, "fails", 0)) + 1); }
+}
+
+store.init();
+let base = store.data_dir() + "/gen";
+mkdir(base);
+let ctx = base + "/demo-go";
+mkdir(ctx);
+write_file(ctx + "/go.mod", "module demo\n");
+write_file(ctx + "/main.go", "package main\nfunc main(){}\n");
+
+print("generate: language");
+ok("识别 go", generate.lang_of(ctx) == "go");
+ok("空目录 → unknown", generate.lang_of(base + "/nothing") == "unknown");
+
+print("generate: dockerfile 模板");
+let df = generate.dockerfile_for("go");
+ok("go 模板多阶段", len(str_match("FROM golang:", df)) > 0 and len(str_match("CGO_ENABLED=0", df)) > 0);
+ok("node 模板", len(str_match("FROM node:", generate.dockerfile_for("node"))) > 0);
+ok("python 模板", len(str_match("FROM python:", generate.dockerfile_for("python"))) > 0);
+ok("unknown 无模板", generate.dockerfile_for("unknown") == "");
+
+print("generate: k8s 名字");
+ok("大小写与非法字符", generate.k8s_name("My_App 2") == "my-app-2");
+ok("空名回落 app", generate.k8s_name("  ") == "app");
+ok("数字开头补前缀", generate.k8s_name("123svc") == "app-123svc");
+
+print("generate: plan（缺 Dockerfile + local-k3s 缺清单）");
+let p = {
+  id: "proj-gen",
+  name: "Demo_Go",
+  build: { context: ctx, image_repo: "local/demo-go" },
+  deploy: { method: "local-k3s", container_port: 8090 },
+};
+let pl = generate.plan(p, base);
+ok("plan ok", get(pl, "ok", false));
+ok("needs_any", get(pl, "needs_any", false));
+ok("给出 Dockerfile 路径", str(get(get(pl, "dockerfile", {}), "path", "")) == ctx + "/Dockerfile");
+ok("给出 manifest 路径", str(get(get(pl, "manifest", {}), "path", "")) == ctx + "/k8s/deployment.yaml");
+ok("配置更新包含两条", len(keys(get(pl, "config_updates", {}))) == 2);
+ok("manifest 用 container_port", len(str_match("containerPort: 8090", str(get(get(pl, "manifest", {}), "content", "")))) > 0);
+ok("plan 不落盘", generate.path_exists(ctx + "/Dockerfile") == false);
+
+print("generate: apply 落盘 + 回写");
+store.put_project(p, true);
+let ap = generate.apply(p, base);
+ok("apply ok", get(ap, "ok", false));
+ok("Dockerfile 已写", generate.path_exists(ctx + "/Dockerfile"));
+ok("manifest 已写", generate.path_exists(ctx + "/k8s/deployment.yaml"));
+let saved = store.get_project("proj-gen");
+ok("配置回写 dockerfile", str(get(get(saved, "build", {}), "dockerfile", "")) == ctx + "/Dockerfile");
+ok("配置回写 manifest_path", str(get(get(saved, "deploy", {}), "manifest_path", "")) == ctx + "/k8s/deployment.yaml");
+ok("配置补 container", str(get(get(saved, "deploy", {}), "container", "")) == "demo-go");
+
+print("generate: 二次 apply 幂等");
+let again = generate.apply(saved, base);
+ok("needs_any=false", get(again, "needs_any", false) == false);
+ok("已有 Dockerfile 内容未被覆盖", read_file(ctx + "/Dockerfile") != "");
+
+print("generate: context 不存在");
+let bad = generate.plan({ id: "x", name: "x", build: { context: base + "/missing" } }, base);
+ok("报错而不是抛异常", get(bad, "ok", false) == false and len(str(get(bad, "err", ""))) > 0);
+
+let nc = int(get(st, "checks", 0));
+let nf = int(get(st, "fails", 0));
+print("");
+if (nf == 0) { print("generate_test: " + str(nc) + " checks passed"); } else { print("generate_test: " + str(nf) + " of " + str(nc) + " FAILED"); }
