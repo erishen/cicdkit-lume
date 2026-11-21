@@ -1,0 +1,162 @@
+// scripts/remap_paths.lume —— 把 cicdkit 容器视角的绝对路径映射到本机真实路径
+//
+// 迁移过来的项目里，这些字段是「容器内看到的路径」：
+//   build.context / build.dockerfile       /workspace/lume/lume-crm
+//   deploy.kubeconfig                      /app/data/kubeconfig-cicd
+//   deploy.ssh_key_path / targets[].ssh_key_path   /app/data/ssh_tencent_key
+// 换成宿主机 runner 后，它们必须指向本机真实存在的文件，否则动作在第一步就失败。
+//
+// 用 PATH_MAP 给出「旧前缀:新前缀」的映射，多个映射用逗号分隔：
+//
+//   export PATH_MAP="/app/data:$PWD/../cicdkit/data-docker,/workspace:$HOME/Workspace/CNB/individular-invest/work"
+//   LUME_DATA=./.data ./vendor/lume/bin/lume scripts/remap_paths.lume            # 干跑
+//   LUME_DATA=./.data APPLY=1 ./vendor/lume/bin/lume scripts/remap_paths.lume    # 落库
+//
+// 干跑会逐个打印「旧 → 新（存在/不存在）」，不存在也照打，方便你补映射或建文件。
+
+import "../src/store.lume" as store;
+
+let want_apply = (str(env("APPLY")) == "1");
+let raw_map = env("PATH_MAP");
+let st = { changes: 0, missing: 0, paths: [] };
+
+// 解析 "a:b,c:d" → [{from, to}]，按 from 长度降序（先匹配更具体的前缀）。
+func parse_map(text) {
+  let out = [];
+  if (text == null) { return out; }
+  let parts = split(str(text), ",");
+  let i = 0;
+  while (i < len(parts)) {
+    let one = trim(str(parts[i]));
+    if (len(one) > 0) {
+      let kv = split(one, ":");
+      if (len(kv) >= 2) {
+        let from = trim(str(kv[0]));
+        let to = trim(str(kv[1]));
+        if (len(from) > 0 and len(to) > 0) { push(out, { from: from, to: to }); }
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 存在性判定要注意两个坑：read_file(目录) 返回 null；files(不存在的目录) 返回 []
+// 而不是报错。所以目录只能反过来查「父目录里有这个条目」（目录条目带尾 /）。
+func path_exists(path) {
+  let s = str(path);
+  if (read_file(s) != null) { return true; }
+
+  let parts = split(s, "/");
+  if (len(parts) == 0) { return false; }
+  let base = str(parts[len(parts) - 1]);
+  if (len(base) == 0) { return false; }
+
+  let parent = "";
+  let i = 0;
+  while (i < len(parts) - 1) {
+    parent = parent + str(parts[i]) + "/";
+    i = i + 1;
+  }
+  if (len(parent) == 0) { parent = "./"; }
+
+  let entries = files(parent);
+  let j = 0;
+  while (j < len(entries)) {
+    let e = str(entries[j]);
+    if (e == base or e == base + "/") { return true; }
+    j = j + 1;
+  }
+  return false;
+}
+
+func mapped(path, maps, label, prefix) {
+  let s = str(path);
+  if (len(s) == 0) { return path; }
+  let i = 0;
+  while (i < len(maps)) {
+    let m = maps[i];
+    let from = str(get(m, "from", ""));
+    let to = str(get(m, "to", ""));
+    if (len(s) >= len(from) and substr(s, 0, len(from)) == from) {
+      let np = to + substr(s, len(from), len(s) - len(from));
+      let found = path_exists(np);
+      st.changes = st.changes + 1;
+      if (not found) { st.missing = st.missing + 1; }
+      print("  " + label + ": " + s + " → " + np + (found ? "  ✓" : "  ✗ 不存在"));
+      push(st.paths, prefix + np);
+      return np;
+    }
+    i = i + 1;
+  }
+  return path;
+}
+
+// 递归替换：字符串命中映射就改写，容器递归下去。
+func remap_project(node, maps) {
+  let km = try(() => keys(node));
+  if (km.err == null) {
+    let ks = km.ok;
+    let i = 0;
+    while (i < len(ks)) {
+      let k = str(ks[i]);
+      put(node, k, remap_project(get(node, k, null), maps));
+      i = i + 1;
+    }
+    return node;
+  }
+  let ss = try(() => substr(node, 0, 0));
+  if (ss.err == null) { return mapped(node, maps, "path", ""); }
+  let ln = try(() => len(node));
+  if (ln.err == null) {
+    let out = [];
+    let i = 0;
+    while (i < len(node)) {
+      push(out, remap_project(node[i], maps));
+      i = i + 1;
+    }
+    return out;
+  }
+  return node;
+}
+
+let maps = parse_map(raw_map);
+store.init();
+print("remap: " + str(len(maps)) + " 条映射, apply=" + str(want_apply));
+let i = 0;
+while (i < len(maps)) {
+  print("  " + str(get(maps[i], "from", "")) + " => " + str(get(maps[i], "to", "")));
+  i = i + 1;
+}
+if (len(maps) == 0) {
+  print("没有 PATH_MAP，什么都没做。");
+  print("done: changes=0");
+} else {
+
+let rows = store.project_rows();
+print("scan: " + str(len(rows)) + " project(s)");
+
+let r = 0;
+while (r < len(rows)) {
+  let row = rows[r];
+  let id = str(get(row, "id", ""));
+  let p = store.parse_json(get(row, "json", ""), null);
+  if (p != null) {
+    st.changes = 0;
+    print("[" + str(get(p, "name", id)) + "]");
+
+    // 递归走一遍：只认「字符串前缀」，不看字段名——这样 helm_values / run_args
+    // 里出现的路径也能一起修。
+    let np = remap_project(p, maps);
+    if (st.changes > 0 and want_apply) {
+      put(np, "created_ts", int(get(row, "created_ts", 0)));
+      let w = store.put_project(np, false);
+      print("  " + (w.ok ? "✓ 已落库" : "✗ 落库失败：" + str(w.err)));
+    }
+    if (st.changes == 0) { print("  （无命中）"); }
+  }
+  r = r + 1;
+}
+
+print("done: apply=" + str(want_apply) + "，缺失 " + str(st.missing) + " 个路径（干跑不做写入）");
+}

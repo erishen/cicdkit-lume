@@ -188,6 +188,30 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
   （`SECRET_RE` / `KEY_RE` / `BEARER_RE`），因为构建参数里本来就有
   `--build-arg LLM_API_KEY=...`、`-e *_VISIT_PIN=...` 这类真值。
 
+### 切换前体检与路径重映射
+
+迁移过来的项目里有一批「cicdkit 容器视角」的绝对路径，宿主机 runner 跑之前必须换成本机
+真实路径，否则第一步就失败：
+
+```bash
+make preflight     # 体检：build.context / Dockerfile / kubeconfig / ssh key 是否真实存在
+make remap         # 干跑：按 PATH_MAP 打印「旧路径 → 新路径（存在/不存在）」
+make remap-apply   # 先备份 store.db 再落库
+```
+
+`PATH_MAP` 是「旧前缀:新前缀」的逗号分隔列表，例如本机实际的迁移：
+
+```bash
+PATH_MAP="/app/data:$PWD/../cicdkit/data-docker,/workspace:$HOME/Workspace/CNB/individular-invest/work" \
+  LUME_DATA=./.data APPLY=1 ./vendor/lume/bin/lume scripts/remap_paths.lume
+```
+
+- 只按前缀替换，不看字段名，所以 `helm_values`、`run_args` 里出现的路径也会一起修。
+- 目录存在性判定走父目录条目比对（`read_file(目录)` 给 null、`files(不存在的目录)` 给 `[]`，
+  两个内建都不能直接当判据）。
+- kubectl/helm/local-k3s 的 kubeconfig 为空时，用 `CICD_DEFAULT_KUBECONFIG` 兜底即可
+  （preflight 会读这个 env）；不需要把私钥/kubeconfig 路径写死进项目。
+
 ### 清洗历史明文密钥
 
 真实历史数据里 `build.build_args`（map 或被拼成 `--build-arg K=V`）与 `ssh_run_args`

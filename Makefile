@@ -23,7 +23,7 @@ WORK  ?= $(HOME)/Workspace
 DATA  ?= ./.data
 RUNNER_PORT ?= 8899
 
-.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan sanitize sanitize-apply docker docker-logs docker-down clean
+.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan preflight remap remap-apply sanitize sanitize-apply docker docker-logs docker-down clean
 
 vendor:
 	@bash scripts/vendor_lume.sh
@@ -84,6 +84,18 @@ sanitize-apply:
 	@cp $(DATA)/store.db $(DATA)/store.db.bak.$$(date +%Y%m%d%H%M%S)
 	@LUME_DATA=$(DATA) APPLY=1 $(LUME) scripts/sanitize_secrets.lume
 	@ls -1 $(DATA)/store.db.bak.* | tail -1
+
+# 切换前体检：build.context / Dockerfile / kubeconfig / ssh key 在本机上是否真的存在。
+# 有阻断项返回非 0。容器视角的路径映射用 remap / remap-apply（见 README）。
+preflight:
+	@bash scripts/preflight.sh
+
+remap:
+	@LUME_DATA=$(DATA) $(LUME) scripts/remap_paths.lume
+
+remap-apply:
+	@cp $(DATA)/store.db $(DATA)/store.db.bak.$$(date +%Y%m%d%H%M%S)
+	@LUME_DATA=$(DATA) APPLY=1 $(LUME) scripts/remap_paths.lume
 
 # 干跑：把真实项目配置翻译成 argv，先看一遍再动手。
 plan:
