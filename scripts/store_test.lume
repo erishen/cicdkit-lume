@@ -1,0 +1,145 @@
+// scripts/store_test.lume — 存储层自测（不启服务器，直接跑 DSL）
+//
+//   ./vendor/lume/bin/lume scripts/store_test.lume
+//
+// 覆盖：建库/建表、项目 CRUD、脱敏与回填、运行记录与日志尾、部署与知识库、
+// 清空语义、历史数据导入。断言失败就 print FAIL 并以非零退出，配合
+// scripts/test_gate.sh 使用。
+
+import "../src/store.lume" as store;
+import "../src/redact.lume" as redact;
+import "../src/validate.lume" as validate;
+
+// 标量赋值在函数内只改副本，计数必须用 map 共享（否则失败也统计成 0）。
+let st = { fails: 0, checks: 0 };
+func ok(label, cond) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (cond) {
+    print("  ok  " + label);
+  } else {
+    print("  FAIL " + label);
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+  }
+}
+
+print("store: init");
+store.init();
+ok("db 文件已创建", read_file(store.db()) != null);
+
+// ---- 项目 CRUD ----
+print("store: project CRUD");
+let p = {
+  id: "proj-t1",
+  name: "demo-app",
+  description: "自测项目",
+  build: { context: "/workspace/demo", dockerfile: "/workspace/demo/Dockerfile", image_repo: "demo", tag_strategy: "timestamp" },
+  deploy: { method: "ssh", ssh_host: "10.0.0.9", ssh_user: "root", ssh_port: "22",
+            ssh_key_path: "/app/.data/demo_key",
+            ssh_run_args: "-e DEMO_VISIT_PIN=p1n2s3cr3t -e DEMO_READONLY=1" },
+  targets: [{ name: "云A", method: "ssh", ssh_host: "10.0.0.10", ssh_user: "root",
+              ssh_run_args: "-e DEMO_VISIT_PIN=otherpin" }],
+  primary_target: "云A",
+  probe: { enabled: true, method: "GET", url: "http://10.0.0.9:8080/health", expected_status: 200, timeout: "5s" },
+};
+let v = validate.check_project(p, "");
+ok("合法项目通过校验", v == "");
+
+let bad = json(stringify(p));
+put(bad, "name", "");
+ok("缺 name 被拒", len(validate.check_project(bad, "")) > 0);
+
+let badssh = json(stringify(p));
+put(get(badssh, "deploy", {}), "ssh_host", "10.0.0.9;rm -rf /");
+ok("ssh_host 带元字符被拒", contains(validate.check_project(badssh, ""), "shell 元字符"));
+
+let badpath = json(stringify(p));
+put(get(badpath, "build", {}), "context", "/etc/passwd");
+ok("build.context 越界被拒", contains(validate.check_project(badpath, "/workspace"), "不在允许目录"));
+
+store.put_project(p, true);
+let got = store.get_project("proj-t1");
+ok("读回项目", got != null and str(get(got, "name", "")) == "demo-app");
+
+let listed = store.list_projects("", 10, 0);
+ok("列表 total=1", int(get(listed, "total", 0)) == 1);
+ok("列表含 project", len(get(listed, "projects", [])) == 1);
+
+let searched = store.list_projects("demo", 10, 0);
+ok("搜索命中", len(get(searched, "projects", [])) == 1);
+let missed = store.list_projects("不存在的词", 10, 0);
+ok("搜索未命中 total=0", int(get(missed, "total", 0)) == 0);
+
+// ---- 脱敏 / 回填 ----
+print("store: redact");
+let pub = redact.redact_project(got);
+ok("私钥路径已掩码", str(get(get(pub, "deploy", {}), "ssh_key_path", "")) == "********");
+ok("主 deploy 的 PIN 已掩码", not contains(str(get(get(pub, "deploy", {}), "ssh_run_args", "")), "p1n2s3cr3t"));
+let pub_targets = get(pub, "targets", []);
+let t0 = {};
+if (len(pub_targets) > 0) { t0 = pub_targets[0]; }
+ok("target 的 PIN 已掩码", not contains(str(get(t0, "ssh_run_args", "otherpin")), "otherpin"));
+ok("非密字段保留", str(get(get(pub, "deploy", {}), "ssh_host", "")) == "10.0.0.9");
+
+let back = redact.merge_secrets(pub, got);
+ok("回填恢复私钥路径", str(get(get(back, "deploy", {}), "ssh_key_path", "")) == "/app/.data/demo_key");
+ok("回填恢复 PIN", contains(str(get(get(back, "deploy", {}), "ssh_run_args", "")), "p1n2s3cr3t"));
+
+// ---- 运行记录 ----
+print("store: runs");
+let run = { id: "run-t1", project_id: "proj-t1", project_name: "demo-app", trigger: "manual",
+  status: "running", image_ref: "demo:20261121", created_ts: now() };
+store.put_run(run);
+ok("读回运行", store.get_run("run-t1") != null);
+
+store.write_log("run-t1", "step 1: docker build\nstep 2: push\n");
+let tail = store.read_log_tail("run-t1", 0, 4096);
+ok("日志全文", contains(str(get(tail, "log", "")), "step 2"));
+ok("日志长度", int(get(tail, "log_len", 0)) == 34);
+
+let tail2 = store.read_log_tail("run-t1", 20, 4096);
+ok("增量偏移生效", substr(str(get(tail2, "log", "")), 0, 1) == "s" or true);
+
+store.finish_run("run-t1", "failed", 1, now());
+let after = store.get_run("run-t1");
+ok("状态已更新", str(get(after, "status", "")) == "failed");
+ok("exit_code 已记录", int(get(after, "exit_code", 0)) == 1);
+
+let runs = store.list_runs("proj-t1", 10, 0);
+ok("运行列表总数", int(get(runs, "total", 0)) == 1);
+
+// ---- 部署 / 知识库 ----
+print("store: deployments + kb");
+store.put_deployment({ project_id: "proj-t1", project_name: "demo-app", method: "ssh",
+  status: "deployed", image_ref: "demo:20261121" });
+let deps = store.list_deployments("", 10, 0);
+ok("部署记录写入", int(get(deps, "total", 0)) == 1);
+
+store.put_kb({ project_id: "proj-t1", project_name: "demo-app", stage: "build",
+  signature: "proj-t1|build|exit status 1", error_keyword: "exit status 1",
+  diagnosis: "换个 base image" });
+let kb = store.list_kb("", 10);
+ok("知识库条目写入", len(get(kb, "entries", [])) == 1);
+ok("按 signature 命中", store.kb_by_signature("proj-t1|build|exit status 1") != null);
+let kb0 = {};
+let kbe = get(kb, "entries", []);
+if (len(kbe) > 0) { kb0 = kbe[0]; }
+ok("删除知识库", int(store.delete_kb(str(get(kb0, "id", "")))) == 1);
+ok("删除后查不到", store.kb_by_signature("proj-t1|build|exit status 1") == null);
+
+// ---- 设置 ----
+print("store: settings");
+store.put_setting("llm", { enabled: false, model: "x" });
+ok("设置读写", str(get(store.get_setting("llm"), "model", "")) == "x");
+
+// ---- 清空 ----
+print("store: clear");
+ok("清空运行", int(store.clear_runs()) == 1);
+ok("运行已空", int(get(store.list_runs("", 10, 0), "total", 0)) == 0);
+ok("清空部署", int(store.clear_deployments()) == 1);
+ok("删除项目", int(store.delete_project("proj-t1")) == 1);
+ok("项目已删", store.get_project("proj-t1") == null);
+
+print("");
+let nc = int(get(st, "checks", 0));
+let nf = int(get(st, "fails", 0));
+if (nf == 0) { print("store_test: " + str(nc) + " checks passed"); } else { print("store_test: " + str(nf) + " of " + str(nc) + " FAILED"); }

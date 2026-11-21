@@ -1,10 +1,11 @@
 # syntax=docker/dockerfile:1
-# cicdkit-lume —— Lume BFF + React 控制台镜像
+# cicdkit-lume —— 控制面镜像（取代 cicdkit 容器）
 #
 # 两个阶段：
 #   ui        node 里把 src/web/*.tsx 打包成 www/app.js（纯静态产物，平台无关）
 #   runtime   alpine + lume 静态二进制 + 本项目 lume/docroot，一个进程就是整站
 #            （静态文件 + SPA 回退 + 同源 JSON API），不需要 nginx / Node。
+#            执行面不在这个镜像里：docker/kubectl/ssh 由同网络的 runner 服务跑。
 #
 # lume 是静态链接的 C 单二进制。默认从已有的 lume 镜像里取（离线可用），
 # 想换成自编版本：--build-arg LUME_BIN_IMAGE=<含 /usr/local/bin/lume 的镜像>。
@@ -31,6 +32,7 @@ FROM ${RUNTIME_IMAGE} AS runtime
 COPY --from=lume-bin /usr/local/bin/lume /usr/local/bin/lume
 
 # 非 root 运行（uid 10001，与本家族其他 lume 服务一致）。
+# .data 需要可写：store.db（SQLite）与 logs/ 都在这里。
 RUN addgroup -S -g 10001 lume \
  && adduser -S -D -H -u 10001 -G lume lume \
  && mkdir -p /app/www /app/.data
@@ -44,15 +46,19 @@ COPY src ./src
 COPY vendor/lume-core ./vendor/lume-core
 RUN chown -R 10001:10001 /app
 
-# 上游默认指向同网络的 cicdkit 容器；端口固定 18107（宿主机侧由 compose 发布）。
+# 控制面自己持有状态（SQLite + 日志），执行面是同网络的 runner。
+# 端口固定 18107（宿主机侧由 compose 发布）。
 ENV LUME_BIND=0.0.0.0 \
     LUME_PORT=18107 \
-    CICD_BASE=http://cicdkit:8080
+    LUME_DATA=/app/.data \
+    RUNNER_BASE=http://runner:8899 \
+    CICD_WORK_DIR=/projects \
+    CICD_FS_ROOTS=/projects
 
 USER 10001
 EXPOSE 18107
 
-# 只看本进程是否在服务；上游掉线由 /api/health 的 ok 字段体现，不拖垮容器。
+# 只看本进程是否在服务；runner 掉线由 /api/health 的 runner_ok 字段体现，不拖垮容器。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD wget -qO- http://127.0.0.1:18107/api/health >/dev/null || exit 1
 

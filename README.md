@@ -1,116 +1,141 @@
 # cicdkit-lume
 
-cicdkit 的 **Lume + React 控制台**：Lume 单进程同时做静态站、SPA 回退和同源 JSON BFF，
-把 [cicdkit](https://github.com/erishen/cicdkit)（Go 标准库实现的 CI/CD 管理平台）的 REST API
-包装成一个浏览器可直接用的控制台。
+**用 Lume 控制面 + 薄 runner 取代 [cicdkit](https://github.com/erishen/cicdkit)**。
 
-> 定位：cicdkit 的 Web 层重写。cicdkit 原版用 Go `embed` 托管 Vite 前端，并让浏览器直连
-> `/api/*`（需要用户自己保管 API Token）。这里换成 **Lume 托管 + 服务端注入 Token**：
-> 浏览器只与 Lume 同源通信，`CICD_AUTH` 永远不落到 `localStorage` 或页面源码里。
+原来的 cicdkit 是一个 1.3 万行 Go 服务（Web + 调度 + 构建/部署执行 + LLM + 知识库全在一个
+进程、一个 232MB 镜像里）。这里把它拆成两半：
+
+| 组件 | 职责 | 形态 |
+| --- | --- | --- |
+| **控制面**（本仓 `.lume` 代码） | 静态站 + SPA 回退 + 全部 JSON API、项目/运行/部署状态（SQLite）、发布审批闸门、LLM 诊断与知识库、探针、**把项目配置翻译成 argv 执行计划** | Lume 单进程（DSL，无后台线程） |
+| **runner**（`runner/`） | 只按收到的 argv 逐条执行 `docker` / `kubectl` / `helm` / `ssh` / `scp`，把输出按字节流写进日志文件 | Go 单二进制，内网 HTTP，无业务逻辑 |
+
+cicdkit 进程和镜像可以整个下线：控制面不再 proxy 任何上游，`/api/*` 全部本地实现。
+
+## 为什么拆
+
+`TODO.md` P14 已定：lume DSL 永久不合并 `spawn` / `proc`——DSL 里拿不到子进程。所以
+「谁来真正跑 `docker build`」只能在 DSL 之外解决。三个候选形态（A 在 DSL 内硬塞进程、
+B 控制面 + 薄执行器、C 把 cicdkit 降级成 runner）里选了 **B**：控制面保留全部决策，
+执行器只做无状态执行和日志落盘，职责边界清楚，两边都能单独替换。
 
 ## 技术栈
 
 | 组件 | 角色 |
 | --- | --- |
-| **lume**（framework 二进制） | HTTP 服务：`server{}` + 路由 + SPA 回退 + 出站 `http_*` 代理 |
-| **lume-core** | 语言核心 + `lib/*.lume` 共享模块；`src/guard.lume` import `approval.lume` 做发布审批闸门 |
-| **React 18 + TypeScript** | 控制台 SPA，esbuild 打包成 `www/app.js`，由 Lume 的 docroot 直接伺服 |
+| **lume**（framework 二进制） | HTTP 服务：`server{}` + 路由 + SPA 回退 + 大静态文件流式发送 |
+| **lume-core** | 语言核心 + `lib/*.lume`；`src/guard.lume` import `approval.lume` 做发布闸门 |
+| **SQLite**（lume 内建） | 项目 / 运行 / 部署 / 知识库 / 配置，单文件 `store.db` |
+| **React 18 + TypeScript** | 控制台 SPA，esbuild 打包成 `www/app.js`，由 docroot 直接伺服 |
+| **Go**（`runner/`） | 执行器，`CGO_ENABLED=0` 静态编译，单二进制 |
 
 ## 目录
 
 ```
-cicdkit_lume.lume        Lume 入口：server{} + 全部路由
-src/api.lume             上游 cicdkit 客户端 + 总览聚合（服务端持有 Token）
-src/guard.lume           发布动作的审批闸门（lume-core/lib/approval.lume）
+cicdkit_lume.lume        Lume 入口：server{} + Lume 路由（原生，不再 proxy）
+src/store.lume           SQLite 存储：项目/运行/部署/KB/配置 + 旧 store.json 一次性导入
+src/redact.lume          脱敏：配置读取回填掩码 + 日志读出侧 mask_log()
+src/validate.lume        项目配置校验（与 cicdkit 的校验规则对齐）
+src/exec.lume            argv 计划生成器（build / push / deploy / ssh）+ runner 客户端
+src/jobs.lume            运行生命周期：启动、同步、取消、日志尾、部署落账
+src/app_api.lume         全部 API 实现（项目 CRUD/动作/运行/部署/KB/LLM/诊断/目录）
+src/guard.lume           发布与写操作的审批闸门
 src/web/                 React 控制台（api.ts + app.tsx）
+runner/                  Go 执行器（main.go + go.mod + Dockerfile）
 www/                     docroot：index.html + app.css + 构建产物 app.js
-scripts/vendor_lume.sh   同步 lume 二进制与 lume-core/lib 到 vendor/
-scripts/smoke.sh         只读 HTTP 冒烟
+scripts/                 自测与运维脚本（见下）
 vendor/lume-core/lib/    lume-core 共享模块（入库，带版本戳）
 ```
 
 ## 快速开始
 
-前置：`cicdkit` 已在本机运行（默认 `127.0.0.1:8080`），Node 18+。
+前置：Node 18+、Docker CLI、本机 `lume` 二进制（`make vendor` 会准备）。
 
 ```bash
-# 1. 同步 lume 二进制 + lume-core/lib（优先用兄弟 checkout ../../lume）
-make vendor
-
-# 2. 启动（自动 npm install + esbuild 打包 + 前台起 Lume）
-make dev
-#    → http://127.0.0.1:8096
-
-# 上游不在默认地址 / 开了 API Token：
-CICD_BASE=http://127.0.0.1:8080 CICD_AUTH='<your-token>' make dev
-# 或把 token 放进文件（不会出现在进程环境里，更适合生产）：
-#   printf '%s' "<your-token>" > .data/upstream.token
-#   CICD_AUTH_FILE=.data/upstream.token make dev
+make vendor     # 同步 lume 二进制 + lume-core/lib
+make runner     # 另开一个终端：编并启动 runner（127.0.0.1:8899）
+make dev        # 打包前端 + 起控制面 → http://127.0.0.1:8096
 ```
 
-> ⚠️ 变量名是 `CICD_AUTH`，**不是** `CICD_TOKEN`：Lume 的 `env()` 会对名字里含
-> `TOKEN` / `SECRET` / `API_KEY` / `PASSWORD` / `CREDENTIAL` 的变量返回 `null`
-> （防止机密被脚本读走）。直接把 Token 命名成 `CICD_TOKEN` 在这里恒为 null。
+runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`、`~/.ssh` 都是现成的，
+也不存在「容器内路径 ≠ 宿主路径」导致 `docker build` 找不到 context 的坑。
 
 单独构建 / 校验：
 
 ```bash
-make check      # lume --check：语法 + 类型
+make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 起临时实例验证闸门 403 / 上游 502 降级（不碰真实上游）
-make smoke      # 对运行中的服务做一次只读冒烟
-make stop       # 停掉 8096 上的服务
+make test       # 三层自测：store 34 项 + exec 61 项 + 闸门 24 项（临时实例，不碰真实数据）
+make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
+make smoke      # 对运行中的服务做只读冒烟
 ```
 
-## Docker
+## 迁移旧数据
 
-容器里不需要宿主 Node：`Dockerfile` 分两段，node 阶段把控制台打包成 `www/app.js`，
-runtime 阶段只有 alpine + lume 静态二进制（uid 10001，非 root），一个进程负责静态文件、
-SPA 回退和 `/api/*`。
+控制面启动时 `store.init()` 后调 `store.import_legacy()`：**只在库里还没有项目时**，
+从 `$LUME_DATA/store.json` + `$LUME_DATA/kb.json`（或 `CICD_LEGACY_STORE` 指定的路径）
+一次性导入。实测用真实历史数据（3.3MB）导入：
 
-```bash
-make docker        # docker compose up -d --build → http://127.0.0.1:18107
-make docker-logs   # 跟日志
-docker compose down
+```
+legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0}
 ```
 
-- 端口 **18107**（容器内同端口，只发布到 `127.0.0.1`）。
-- 默认接入**已存在的** `cicdkit_default` 网络，容器内用 `http://cicdkit:8080` 访问上游；
-  上游不在这个网络里时用 `CICD_BASE=http://host.docker.internal:10081 make docker`
-  之类显式指定（该地址需要能绕过回环绑定）。
-- 上游 `API_TOKEN` 走挂载文件 `.data/upstream.token`（`CICD_AUTH_FILE`），不进镜像、
-  不上命令行；文件缺失时按“上游未开鉴权”处理。
-- lume 二进制从已有的 lume 镜像里取，因为 lume 是静态 C 单二进制、release 包在本机
-  网络下不可达：`--build-arg LUME_BIN_IMAGE=<含 /usr/local/bin/lume 的镜像>` 可换成自编版本。
-  本机默认 `lume-bin:0.14.2`，由 lume 仓库在容器内编译后打包：
+迁移后 cicdkit 的 `data/` 目录只剩存档价值。真实项目里两个必须显式处理的点：
 
-  ```sh
-  cd work/lume/lume
-  docker build --target lume-build -t lume-buildcache:0.14.2 -f docker/Dockerfile .
-  docker create --name lume-tmp lume-buildcache:0.14.2
-  docker cp lume-tmp:/build/lume/bin/lume ./lume && docker rm lume-tmp
-  printf 'FROM scratch\nCOPY lume /usr/local/bin/lume\n' > Dockerfile.bin && docker build -t lume-bin:0.14.2 .
-  ```
-
-  该版本（lume `0.14.2`）在此前基础上把大静态文件从"甩给 worker"改成"主循环内非阻塞流式"：
-  头部内联发出，body 用 `sendfile(2)` 按 socket 可写推进，`EAGAIN` 只等下一次可写事件。
-  所以 `GET /api/*` 不再串行、下载也不再占 worker 槽位（实测池被两个长任务占满时，
-  8 个并发 5MB 下载 p50 20ms，`workers_busy` 不变）；慢读客户端同样不阻塞其他人，
-  300s 无进展才回收。池与队列状态见 `/metrics` 的 `agenthttpd_slow_queue_depth`、
-  `agenthttpd_slow_wait_ms_max`、`agenthttpd_pool_rejected_total`、`agenthttpd_workers_total`。
-
-健康检查打 `/api/health`（只验证本进程在服务；上游掉线看返回体里的 `ok`/`error`）。
+- `lume-crm` 顶层 deploy 是 kubectl 系，原来依赖 cicdkit 容器里的 `CICD_DEFAULT_KUBECONFIG`。
+  控制面**强制要求 kubeconfig 可解析**（顺序：`deploy.kubeconfig` → `KUBECONFIG` →
+  `CICD_DEFAULT_KUBECONFIG`），三者皆空会明确报「缺少 kubeconfig」而不是跑到一半失败。
+- SSH 私钥路径来自旧配置（`/app/data/ssh_*_key`），迁到新部署形态时要改成实际挂载路径。
 
 ## 环境变量
 
+### 控制面
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `CICD_BASE` | `http://127.0.0.1:8080` | cicdkit 上游地址（回环/私网，`http_*` 显式 `allow_private`） |
-| `CICD_AUTH` | 空 | 上游 `X-API-Token`；只在 Lume 进程内使用（名字不能含 `TOKEN`，Lume 会屏蔽） |
-| `CICD_AUTH_FILE` | 空 | 从文件读 token，优先于 `CICD_AUTH`；末尾换行会被裁掉 |
-| `CICD_DEPLOY_APPROVAL` | `off` | 发布闸门：`off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
+| `LUME_DATA` | `./.data` | 数据目录：`store.db` + `logs/` |
+| `RUNNER_BASE` | `http://127.0.0.1:8899` | runner 地址 |
+| `RUNNER_AUTH` | 空 | runner 令牌；**不能**叫 `RUNNER_TOKEN`（Lume `env()` 屏蔽含 TOKEN 的名字） |
+| `RUNNER_AUTH_FILE` | 空 | 从文件读令牌，优先于 `RUNNER_AUTH` |
+| `CICD_WORK_DIR` | `.` | 运行的工作目录（也是 `build.context` 的基准） |
+| `CICD_FS_ROOTS` | 空 | 目录浏览允许根（冒号分隔），越界 403 |
+| `CICD_DEFAULT_KUBECONFIG` | 空 | kubectl/helm 部署的兜底 kubeconfig |
+| `CICD_SSH_USER/PORT/KEY_PATH/CONTAINER/CONTAINER_PORT/PROBE_PORT/RUN_ARGS/COMMAND` | 空 | 部署字段的兜底值 |
+| `CICD_DEPLOY_APPROVAL` | `off` | `off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
+| `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
-| `HTPASSWD_FILE` | 空 | 设置后启用 Basic Auth（对外暴露时必须） |
+| `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
+
+### runner
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `RUNNER_BIND` | `127.0.0.1:8899` | 监听地址（容器里是 `0.0.0.0:8899`） |
+| `RUNNER_LOG_DIR` | `./logs` | 日志目录，**必须与控制面的 `LUME_DATA/logs` 同一个目录** |
+| `RUNNER_AUTH` / `RUNNER_AUTH_FILE` | 空 | 令牌，所有端点（含 `/healthz`）都要带 `X-Runner-Token` |
+| `RUNNER_ALLOW` | `docker,kubectl,ssh,helm,git,scp,sudo` | argv[0] 白名单 |
+| `RUNNER_MAX_JOBS` | `4` | 并发 job 上限 |
+
+## 执行模型
+
+1. 前端触发动作 → 控制面按项目配置生成 argv 计划（`src/exec.lume`）。
+2. 计划整体 `POST` 给 runner（`{name, steps[], timeout_s, work_dir}`），runner 逐条执行，
+   每条 step 的 stdout/stderr 追加进 `<RUNNER_LOG_DIR>/<job_id>.log`。
+3. 前端每 1.5s 轮询 `GET /api/runs/:id/log?from=<字节偏移>`，增量拿日志；同一请求顺手把
+   runner 的 `GET /jobs/:id` 状态同步回来（done→success、failed→failed、canceled→canceled）。
+4. 只有成功后控制面才写 `deployments` 和项目的 `last_deploy`。
+
+**没有后台线程**：Lume DSL 跑不了常驻调度器，所以「同步」由前端轮询顺手驱动。代价是
+没人看页面时状态不会自己推进；换来的是控制面完全无状态机、重启只读库。runner 重启丢
+job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
+
+### 与 cicdkit 执行面的有意差异
+
+- `local-k3s` 导入改成 `docker save -o <tar>` → `k3s ctr images import <tar>` → `rm -f <tar>`：
+  runner 不解释 shell，不吃管道。`-` 参数相应换成 tar 路径。
+- helm `--set` 顺序：`helm_values` 先、镜像键后（原实现相反，镜像键会被自定义值覆盖）。
+- 放弃 `tag_strategy=git-sha`，统一时间戳 tag（runner 侧不引入 git 参数注入面）。
+- ssh 传输是 `save → scp → rm → ssh + load` 四步，替代原来的流式管道 + 远端磁盘预检。
 
 ## API
 
@@ -118,119 +143,94 @@ docker compose down
 
 | 端点 | 说明 |
 | --- | --- |
-| `GET /api/health` | 本服务 + 上游健康检查（上游版本号） |
-| `GET /api/meta` | 上游地址 + 审批闸门策略（模式、审批链、角色表） |
-| `GET /api/overview` | 首屏聚合：项目/运行/部署计数、运行中/失败数、最近 8 条 |
-| `GET /api/projects` | 项目列表（`?q=&limit=&offset=` 透传） |
-| `GET /api/projects/:id` | 项目详情 |
-| `PUT /api/projects/:id` | 保存项目配置（整份替换，需 `?role=human_admin`） |
-| `GET /api/fs/roots` | 上游机器上可浏览的目录根（需 `?role=human_admin`） |
-| `GET /api/fs/list` | 列出目录内容（`?dir=`，需 `?role=human_admin`） |
+| `GET /api/version` | 控制面版本 |
+| `GET /api/health` | 本进程健康 + `runner_ok`（runner 掉线不拖垮容器探针） |
+| `GET /api/meta` | 审批闸门策略（模式、审批链、角色表） |
+| `GET /api/overview` | 首屏聚合：计数、运行中/失败数、最近记录、`connected` |
+| `GET /api/projects` | 项目列表（`?q=&limit=&offset=`） |
+| `POST /api/projects` | 新建项目（需 `?role=human_admin`） |
+| `POST /api/projects/scan` | 扫描候选目录（有 Dockerfile 或 deploy/k8s/chart/） |
+| `GET/PUT /api/projects/:id` | 详情 / 保存（PUT 需 `?role=human_admin`，掩码字段不回写） |
+| `DELETE /api/projects/:id` | 删除项目（需 `?role=human_admin`） |
+| `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe` |
 | `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护 |
-| `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe` 透传 |
-| `GET /api/runs` | 运行列表（`?project_id=&limit=&offset=`） |
-| `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移，1.5s 轮询） |
-| `POST /api/runs/:id/cancel` | 取消运行 |
-| `GET /api/runs/:id` | 运行详情 |
-| `GET /api/deployments` | 部署历史（`?project_id=&limit=&offset=`） |
-| `GET /api/config/llm` | LLM 配置（掩码，只有 `api_key_set`） |
-| `PUT /api/config/llm` | 保存 LLM 配置（需 `?role=human_admin`） |
-| `POST /api/config/llm/test` | 测试 LLM 连通性（需 `?role=human_admin`） |
-| `POST /api/runs/:id/diagnose` | AI 诊断一次失败运行 |
-| `POST /api/runs/:id/diagnosis/adopt` | 采纳 / 不采纳（采纳写入知识库） |
-| `GET /api/kb` | 知识库条目列表（`?q=` 按项目/阶段/报错/结论过滤） |
-| `DELETE /api/kb/:id` | 删除一条知识库条目 |
+| `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
+| `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |
+| `POST /api/runs/:id/cancel` | 取消（转给 runner） |
+| `DELETE /api/runs` | 清空运行记录（需 `?role=human_admin`） |
+| `GET /api/deployments`、`DELETE /api/deployments` | 部署历史 / 清空 |
+| `GET /api/config/llm`、`PUT`、`POST /api/config/llm/test` | LLM 配置（掩码）/ 保存 / 连通性测试 |
+| `POST /api/runs/:id/diagnose`、`POST /api/runs/:id/diagnosis/adopt` | AI 诊断 / 采纳入知识库 |
+| `GET /api/kb`、`POST /api/kb`、`DELETE /api/kb/:id` | 知识库 |
+| `GET /api/fs/roots`、`GET /api/fs/list` | 目录浏览（受 `CICD_FS_ROOTS` 前缀校验） |
+| `GET /api/config/ssh-defaults` | SSH 兜底配置（前端表单预填） |
 
-上游不可达时透传端点统一返回 `502 { ok:false, error }`，前端显示可重试的错误条。
+`?role=` 只在本层做闸门判定，是**流程门禁**而不是身份认证——真正的身份边界交给
+`HTPASSWD_FILE` 或反向代理。
 
-### 并发与超时
+## 发布审批闸门
 
-Lume（agent-httpd）的模型是「主事件循环 + 阻塞型 worker 池」：静态文件走主循环，
-`/api/*` 这类同步出站调用各占一个 worker。这里显式 `workers = 8`（框架默认值）——
-原来设 2 时，两个 AI 诊断（预算 180s）就能把整个 API 层堵死。
-
-| 场景 | 预算 | 失败表现 |
-| --- | --- | --- |
-| `/api/health` | 2s（上游健康失败时跳过版本号） | `ok:false` + `error`，容器探针不超时误判 |
-| `/api/overview` | 3 × 5s（项目/运行/部署串行） | 部分数据 + `connected:false` + `errors.*`，前端标「不可用」并显示原因 |
-| 普通读写透传 | 30s | `502 { ok:false, error }` |
-| AI 诊断 / LLM 测试 | 180s | 同上（上游模型调用本身 150s，网关不能先断） |
-
-`?role=` 只在本层做闸门判定，**不再转发给上游**：上游 cicdkit 不读这个参数，转发过去
-只会把角色串写进它的访问日志。其余查询参数（`?q=` `?limit=` `?from=`）原样透传。
-
-## 发布审批闸门（lume-core）
-
-`src/guard.lume` import `vendor/lume-core/lib/approval.lume`，用的是它的
-**职责分离**模型而不是角色等级：
+`src/guard.lume` import `vendor/lume-core/lib/approval.lume`，用**职责分离**模型：
 
 | 角色 | 动作 |
 | --- | --- |
 | `agent_operator` | `execute`（构建/流水线） |
 | `agent_reviewer` / `agent_reviewer_second` | 一审 / 二审 |
-| `human_admin` | `approve`（发布） |
+| `human_admin` | `approve`（发布、改配置、清数据、改项目） |
 
-- `CICD_DEPLOY_APPROVAL=off`（默认）：发布行为与 cicdkit 原版一致。
-- `=approve`：发布要求 `?role=human_admin`；其他角色返回 `403` 并附审批链。
-- `=execute`：发布要求 `?role=agent_operator`。
+## 脱敏
 
-前端顶栏的「角色」选择器把角色放在 `?role=` 查询参数里（Lume 的 `req` 不暴露请求头）。
-该参数只在 BFF 内用于闸门判定，转发上游前会被剔掉，不会出现在 cicdkit 的访问日志里。
-这是**流程门禁**，不是身份认证——真正的身份边界交给 `HTPASSWD_FILE` 或反向代理。
+两条链路都必须挡住明文密钥：
 
-## AI 故障诊断（可选 LLM）
+- **写入侧**：`PUT` 项目/LLM 时前端回传 `********` 表示「保持不变」，`merge_secrets`
+  保证库里存的还是旧值。
+- **读出侧**：`GET` 永远不回传明文。运行日志和诊断提示词都过 `mask_log()`
+  （`SECRET_RE` / `KEY_RE` / `BEARER_RE`），因为构建参数里本来就有
+  `--build-arg LLM_API_KEY=...`、`-e *_VISIT_PIN=...` 这类真值。
 
-失败运行在日志抽屉里多一个「**AI 诊断**」按钮：把失败阶段日志发给兼容 OpenAI
-的 `/chat/completions`，返回中文根因 + 证据 + 修复步骤。能力本身在上游
-cicdkit（`internal/llm` + `internal/kb`），这个控制台只是把入口接回来：
+> 已知遗留：真实历史数据里 `build.build_args` / `ssh_run_args` 明文存着 LLM Key 和
+> `*_VISIT_PIN`。当前只做了读出侧脱敏，库里仍是明文，需要时另行清洗。
 
-- **配置不落在这里**：Base URL / API Key / Model / 系统提示词仍然写在上游
-  `data/llm.json`（0600）。前端只做掩码编辑，`GET` 永不回传明文 Key；
-  想用环境变量兜底就是上游的 `CICD_LLM_*`（那个容器里设）。
-- **顶栏「LLM」按钮**打开设置面板，可以改配置、点「测试连接」（发一个最小请求验连通）。
-  写配置 / 测试连接**强制要求** `?role=human_admin`（顶栏角色选「终审」）：
-  这一层能改 BaseURL 并让服务端用已存密钥去请求它，不能让任意访客把密钥指向自己的地址。
-- **成本与缓存**：上游命中知识库同类失败时直接复用结论，不调模型；非命中时调用一次并把
-  结果缓存在运行记录上，重复点诊断不会重复计费。
-- **脱敏**：日志外发前上游把 IPv4/IPv6、`user@host`、`/Users/ /home/ /root/` 路径替换为占位符。
-- **知识库**：诊断结果可以「采纳」写入上游 `kb.json`，后续同类失败按相似度匹配复用（取前 3 条）；
-  面板里会列出命中的历史同类诊断。顶栏「知识库」页只读列出全部条目（可按文本过滤、点行展开完整结论），
-  并支持删除；新增仍然只能来自诊断的「采纳」，因为上游只有列表与 DELETE 两个接口。
-- 未配置 LLM 时点诊断会返回上游的提示「LLM 未配置：请先在「设置」中填写…」，不会 500。
+## 自测
 
-## 项目配置编辑（含服务器目录选择）
+```bash
+make test     # store 34 + exec 61 + gate 24
+```
 
-项目卡片上的「编辑」打开一个表单，覆盖名称 / 描述 / 仓库 / 分支 / 镜像仓库 / tag 策略 /
-构建上下文 / Dockerfile / 是否推送镜像，保存走 `PUT /api/projects/:id`：
+- `scripts/store_test.lume`：建库/迁移/掩码合并/时间列/清理。
+- `scripts/exec_test.lume`：argv 计划的 61 个断言（含 ssh 四步、helm set 顺序、kubeconfig 缺失）。
+- `scripts/test_gate.sh`：起临时实例（runner 指向死端口 `127.0.0.1:9`），验证闸门 403、
+  本地存储 404、`overview connected:false`、`health runner_ok:false`、建删项目、静态站 200。
 
-- **整份替换**：上游的 PUT 不是 patch。前端先 `GET` 到完整对象、只改表单里的字段再整份写回，
-  否则 `targets` / `probe` 这些没在表单里的字段会被清空。
-- **目录选择器**：`build.context` 决定 docker 从哪里取上下文，而浏览器拿不到服务器路径。
-  「浏览目录」走 `GET /api/fs/roots` + `GET /api/fs/list`，在**上游机器**的允许根目录
-  （`FS_ROOTS`）里点选；上游会解析 symlink 后二次校验，越界返回 403。
-- **门禁**：保存与浏览都要求 `?role=human_admin`（与改 LLM 配置同级）。和其他闸门一样，
-  这是流程门禁，真实身份边界仍是 `HTPASSWD_FILE` / 反向代理。
+## Docker
 
-## 与 cicdkit 原版前端的差异
+```bash
+make docker        # 控制面 + runner 双服务 → http://127.0.0.1:18107
+make docker-logs
+make docker-down
+```
 
-- 只做只读看板 + 构建/发布/取消 + AI 诊断；项目页可编辑**现有**项目的配置，
-  仍不做「新建项目 / 扫描导入」（那需要完整的建项表单，还在 cicdkit 原版 UI）。
-- 知识库页只做「列表 + 删除 + 结论展开」，不能手工新建/编辑（新增只能来自诊断的「采纳」）。
-- 运行日志抽屉轮询 `/api/runs/:id/log?from=`，只取增量，不在浏览器保存完整日志。
-- 没有任何前端状态写回磁盘；Lume 进程无状态，重启即回到上游真相。
+- 控制面端口 **18107**，只发布到 `127.0.0.1`；runner 仅 `expose 8899`，不出宿主机。
+- `./.data` 挂成**可写**（SQLite + 日志），`./.data/logs` 同时挂给 runner——
+  两者必须指向同一个卷，否则前端永远看到空日志（增量读按字节偏移）。
+- 项目目录必须**以相同绝对路径**挂进两个容器，否则 docker daemon 解析 `build.context` 会失败。
+- lume 二进制从既有镜像取（`LUME_BIN_IMAGE`，默认 `lume-bin:0.14.2`）：
+  lume 是静态 C 单二进制，release 包在本机网络下不可达。
+
+## 还没做 / 已知取舍
+
+- A2A 六端点、`/api/webhook/:id`、`/api/generate` 未实现（控制面已无 cicdkit 可转，
+  要做只能在本地重写）。
+- `tag_strategy=git-sha` 已放弃，统一时间戳 tag。
+- 清空运行不会删日志文件，只清库记录。
+- `interrupted` 是新增的运行终态，旧 UI 不认它时按「失败」展示即可。
 
 ## 版本
 
 `vendor/.vendor-stamp` 记录二进制版本与库来源。本地兄弟 checkout 存在时用它
 （本次实测配对：lume `0.14.0` + lume-core 工作树 `de7ce92`）；单独 clone 时从 GitHub
-release 拉 `LUME_VERSION` / `LUME_CORE_TAG`（默认 `v0.13.1`，即当前已发布版本）。
-Linux 用 `-static` 资产，macOS release 只有动态链接包（依赖 Homebrew openssl/sqlite3）。
+release 拉 `LUME_VERSION` / `LUME_CORE_TAG`（默认 `v0.13.1`）。
 
-### vendor 入库策略
-
-- `vendor/lume-core/lib/*.lume` **入库**：`src/guard.lume` 按源码路径 `import`，
-  clone 下来必须原样存在，否则 `lume --check` 直接失败。
-- `vendor/lume/bin/lume` **不入库**：平台相关、体积大， macOS 上 vendor 脚本建的是
-  指向兄弟 checkout 的软链（复制会破坏 codesign）。首次 clone 后跑一次 `make vendor`。
-- `vendor/.vendor-stamp` **不入库**：由 vendor 脚本按本机来源生成（`local-checkout` /
-  `release`），提交进来只会在别人机器上过时。版本配对以本节文字为准。
+- `vendor/lume-core/lib/*.lume` **入库**：`src/guard.lume` 按源码路径 import。
+- `vendor/lume/bin/lume` **不入库**：平台相关、体积大，首次 clone 后跑一次 `make vendor`。
+- `vendor/.vendor-stamp` **不入库**：由 vendor 脚本按本机来源生成。

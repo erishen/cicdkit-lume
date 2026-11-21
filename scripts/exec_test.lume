@@ -1,0 +1,220 @@
+// scripts/exec_test.lume — 执行计划自测（不跑 docker/kubectl，只断言 argv 形状）
+//
+// 目的：把「配置 → 命令行」这一段固定下来。这段最容易悄悄改坏——argv 顺序
+// 错了 kubectl 只会报个语焉不详的参数错，helm 少个 --set 就是发布了旧镜像。
+
+import "../src/exec.lume" as exec;
+
+// 注意：LUME 的标量赋值在函数内只改副本，全局计数必须放 map 里共享。
+let st = { checks: 0, fails: 0 };
+
+func eq(name, got, want) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (str(got) != str(want)) {
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+    print("FAIL " + name + "\n  got  " + str(got) + "\n  want " + str(want));
+  }
+}
+
+func has(name, hay, needle) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (not contains(str(hay), str(needle))) {
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+    print("FAIL " + name + "\n  missing " + str(needle) + "\n  in " + str(hay));
+  }
+}
+
+func no(name, hay, needle) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (contains(str(hay), str(needle))) {
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+    print("FAIL " + name + "\n  unexpected " + str(needle) + "\n  in " + str(hay));
+  }
+}
+
+func base() {
+  return {
+    id: "demo-app",
+    build: {
+      context: "./",
+      dockerfile: "Dockerfile",
+      image_repo: "registry.example.com/team/demo",
+      tag_strategy: "timestamp",
+      push: true,
+      build_args: { "B": "2", "A": "1" },
+      platforms: ["linux/amd64"],
+      registry: { "server": "registry.example.com", username: "ci", password: "s3cret" }
+    },
+    deploy: {
+      method: "kubectl-set-image",
+      kubeconfig: "/root/.kube/config",
+      namespace: "demo",
+      deployment: "demo",
+      container: "app",
+      wait: true,
+      timeout: "120s"
+    }
+  };
+}
+
+// ---------- 构建 ----------
+
+let p = base();
+let b = exec.build_steps(p, "20261121-120000");
+eq("build ok", b.ok, true);
+eq("build ref", b.image_ref, "registry.example.com/team/demo:20261121-120000");
+eq("build steps", len(b.steps), 2);
+
+let login = b.steps[0];
+eq("login label", login.label, "docker login");
+eq("login argv", join(login.argv, " "), "docker login registry.example.com -u ci --password-stdin");
+eq("login stdin 是口令", login.stdin, "s3cret");
+no("login argv 不含口令", join(login.argv, " "), "s3cret");
+
+let bstep = b.steps[1];
+eq("build argv", join(bstep.argv, " "),
+   "docker build -f Dockerfile --build-arg A=1 --build-arg B=2 --platform linux/amd64 -t registry.example.com/team/demo:20261121-120000 ./");
+
+let psteps = exec.push_steps(p, b.image_ref);
+eq("push steps", len(psteps), 1);
+eq("push argv", join(psteps[0].argv, " "), "docker push registry.example.com/team/demo:20261121-120000");
+
+// 不 push 就没这一步
+let pn = { id: "x", build: { image_repo: "r/x", push: false }, deploy: { method: "ssh" } };
+eq("no push steps", len(exec.push_steps(pn, "r/x:t")), 0);
+
+// 缺 image_repo 要报错而不是产出半截计划
+let empty_proj = { id: "y", build: {}, deploy: {} };
+let bb = exec.build_steps(empty_proj, "t");
+eq("缺 image_repo 拒绝", bb.ok, false);
+has("缺 image_repo 提示", bb.err, "image_repo");
+
+// ---------- kubectl-set-image ----------
+
+let kb = exec.deploy_steps(p, p.deploy, b.image_ref, {});
+eq("setimage ok", kb.ok, true);
+eq("setimage steps", len(kb.steps), 2);
+eq("setimage argv", join(kb.steps[0].argv, " "),
+   "kubectl --kubeconfig /root/.kube/config -n demo set image deployment/demo app=registry.example.com/team/demo:20261121-120000");
+eq("rollout argv", join(kb.steps[1].argv, " "),
+   "kubectl --kubeconfig /root/.kube/config -n demo rollout status deployment/demo --timeout 120s");
+
+// wait=false 就不该有 rollout
+let nw = { method: "kubectl-set-image", kubeconfig: "/k", deployment: "d", container: "c", wait: false };
+eq("no wait 无 rollout", len(exec.deploy_steps({ id: "z" }, nw, "img:1", {}).steps), 1);
+
+// 缺 kubeconfig 必须拦住（否则会在 runner 里报一句 "no config file")
+let nokc = { method: "kubectl-set-image", deployment: "d", container: "c" };
+eq("缺 kubeconfig 拒绝", exec.deploy_steps({ id: "z" }, nokc, "img:1", {}).ok, false);
+
+// ---------- kubectl-apply ----------
+
+let app = {
+  method: "kubectl-apply", kubeconfig: "/root/.kube/config", namespace: "ns",
+  manifest_path: "deploy/app.yaml", wait: true, timeout: "90s"
+};
+let r1 = exec.deploy_steps({ id: "ap" }, app, "img:1", {});
+eq("apply ok", r1.ok, true);
+eq("apply argv", join(r1.steps[0].argv, " "),
+   "kubectl --kubeconfig /root/.kube/config -n ns apply -f deploy/app.yaml --wait --timeout 90s");
+
+// ---------- helm ----------
+
+let hm = {
+  method: "helm", kubeconfig: "/root/.kube/config", namespace: "prod",
+  chart_path: "./chart", release_name: "demo", helm_set_image: true,
+  helm_image_key: "image.repository", helm_values: { "replicas": "2" },
+  wait: true, timeout: "300s"
+};
+let r2 = exec.deploy_steps({ id: "hl" }, hm, "registry/x:1", {});
+eq("helm ok", r2.ok, true);
+eq("helm argv", join(r2.steps[0].argv, " "),
+   "helm --kubeconfig /root/.kube/config -n prod upgrade --install demo ./chart --set replicas=2 --set image.repository=registry/x:1 --wait --timeout 300s");
+eq("helm timeout 带余量", r2.steps[0].timeout_s, 310);
+
+// ---------- local-k3s ----------
+
+let k3 = {
+  method: "local-k3s", kubeconfig: "/root/.kube/config", namespace: "default",
+  deployment: "demo", container: "app", manifest_path: "deploy/app.yaml",
+  k3s_import_cmd: "sudo k3s ctr images import -", timeout: "60s"
+};
+let r3 = exec.deploy_steps({ id: "k3s-demo" }, k3, "registry/x:1", {});
+eq("k3s ok", r3.ok, true);
+eq("k3s steps", len(r3.steps), 7);
+eq("k3s precheck", join(r3.steps[0].argv, " "), "docker image inspect registry/x:1");
+eq("k3s save", join(r3.steps[1].argv, " "), "docker save -o /tmp/cicd-k3s-k3s-demo.tar registry/x:1");
+// "-" 被换成 tar 路径，且 sudo 前缀保留
+eq("k3s import", join(r3.steps[2].argv, " "), "sudo k3s ctr images import /tmp/cicd-k3s-k3s-demo.tar");
+eq("k3s cleanup", join(r3.steps[3].argv, " "), "rm -f /tmp/cicd-k3s-k3s-demo.tar");
+eq("k3s apply", join(r3.steps[4].argv, " "), "kubectl --kubeconfig /root/.kube/config -n default apply -f deploy/app.yaml");
+eq("k3s setimage", join(r3.steps[5].argv, " "), "kubectl --kubeconfig /root/.kube/config -n default set image deployment/demo app=registry/x:1");
+eq("k3s rollout", join(r3.steps[6].argv, " "), "kubectl --kubeconfig /root/.kube/config -n default rollout status deployment/demo --timeout 60s");
+
+// 允许列表外的导入命令必须拒绝（这是注入点）
+let evil = { method: "local-k3s", kubeconfig: "/k", deployment: "d", container: "c", k3s_import_cmd: "sh -c 'rm -rf /'" };
+eq("非法 import 命令拒绝", exec.deploy_steps({ id: "e" }, evil, "img:1", {}).ok, false);
+
+// 不配 import（OrbStack 共享 docker 镜像）时跳过导入
+let noimp = { method: "local-k3s", kubeconfig: "/k", deployment: "d", container: "c", manifest_path: "m.yaml" };
+let r3b = exec.deploy_steps({ id: "n" }, noimp, "img:1", {});
+eq("无 import 步数", len(r3b.steps), 4);
+
+// ---------- ssh ----------
+
+let sh = {
+  method: "ssh", ssh_host: "10.0.0.9", ssh_user: "deploy", ssh_port: "2222",
+  ssh_key_path: "/root/.ssh/id_ed25519", ssh_container: "web", ssh_probe_port: "18080",
+  ssh_container_port: "8080", ssh_run_args: "-e A=1 -p 9999:80 --restart always",
+  ssh_pull: true, wait: false, timeout: "45s"
+};
+let r4 = exec.deploy_steps({ id: "sh1" }, sh, "registry/x:1", {});
+eq("ssh ok", r4.ok, true);
+eq("ssh 步数", len(r4.steps), 1);
+let sshargv = join(r4.steps[0].argv, " ");
+has("ssh -i", sshargv, "-i /root/.ssh/id_ed25519");
+has("ssh -p", sshargv, "-p 2222");
+has("ssh 目标", sshargv, "deploy@10.0.0.9");
+let script = r4.steps[0].argv[len(r4.steps[0].argv) - 1];
+has("脚本先 pull", script, "docker pull 'registry/x:1'");
+has("脚本清端口占用", script, "publish=18080");
+has("脚本 rm -f 旧容器", script, "docker rm -f 'web'");
+has("脚本 run -p 只认 probe 端口", script, "docker run -d --name 'web' -p 18080:8080 --restart unless-stopped");
+no("脚本去掉 -p 9999", script, "9999:80");
+has("保留其它 run 参数", script, "-e A=1");
+has("镜像被单引号包住", script, "'registry/x:1'");
+
+// ssh_transfer：save → scp → 清理 → 远端 load
+let tr = {
+  method: "ssh", ssh_host: "10.0.0.9", ssh_user: "deploy",
+  ssh_transfer: true, ssh_container: "web", ssh_probe_port: "18080", ssh_container_port: "8080"
+};
+let r5 = exec.deploy_steps({ id: "tr1" }, tr, "registry/x:1", {});
+eq("transfer 步数", len(r5.steps), 4);
+has("transfer save", join(r5.steps[0].argv, " "), "docker save -o /tmp/cicd-ssh-tr1-");
+has("transfer scp -P", join(r5.steps[1].argv, " "), "scp -P 22 -o StrictHostKeyChecking=accept-new");
+has("transfer scp 目标", join(r5.steps[1].argv, " "), "deploy@10.0.0.9:/tmp/cicd-ssh-tr1.tar");
+let script2 = r5.steps[3].argv[len(r5.steps[3].argv) - 1];
+has("远端 load", script2, "docker load -i '/tmp/cicd-ssh-tr1.tar'");
+no("transfer 不 pull", script2, "docker pull");
+
+// 缺 host 必须报错
+eq("ssh 缺 host 拒绝", exec.deploy_steps({ id: "s" }, { method: "ssh", ssh_user: "u" }, "img:1", {}).ok, false);
+
+// ---------- 容器名 / 端口解析 ----------
+
+eq("容器名净化", exec.container_name("My App_01!"), "My-App_01-");
+eq("容器名空值", exec.container_name(""), "cicd-app");
+eq("strip -p", exec.strip_publish("-p 1:2 --publish 3:4 -e X=1"), "-e X=1");
+eq("strip --publish=", exec.strip_publish("--publish=1:2 -e Y=2"), "-e Y=2");
+eq("timeout 解析", exec.step_timeout({ timeout: "120s" }, 600), 130);
+eq("timeout 缺省", exec.step_timeout({}, 600), 600);
+eq("timeout 非法", exec.step_timeout({ timeout: "abc" }, 600), 600);
+
+let total = int(get(st, "checks", 0));
+let nfail = int(get(st, "fails", 0));
+if (nfail == 0) {
+  print("exec_test: " + str(total) + " checks passed");
+} else {
+  print("exec_test: " + str(nfail) + " of " + str(total) + " checks FAILED");
+}

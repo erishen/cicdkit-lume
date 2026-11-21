@@ -1,0 +1,79 @@
+// scripts/plan_dump.lume — 把每个项目的执行计划打出来（干跑，不执行）
+//
+// 用途：接管 cicdkit 之前先对着真实数据看一遍「配置会被翻译成什么命令行」。
+// 有 plan 生成失败的项目，就是迁过去会立刻炸的地方。
+//
+//   LUME_DATA=/tmp/lume_native ./vendor/lume/bin/lume scripts/plan_dump.lume [dir]
+
+import "../src/store.lume" as store;
+import "../src/validate.lume" as validate;
+import "../src/exec.lume" as exec;
+
+store.init();
+let page = store.list_projects("", 200, 0);
+let items = get(page, "projects", []);
+let i = 0;
+let bad = 0;
+while (i < len(items)) {
+  let p = items[i];
+  print("\n=== " + str(get(p, "id", "")) + " (" + str(get(p, "name", "")) + ")");
+  let b = exec.build_steps(p, "20260101-000000");
+  if (get(b, "ok", false)) {
+    let bs = get(b, "steps", []);
+    let j = 0;
+    while (j < len(bs)) {
+      print("  build  " + join(get(get(bs, j, {}), "argv", []), " "));
+      j = j + 1;
+    }
+    print("  ref    " + str(get(b, "image_ref", "")));
+  } else {
+    bad = bad + 1;
+    print("  BUILD FAILED: " + str(get(b, "err", "")));
+  }
+  let rd = validate.resolve_deploy(p, "", "");
+  if (not get(rd, "ok", false)) {
+    bad = bad + 1;
+    print("  DEPLOY RESOLVE FAILED: " + str(get(rd, "err", "")));
+  } else {
+    let d = exec.deploy_steps(p, get(rd, "spec", {}), str(get(b, "image_ref", "ref:tag")), {});
+    if (get(d, "ok", false)) {
+      let ds = get(d, "steps", []);
+      let k = 0;
+      while (k < len(ds)) {
+        print("  deploy " + join(get(get(ds, k, {}), "argv", []), " "));
+        k = k + 1;
+      }
+    } else {
+      bad = bad + 1;
+      print("  DEPLOY FAILED: " + str(get(d, "err", "")));
+    }
+  }
+  let targets = get(p, "targets", null);
+  if (targets != null) {
+    let t = 0;
+    while (t < len(targets)) {
+      let tn = str(get(get(targets, t, {}), "name", ""));
+      let rt = validate.resolve_deploy(p, tn, "");
+      if (not get(rt, "ok", false)) {
+        bad = bad + 1;
+        print("  TARGET " + tn + " FAILED: " + str(get(rt, "err", "")));
+      } else {
+        let dd = exec.deploy_steps(p, get(rt, "spec", {}), str(get(b, "image_ref", "ref:tag")), {});
+        if (get(dd, "ok", false)) {
+          let dds = get(dd, "steps", []);
+          let x = 0;
+          while (x < len(dds)) {
+            print("  target " + tn + ": " + join(get(get(dds, x, {}), "argv", []), " "));
+            x = x + 1;
+          }
+        } else {
+          bad = bad + 1;
+          print("  TARGET " + tn + " FAILED: " + str(get(dd, "err", "")));
+        }
+      }
+      t = t + 1;
+    }
+  }
+  i = i + 1;
+}
+print("\nplan_dump: " + str(len(items)) + " projects, " + str(bad) + " problems");

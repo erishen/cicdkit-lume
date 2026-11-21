@@ -1,0 +1,550 @@
+// src/exec.lume — 执行面的控制侧：把项目配置翻译成 argv 计划，投给 runner
+//
+// 为什么「翻译」放在这里而不是 runner 里：
+//   拼命令行（docker build 的 --build-arg、kubectl 的 -n、ssh 的 -o ...）
+//   全是字符串与 map 的活，DSL 做得来，而且改一版不用重编二进制；
+//   runner 只负责「跑」，这样它才可能做到 500 行以内且没有业务逻辑。
+//
+// 与 cicdkit internal/build + internal/deploy 的对应关系：
+//   build        docker build [-f] [--target] [--build-arg] [--platform] -t ref ctx
+//   push         docker push ref
+//   deploy       kubectl-apply / kubectl-set-image / helm / local-k3s / ssh
+// 差异（有意为之，写在这里免得以后当成 bug）：
+//   1. local-k3s 的镜像导入不再用「docker save | k3s ctr images import -」管道
+//      （runner 不解释 shell），改成先 `docker save -o <tar>` 再
+//      `k3s ctr images import <tar>`，末尾删 tar。语义相同，多一次落盘。
+//   2. k3s 导入的 sudo 前缀仍沿用配置里的 k3s_import_cmd 第一个词，不经 shell。
+//   3. helm 的 --set 顺序与 cicdkit 一致（helm_values 先，镜像键后）。
+
+import "validate.lume" as validate;
+
+// ---------- runner 客户端 ----------
+
+export func runner_base() {
+  let b = env("RUNNER_BASE");
+  let s = "";
+  if (b != null) { s = trim(str(b)); }
+  if (len(s) == 0) { return "http://127.0.0.1:8899"; }
+  if (substr(s, len(s) - 1) == "/") { return substr(s, 0, len(s) - 1); }
+  return s;
+}
+
+// 变量名不能叫 RUNNER_TOKEN：env() 对含 TOKEN 的名字一律返回 null。
+// 与上游 cicdkit 的 CICD_AUTH 同一个坑，这里叫 RUNNER_AUTH（或读文件）。
+export func runner_auth() {
+  let f = env("RUNNER_AUTH_FILE");
+  if (f != null and len(str(f)) > 0) {
+    let raw = read_file(str(f));
+    if (raw != null) { return trim(str(raw)); }
+  }
+  let t = env("RUNNER_AUTH");
+  if (t == null) { return ""; }
+  return trim(str(t));
+}
+
+func runner_opts(secs, body) {
+  let hdrs = { "Accept": "application/json" };
+  let t = runner_auth();
+  if (len(t) > 0) { put(hdrs, "X-Runner-Token", t); }
+  if (body != null) { put(hdrs, "Content-Type", "application/json"); }
+  let o = { headers: hdrs, timeout: secs, max_bytes: 8388608, allow_private: true };
+  if (body != null) { put(o, "body", str(body)); }
+  return o;
+}
+
+func runner_json(method, path, body, secs) {
+  let o = runner_opts(secs, body);
+  let url = runner_base() + path;
+  let r = null;
+  if (method == "POST") {
+    r = http_post(url, o);
+  } else if (method == "PUT") {
+    r = http_put(url, o);
+  } else {
+    r = http_get(url, o);
+  }
+  let code = int(get(r, "status", 0));
+  let raw = get(r, "body", "");
+  let data = null;
+  if (raw != null and len(str(raw)) > 0) {
+    let p = try(() => json(str(raw)));
+    if (p.err == null) { data = p.ok; }
+  }
+  return { ok: code >= 200 and code < 300, status: code, data: data, err: str(get(r, "err", "")) };
+}
+
+export func alive() {
+  let r = runner_json("GET", "/healthz", null, 2);
+  return get(r, "ok", false);
+}
+
+// 提交：name 同时是日志文件名（控制面按字节偏移读它，必须与 run id 对齐）。
+export func submit(name, steps, timeout_s) {
+  let body = { name: str(name), steps: steps, timeout_s: int(timeout_s) };
+  let r = runner_json("POST", "/jobs", stringify(body), 10);
+  if (not get(r, "ok", false)) {
+    let msg = "无法提交任务到 runner " + runner_base() + "：" + str(get(r, "err", ""));
+    let d = get(r, "data", null);
+    if (d != null) { msg = str(get(d, "error", msg)); }
+    return { ok: false, id: "", err: msg };
+  }
+  return { ok: true, id: str(get(get(r, "data", {}), "id", "")), err: "" };
+}
+
+export func status(job_id) {
+  if (len(str(job_id)) == 0) { return null; }
+  let r = runner_json("GET", "/jobs/" + str(job_id), null, 5);
+  if (not get(r, "ok", false)) { return null; }
+  return get(r, "data", null);
+}
+
+export func cancel(job_id) {
+  if (len(str(job_id)) == 0) { return false; }
+  let r = runner_json("POST", "/jobs/" + str(job_id) + "/cancel", "{}", 5);
+  return get(r, "ok", false);
+}
+
+// ---------- 计划：构建 ----------
+
+// tag = timestamp（默认）或 git-sha。git-sha 需要读仓库 HEAD，走 runner 太重，
+// 这里用 commit 文件的 mtime？不 —— 直接返回时间戳，并在 meta 里说明。
+export func make_tag() {
+  // cicdkit 的 tag_strategy 还有 git-sha（要在构建上下文里跑 git rev-parse）。
+  // 控制面不去碰 git：统一用时间戳 tag，可追溯到构建记录（run 的 created_at）。
+  return strftime("%Y%m%d-%H%M%S", now());
+}
+
+export func image_ref(p, tag) {
+  let repo = trim(str(get(get(p, "build", {}), "image_repo", "")));
+  if (len(repo) == 0) { return ""; }
+  if (substr(repo, len(repo) - 1) == "/") { repo = substr(repo, 0, len(repo) - 1); }
+  return repo + ":" + str(tag);
+}
+
+// docker login 用 stdin 传口令：argv 里只有 -u，口令不出现在日志/ps。
+func login_steps(p) {
+  let reg = get(get(p, "build", {}), "registry", null);
+  let out = [];
+  if (reg == null) { return out; }
+  let reg_server = trim(str(get(reg, "server", "")));
+  let user = trim(str(get(reg, "username", "")));
+  let pass = str(get(reg, "password", ""));
+  if (len(user) == 0) { return out; }
+  let argv = ["docker", "login"];
+    if (len(reg_server) > 0) { push(argv, reg_server); }
+  push(argv, "-u");
+  push(argv, user);
+  push(argv, "--password-stdin");
+  push(out, { label: "docker login", argv: argv, stdin: pass, timeout_s: 60 });
+  return out;
+}
+
+// 构建计划。platform 取 build.platforms；ssh_transfer 时按 deploy.ssh_build_platforms
+// 覆盖并只留一个（远端 docker load 只吃单架构 tar）。
+export func build_steps(p, tag) {
+  let build = get(p, "build", {});
+  let repo = trim(str(get(build, "image_repo", "")));
+  if (len(repo) == 0) {
+    return { ok: false, steps: [], image_ref: "", err: "build.image_repo 未配置" };
+  }
+  let ref = image_ref(p, tag);
+
+  let steps = login_steps(p);
+
+  let platforms = get(build, "platforms", []);
+  let dep = get(p, "deploy", {});
+  if (trim(str(get(dep, "method", ""))) == "ssh" and bool(get(dep, "ssh_transfer", false))) {
+    let sp = get(dep, "ssh_build_platforms", null);
+    if (sp != null and len(sp) > 0) { platforms = sp; }
+    if (len(platforms) > 1) { platforms = [platforms[0]]; }
+    if (len(platforms) == 0) { platforms = ["linux/amd64"]; }
+  }
+
+  let argv = ["docker", "build"];
+  let df = trim(str(get(build, "dockerfile", "")));
+  if (len(df) > 0) { push(argv, "-f"); push(argv, df); }
+  let target = trim(str(get(build, "target", "")));
+  if (len(target) > 0) { push(argv, "--target"); push(argv, target); }
+  let args = get(build, "build_args", null);
+  if (args != null) {
+    let ks = keys(args);
+    // keys() 的顺序不稳定，排序让日志可复现（--build-arg 之间无依赖）。
+    let sorted = sort(ks);
+    let i = 0;
+    while (i < len(sorted)) {
+      push(argv, "--build-arg");
+      push(argv, sorted[i] + "=" + str(get(args, sorted[i], "")));
+      i = i + 1;
+    }
+  }
+  let i2 = 0;
+  while (i2 < len(platforms)) {
+    push(argv, "--platform");
+    push(argv, str(platforms[i2]));
+    i2 = i2 + 1;
+  }
+  push(argv, "-t");
+  push(argv, ref);
+  let ctx = trim(str(get(build, "context", "")));
+  if (len(ctx) == 0) { ctx = "."; }
+  push(argv, ctx);
+
+  push(steps, { label: "build", argv: argv, timeout_s: 2400 });
+  return { ok: true, steps: steps, image_ref: ref, err: "" };
+}
+
+export func push_steps(p, ref) {
+  if (not bool(get(get(p, "build", {}), "push", false))) { return []; }
+  return [{ label: "push", argv: ["docker", "push", ref], timeout_s: 1200 }];
+}
+
+// ---------- 计划：发布 ----------
+
+func kube_args(spec) {
+  let out = [];
+  let kc = resolve_kubeconfig(spec);
+  if (len(kc) > 0) { push(out, "--kubeconfig"); push(out, kc); }
+  let ns = trim(str(get(spec, "namespace", "")));
+  if (len(ns) > 0) { push(out, "-n"); push(out, ns); }
+  return out;
+}
+
+// kubeconfig 解析顺序：项目字段 → KUBECONFIG → CICD_DEFAULT_KUBECONFIG。
+// 三者都空就没戏了：runner 里 kubectl 只会回一句 "no config file"，没人看得懂。
+func resolve_kubeconfig(spec) {
+  let kc = trim(str(get(spec, "kubeconfig", "")));
+  if (len(kc) > 0) { return kc; }
+  let e = env("KUBECONFIG");
+  if (e != null and len(trim(str(e))) > 0) { return trim(str(e)); }
+  let d = env("CICD_DEFAULT_KUBECONFIG");
+  if (d != null and len(trim(str(d))) > 0) { return trim(str(d)); }
+  return "";
+}
+
+func kubeconfig_missing(spec) {
+  return len(resolve_kubeconfig(spec)) == 0;
+}
+
+func ssh_base_args(spec) {
+  let out = [];
+  let key = validate.env_or(get(spec, "ssh_key_path", ""), "CICD_SSH_KEY_PATH");
+  if (len(key) > 0) { push(out, "-i"); push(out, key); }
+  let port = validate.env_or(get(spec, "ssh_port", ""), "CICD_SSH_PORT");
+  if (len(port) == 0) { port = "22"; }
+  push(out, "-p"); push(out, port);
+  push(out, "-o"); push(out, "StrictHostKeyChecking=accept-new");
+  push(out, "-o"); push(out, "LogLevel=ERROR");
+  push(out, "-o"); push(out, "ConnectTimeout=10");
+  return out;
+}
+
+func ssh_target(spec) {
+  let host = trim(str(get(spec, "ssh_host", "")));
+  let user = validate.env_or(get(spec, "ssh_user", ""), "CICD_SSH_USER");
+  return user + "@" + host;
+}
+
+// 远端脚本：先清掉占端口的旧容器，再 docker rm -f 本项目容器，最后 docker run -d。
+// 脚本整体作为一个 argv 元素交给 ssh，由远端登录 shell 解释（ssh 的固有语义）。
+func ssh_run_script(p, spec, image, remote_tar, transfer) {
+  let lines = [];
+  if (transfer and len(remote_tar) > 0) {
+    push(lines, "docker load -i '" + remote_tar + "'");
+  } else if (bool(get(spec, "ssh_pull", false))) {
+    push(lines, "docker pull '" + image + "'");
+  }
+
+  let container = validate.env_or(get(spec, "ssh_container", ""), "CICD_SSH_CONTAINER");
+  if (len(container) == 0) { container = container_name(get(p, "id", "")); }
+
+  let container_port = validate.env_or(get(spec, "ssh_container_port", ""), "CICD_SSH_CONTAINER_PORT");
+  if (len(container_port) == 0) { container_port = "8080"; }
+  let probe_port = validate.env_or(get(spec, "ssh_probe_port", ""), "CICD_SSH_PROBE_PORT");
+  if (len(probe_port) == 0) { probe_port = "8080"; }
+
+  let run_args = validate.env_or(get(spec, "ssh_run_args", ""), "CICD_SSH_RUN_ARGS");
+  run_args = strip_publish(run_args);
+
+  // 端口释放：残留容器（换过名字、手工 docker run 的）会占着宿主端口，新容器就直接失败。
+  push(lines, "for cid in $(docker ps -q --filter \"publish=" + probe_port + "\"); do [ -n \"$cid\" ] && docker rm -f \"$cid\"; done");
+  push(lines, "docker rm -f '" + container + "' 2>/dev/null || true");
+  let runline = "docker run -d --name '" + container + "' -p " + probe_port + ":" + container_port +
+    " --restart unless-stopped";
+  if (len(run_args) > 0) { runline = runline + " " + run_args; }
+  runline = runline + " '" + image + "'";
+  let cmd = validate.env_or(get(spec, "ssh_command", ""), "CICD_SSH_COMMAND");
+  if (len(cmd) > 0) { runline = runline + " '" + cmd + "'"; }
+  push(lines, runline);
+  return join(lines, "\n") + "\n";
+}
+
+// 去掉 ssh_run_args 里的 -p/--publish：发布端口只认 ssh_probe_port 一个来源，
+// 否则两处配置打架时「改了端口没生效」，排查起来非常费劲（cicdkit 踩过）。
+export func strip_publish(args) {
+  let toks = split(trim(str(args)), " ");
+  let out = [];
+  let i = 0;
+  while (i < len(toks)) {
+    let t = trim(toks[i]);
+    if (t == "-p" or t == "--publish") {
+      i = i + 2;
+    } else if (substr(t, 0, 10) == "--publish=") {
+      i = i + 1;
+    } else if (len(t) > 0) {
+      push(out, t);
+      i = i + 1;
+    } else {
+      i = i + 1;
+    }
+  }
+  return join(out, " ");
+}
+
+// 容器名按项目 id 派生，保证「一个项目一个容器」，重发布时 rm -f 能命中。
+export func container_name(id) {
+  let s = trim(str(id));
+  if (len(s) == 0) { return "cicd-app"; }
+  let ok_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
+  let out = "";
+  let i = 0;
+  while (i < len(s)) {
+    let ch = substr(s, i, 1);
+    if (contains(ok_chars, ch) and len(ch) == 1) {
+      out = out + ch;
+    } else {
+      out = out + "-";
+    }
+    i = i + 1;
+  }
+  let first = substr(out, 0, 1);
+  if (len(first) == 0 or not contains("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", first)) {
+    out = "c" + out;
+  }
+  return out;
+}
+
+// 发布计划。method 来自 resolve_deploy 解析出的目标 DeploySpec。
+export func deploy_steps(p, spec, ref, opts) {
+  let method = trim(str(get(spec, "method", "")));
+  let steps = [];
+
+  if (method == "kubectl-apply") {
+    let manifest = trim(str(get(spec, "manifest_path", "")));
+    if (len(manifest) == 0) { return { ok: false, steps: [], err: "deploy.manifest_path 未配置 (kubectl-apply)" }; }
+    if (kubeconfig_missing(spec)) { return { ok: false, steps: [], err: "缺少 kubeconfig（deploy.kubeconfig / KUBECONFIG / CICD_DEFAULT_KUBECONFIG 都为空）" }; }
+    let argv = ["kubectl"];
+    concat(argv, kube_args(spec));
+    push(argv, "apply");
+    push(argv, "-f");
+    push(argv, manifest);
+    if (bool(get(spec, "wait", false))) { push(argv, "--wait"); }
+    let to = trim(str(get(spec, "timeout", "")));
+    if (len(to) > 0) { push(argv, "--timeout"); push(argv, to); }
+    push(steps, { label: "deploy", argv: argv, timeout_s: step_timeout(spec, 600) });
+    return { ok: true, steps: steps, err: "" };
+  }
+
+  if (method == "kubectl-set-image") {
+    let dep = trim(str(get(spec, "deployment", "")));
+    let ct = trim(str(get(spec, "container", "")));
+    if (len(dep) == 0 or len(ct) == 0) {
+      return { ok: false, steps: [], err: "deploy.deployment 与 deploy.container 为必填 (kubectl-set-image)" };
+    }
+    if (kubeconfig_missing(spec)) { return { ok: false, steps: [], err: "缺少 kubeconfig（deploy.kubeconfig / KUBECONFIG / CICD_DEFAULT_KUBECONFIG 都为空）" }; }
+    let argv = ["kubectl"];
+    concat(argv, kube_args(spec));
+    push(argv, "set");
+    push(argv, "image");
+    push(argv, "deployment/" + dep);
+    push(argv, ct + "=" + ref);
+    push(steps, { label: "set-image", argv: argv, timeout_s: step_timeout(spec, 300) });
+    if (bool(get(spec, "wait", false))) { push(steps, rollout_step(spec)); }
+    return { ok: true, steps: steps, err: "" };
+  }
+
+  if (method == "helm") {
+    let release = trim(str(get(spec, "release_name", "")));
+    let chart = trim(str(get(spec, "chart_path", "")));
+    if (len(release) == 0 or len(chart) == 0) {
+      return { ok: false, steps: [], err: "deploy.release_name 与 deploy.chart_path 为必填 (helm)" };
+    }
+    if (kubeconfig_missing(spec)) { return { ok: false, steps: [], err: "缺少 kubeconfig（deploy.kubeconfig / KUBECONFIG / CICD_DEFAULT_KUBECONFIG 都为空）" }; }
+    let argv = ["helm"];
+    concat(argv, kube_args(spec));
+    push(argv, "upgrade");
+    push(argv, "--install");
+    push(argv, release);
+    push(argv, chart);
+    let hv = get(spec, "helm_values", null);
+    if (hv != null) {
+      let ks = sort(keys(hv));
+      let i = 0;
+      while (i < len(ks)) {
+        push(argv, "--set");
+        push(argv, ks[i] + "=" + str(get(hv, ks[i], "")));
+        i = i + 1;
+      }
+    }
+    if (bool(get(spec, "helm_set_image", false))) {
+      let key = trim(str(get(spec, "helm_image_key", "")));
+      if (len(key) == 0) { key = "image"; }
+      push(argv, "--set");
+      push(argv, key + "=" + ref);
+    }
+    if (bool(get(spec, "wait", false))) { push(argv, "--wait"); }
+    let to = trim(str(get(spec, "timeout", "")));
+    if (len(to) > 0) { push(argv, "--timeout"); push(argv, to); }
+    push(steps, { label: "deploy", argv: argv, timeout_s: step_timeout(spec, 900) });
+    return { ok: true, steps: steps, err: "" };
+  }
+
+  if (method == "local-k3s") {
+    let dep = trim(str(get(spec, "deployment", "")));
+    let ct = trim(str(get(spec, "container", "")));
+    if (len(dep) == 0 or len(ct) == 0) {
+      return { ok: false, steps: [], err: "deploy.deployment 与 deploy.container 为必填 (local-k3s)" };
+    }
+    if (kubeconfig_missing(spec)) { return { ok: false, steps: [], err: "缺少 kubeconfig（deploy.kubeconfig / KUBECONFIG / CICD_DEFAULT_KUBECONFIG 都为空）" }; }
+
+    // 0. 本地镜像必须在，否则 set-image 会「成功」而 Pod 卡在 ImagePullBackOff。
+    push(steps, { label: "precheck", argv: ["docker", "image", "inspect", ref], timeout_s: 60 });
+
+    // 1. 导入 k3s containerd（可跳过：OrbStack 之类共享 docker 镜像）
+    let import_cmd = trim(str(get(spec, "k3s_import_cmd", "")));
+    if (len(import_cmd) > 0) {
+      let err = validate.check_import_cmd(import_cmd);
+      if (len(err) > 0) { return { ok: false, steps: [], err: err }; }
+      let tar = "/tmp/cicd-k3s-" + str(get(p, "id", "img")) + ".tar";
+      push(steps, { label: "save", argv: ["docker", "save", "-o", tar, ref], timeout_s: 900 });
+      let parts = split(import_cmd, " ");
+      let imp = [];
+      let i = 0;
+      while (i < len(parts)) {
+        let t = trim(parts[i]);
+        if (len(t) > 0) { push(imp, t); }
+        i = i + 1;
+      }
+      // cicdkit 把镜像从标准输入灌进去（... import -）；这里给了文件路径，
+      // 把末尾的 "-" 换成 tar 路径，其余参数原样。
+      // 末尾的 "-"（表示从 stdin 读）不能带过来，改成显式 tar 路径。
+      let clean = [];
+      let k = 0;
+      while (k < len(imp)) {
+        if (imp[k] != "-") { push(clean, imp[k]); }
+        k = k + 1;
+      }
+      push(clean, tar);
+      imp = clean;
+      push(steps, { label: "import", argv: imp, timeout_s: 900 });
+      push(steps, { label: "cleanup", argv: ["rm", "-f", tar], timeout_s: 30 });
+    }
+
+    // 2. 每次发布都 apply 一次清单：Service/Deployment 与文件保持同步。
+    let manifest = trim(str(get(spec, "manifest_path", "")));
+    if (len(manifest) > 0) {
+      let argv = ["kubectl"];
+      concat(argv, kube_args(spec));
+      push(argv, "apply");
+      push(argv, "-f");
+      push(argv, manifest);
+      push(steps, { label: "apply", argv: argv, timeout_s: 300 });
+    }
+
+    // 3. set-image
+    let argv2 = ["kubectl"];
+    concat(argv2, kube_args(spec));
+    push(argv2, "set");
+    push(argv2, "image");
+    push(argv2, "deployment/" + dep);
+    push(argv2, ct + "=" + ref);
+    push(steps, { label: "set-image", argv: argv2, timeout_s: 300 });
+
+    // 4. 等滚动更新真正就绪（把「image updated」的假成功变成真检查）
+    push(steps, rollout_step(spec));
+    return { ok: true, steps: steps, err: "" };
+  }
+
+  if (method == "ssh") {
+    let image = trim(str(get(spec, "ssh_image", "")));
+    if (len(image) == 0) { image = trim(str(ref)); }
+    if (len(image) == 0) {
+      return { ok: false, steps: [], err: "ssh 部署缺少镜像：请设置 build.image_repo，或在 deploy.ssh_image 显式填写" };
+    }
+    let host = trim(str(get(spec, "ssh_host", "")));
+    if (len(host) == 0) { return { ok: false, steps: [], err: "ssh 部署缺少 deploy.ssh_host" }; }
+    let user = validate.env_or(get(spec, "ssh_user", ""), "CICD_SSH_USER");
+    if (len(user) == 0) { return { ok: false, steps: [], err: "ssh 部署缺少 deploy.ssh_user（或 CICD_SSH_USER）" }; }
+
+    let transfer = bool(get(spec, "ssh_transfer", false));
+    let remote_tar = "";
+    if (transfer) {
+      // 无注册表中转：本地 save → scp → 远端 load → run。文件名带项目 id 与秒，
+      // 避免两台发布撞名；远端 /tmp 由容器重启自行清理。
+      let local_tar = "/tmp/cicd-ssh-" + str(get(p, "id", "img")) + "-" + str(now()) + ".tar";
+      remote_tar = "/tmp/cicd-ssh-" + str(get(p, "id", "img")) + ".tar";
+      push(steps, { label: "save", argv: ["docker", "save", "-o", local_tar, image], timeout_s: 900 });
+      let scp_argv = ["scp"];
+      let key = validate.env_or(get(spec, "ssh_key_path", ""), "CICD_SSH_KEY_PATH");
+      if (len(key) > 0) { push(scp_argv, "-i"); push(scp_argv, key); }
+      let port = validate.env_or(get(spec, "ssh_port", ""), "CICD_SSH_PORT");
+      if (len(port) == 0) { port = "22"; }
+      push(scp_argv, "-P"); push(scp_argv, port);
+      push(scp_argv, "-o"); push(scp_argv, "StrictHostKeyChecking=accept-new");
+      push(scp_argv, local_tar);
+      push(scp_argv, ssh_target(spec) + ":" + remote_tar);
+      push(steps, { label: "scp", argv: scp_argv, timeout_s: 1800 });
+      push(steps, { label: "cleanup", argv: ["rm", "-f", local_tar], timeout_s: 30 });
+    }
+
+    let script = ssh_run_script(p, spec, image, remote_tar, transfer);
+    let ssh_argv = ["ssh"];
+    concat(ssh_argv, ssh_base_args(spec));
+    push(ssh_argv, ssh_target(spec));
+    push(ssh_argv, script);
+    push(steps, { label: "deploy", argv: ssh_argv, timeout_s: step_timeout(spec, 900) });
+    return { ok: true, steps: steps, err: "" };
+  }
+
+  return { ok: false, steps: [], err: "未知的部署方式 \"" + method + "\"" };
+}
+
+func rollout_step(spec) {
+  let dep = trim(str(get(spec, "deployment", "")));
+  let argv = ["kubectl"];
+  concat(argv, kube_args(spec));
+  push(argv, "rollout");
+  push(argv, "status");
+  push(argv, "deployment/" + dep);
+  let to = trim(str(get(spec, "timeout", "")));
+  if (len(to) > 0) { push(argv, "--timeout"); push(argv, to); }
+  return { label: "rollout", argv: argv, timeout_s: step_timeout(spec, 600) };
+}
+
+// 配置里的 timeout 是 kubectl/helm 的时长串（"120s"），runner 要秒数。
+export func step_timeout(spec, def) {
+  let t = trim(str(get(spec, "timeout", "")));
+  if (len(t) == 0) { return def; }
+  let n = 0;
+  let i = 0;
+  while (i < len(t)) {
+    let ch = substr(t, i, 1);
+    if (contains("0123456789", ch) and len(ch) == 1) {
+      n = n * 10 + int(ch);
+      i = i + 1;
+    } else {
+      break;
+    }
+  }
+  if (n <= 0) { return def; }
+  // 多留 10s 余量：kubectl 自己也会在 timeout 时失败，runner 不能更早砍掉。
+  return n + 10;
+}
+
+func concat(dst, src) {
+  let i = 0;
+  while (i < len(src)) {
+    push(dst, src[i]);
+    i = i + 1;
+  }
+  return dst;
+}

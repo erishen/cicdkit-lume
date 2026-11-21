@@ -1,41 +1,46 @@
-// cicdkit_lume.lume — cicdkit 的 Lume BFF + React 控制台
+// cicdkit_lume.lume — cicdkit 的替代实现：Lume 单进程控制面 + 薄 runner
 //
-// 形态：Lume 单进程 = 静态站（www/）+ SPA 回退 + 同源 JSON API。
-// 浏览器不直连 cicdkit：所有 /api/* 在这里转发/聚合，API Token 留在服务端。
+// 形态：本进程 = 静态站（www/）+ SPA 回退 + 同源 JSON API + 状态存储（SQLite）。
+// 代码执行发生在内网 runner（runner/main.go）里：本进程只把项目配置翻译成
+// argv 计划并投递 job，日志按字节偏移从共享目录增量读取。
+// cicdkit 本体（13k 行 Go 服务 + 232MB 镜像）不再需要运行。
 //
-//   GET  /                      React 控制台（总览 / 项目 / 运行 / 部署）
-//   GET  /api/health            本服务 + 上游 cicdkit 健康检查
-//   GET  /api/meta              上游地址、审批闸门策略（lume-core approval）
-//   GET  /api/overview          首屏聚合：项目/运行/部署计数 + 最近记录
-//   GET  /api/projects          项目列表（?q= &limit= &offset= 透传）
-//   GET  /api/projects/:id      项目详情
+//   GET  /api/health            本服务 + runner + 存储健康
+//   GET  /api/meta              runner 地址、审批闸门策略、LLM 状态
+//   GET  /api/version           版本信息（前端顶栏）
+//   GET  /api/overview          首屏聚合
+//   GET  /api/projects          项目列表（?q= &limit= &offset=）
+//   POST /api/projects          新建项目（需 ?role=human_admin）
+//   POST /api/projects/scan     扫描工作目录里的候选项目（需 ?role=human_admin）
+//   GET  /api/projects/:id      项目详情（机密字段掩码）
 //   PUT  /api/projects/:id      保存项目配置（需 ?role=human_admin）
-//   GET  /api/fs/roots          服务器端可浏览的根目录（需 ?role=human_admin）
-//   GET  /api/fs/list           列出目录内容（?dir=，需 ?role=human_admin）
-//   POST /api/projects/:id/deploy   发布（受审批闸门保护）
-//   POST /api/projects/:id/:action  构建/流水线/验证/探测（透传）
-//   GET  /api/runs              运行列表（?project_id= &limit= &offset=）
-//   GET  /api/runs/:id/log      增量日志尾（?from= 字节偏移）
-//   POST /api/runs/:id/cancel   取消运行
+//   DEL  /api/projects/:id      删除项目（需 ?role=human_admin）
+//   POST /api/projects/:id/deploy      发布（受审批闸门保护）
+//   POST /api/projects/:id/:action     build / pipeline / validate / probe
+//   GET  /api/projects/:id/targets/:target/deploy  指定目标发布
+//   GET  /api/runs              运行列表；DELETE /api/runs 清空
 //   GET  /api/runs/:id          运行详情
-//   GET  /api/deployments       部署历史（?project_id= &limit= &offset=）
-//   GET  /api/config/llm        LLM 配置（掩码，含 api_key_set）
-//   PUT  /api/config/llm        保存 LLM 配置（需 ?role=human_admin）
-//   POST /api/config/llm/test   测试 LLM 连通性（需 ?role=human_admin）
-//   POST /api/runs/:id/diagnose         AI 诊断失败运行
-//   POST /api/runs/:id/diagnosis/adopt  采纳 / 不采纳（采纳写入知识库）
-//   GET  /api/kb               知识库条目列表（?q= 按项目/阶段/报错/结论过滤）
-//   DELETE /api/kb/:id         删除一条知识库条目
+//   GET  /api/runs/:id/log      增量日志尾（?from= 字节偏移，顺带同步状态）
+//   POST /api/runs/:id/cancel   取消运行
+//   POST /api/runs/:id/diagnose        AI 诊断失败运行
+//   POST /api/runs/:id/diagnosis/adopt 采纳 / 不采纳（采纳写入知识库）
+//   GET  /api/deployments       部署历史；DELETE 清空（需 ?role=human_admin）
+//   GET  /api/kb                知识库；POST 新增（需 human_admin）；DELETE 删除
+//   GET  /api/config/llm        LLM 配置（掩码）；PUT 保存；POST /test 测连通
+//   GET  /api/config/ssh-defaults      CICD_SSH_* 兜底值（掩码，供表单预填）
+//   GET  /api/fs/roots          可浏览根目录（需 human_admin）
+//   GET  /api/fs/list           列目录（?dir=，需 human_admin）
 //
 // 环境变量：
-//   CICD_BASE              上游 cicdkit，默认 http://127.0.0.1:8080
-//   CICD_AUTH              上游 X-API-Token（可空）
-//   CICD_AUTH_FILE         从文件读 token，优先于 CICD_AUTH（末尾空白会被裁掉）
-//                          注意：不能叫 CICD_TOKEN —— Lume 的 env() 对含 TOKEN /
-//                          SECRET / API_KEY / PASSWORD / CREDENTIAL 的名字返回 null。
-//   CICD_DEPLOY_APPROVAL   off | approve | execute（发布闸门，默认 off）
+//   LUME_DATA              数据目录，默认 ./.data（store.db + logs/）
+//   RUNNER_BASE            runner 地址，默认 http://127.0.0.1:8899
+//   RUNNER_AUTH / RUNNER_AUTH_FILE   runner 的 X-Runner-Token
+//                          不能叫 RUNNER_TOKEN —— env() 对含 TOKEN 的名字返回 null
+//   CICD_WORK_DIR          项目根目录（build.context 相对它解析），默认 .
+//   CICD_DEPLOY_APPROVAL   off | approve | execute（默认 off）
+//   CICD_FS_ROOTS          允许浏览的目录，冒号分隔，默认 CICD_WORK_DIR
 //   LUME_BIND / LUME_PORT  默认 127.0.0.1:8096
-//   HTPASSWD_FILE          可选 Basic Auth（对外暴露时设置）
+//   HTPASSWD_FILE          可选 Basic Auth
 
 let lc_bind = env("LUME_BIND");
 if (lc_bind == null) { lc_bind = "127.0.0.1"; }
@@ -44,12 +49,8 @@ if (lc_port == null) { lc_port = "8096"; }
 
 server {
   port = int(lc_port);
-  // 8 = agent-httpd 慢路径 worker 池容量。每个 /api/* 都是一次同步出站调用，
-  // 独占一个 worker（GET 与 POST 同等对待：框架把动态路由整体送进池，不再
-  // 在主事件循环里内联执行）；只有 2 个时，两个慢请求（AI 诊断/LLM 测试，
-  // 预算 180s）就能把整个 API 层堵死。静态资源与 SPA 回退仍在主循环，
-  // 只有 >64KB 的大文件流式响应会占用一个 worker。池满后排队超过 5s 的
-  // 请求收到 503 + Retry-After（框架侧 SLOW_QUEUE_WAIT_SECONDS）。
+  // 8 = agent-httpd 慢路径 worker 池容量。每个 /api/* 可能是一次 runner
+  // 往返或一次模型调用（诊断预算 150s），池太小时两个慢请求就能堵死整层 API。
   workers = 8;
   bind = str(lc_bind);
   docroot = "./www";
@@ -57,36 +58,36 @@ server {
   htpasswd = env("HTPASSWD_FILE");  // 本地留空 = 无认证；对外部署注入即开 Basic Auth
 };
 
-import "src/api.lume" as api;
+import "src/app_api.lume" as api;
+import "src/store.lume" as store;
 import "src/guard.lume" as guard;
 
-// 原样转发查询串（?q=、?limit=、?from= …），但剔掉 ?role=。
-//
-// role 只是本层的流程门禁（见 src/guard.lume），上游 cicdkit 根本不读这个参数：
-// 一起转发过去只会把角色串写进上游访问日志。闸门在下面各路由里已经判定完，
-// 转发时不需要它。
-func qs(req) {
-  let raw = get(req, "query", "");
-  if (raw == null) { return ""; }
-  let s = str(raw);
-  if (len(s) == 0) { return ""; }
-
-  let parts = split(s, "&");
-  let keep = [];
-  let i = 0;
-  while (i < len(parts)) {
-    let p = trim(str(get(parts, i, "")));
-    let is_role = false;
-    if (p == "role") { is_role = true; }
-    if (len(p) >= 5 and substr(p, 0, 5) == "role=") { is_role = true; }
-    if (len(p) > 0 and not is_role) { push(keep, p); }
-    i = i + 1;
-  }
-  if (len(keep) == 0) { return ""; }
-  return "?" + join(keep, "&");
+// ---------- 启动期：把库建好，必要时把 cicdkit 的历史数据搬进来 ----------
+// 只搬一次：import_legacy() 用 empty() 判空，库里已有内容就跳过。
+store.init();
+let lc_imp = store.import_legacy();
+if (get(lc_imp, "imported", false)) {
+  print("legacy import: " + stringify(lc_imp));
 }
 
-// 转发请求体；空体补 "{}"，cicdkit 的 handler 都是可空 body。
+func qint(req, key, def) {
+  let qp = get(req, "query_params", null);
+  if (qp == null) { return def; }
+  let v = get(qp, key, null);
+  if (v == null) { return def; }
+  let n = int(v);
+  if (n <= 0) { return def; }
+  return n;
+}
+
+func qstr(req, key, def) {
+  let qp = get(req, "query_params", null);
+  if (qp == null) { return def; }
+  let v = get(qp, key, null);
+  if (v == null) { return def; }
+  return str(v);
+}
+
 func body_of(req) {
   let b = get(req, "body", null);
   if (b == null) { return "{}"; }
@@ -95,182 +96,195 @@ func body_of(req) {
   return s;
 }
 
-// ---- 健康 / 元信息 ----
+func denied(gate, label) {
+  return {
+    status: 403,
+    body: { ok: false, error: str(get(gate, "reason", label + "被闸门拒绝")), approval: gate },
+  };
+}
+
+// ---------- 健康 / 元信息 ----------
+
 get "/api/health", (req) => {
-  return api.health();
+  return { status: 200, body: api.health() };
 };
 
 get "/api/meta", (req) => {
-  return {
-    service: "cicdkit-lume",
-    upstream: api.base(),
-    approval: guard.policy(),
-    llm: api.llm_status(),
-  };
+  let m = api.meta();
+  put(m, "approval", guard.policy());
+  return { status: 200, body: m };
+};
+
+get "/api/version", (req) => {
+  return { status: 200, body: { ok: true, service: "cicdkit-lume", version: "native", mode: "lume-control-plane" } };
 };
 
 get "/api/overview", (req) => {
-  return api.overview();
+  return { status: 200, body: api.overview() };
 };
 
-// ---- 项目 ----
+// ---------- 项目 ----------
+
 get "/api/projects", (req) => {
-  return api.proxy("GET", "/api/projects" + qs(req), null);
+  let page = api.project_list(qstr(req, "q", ""), qint(req, "limit", 200), qint(req, "offset", 0));
+  return { status: 200, body: page };
 };
 
-// 发布是唯一受审批闸门保护的动作：构建可重跑，发布不可逆。
+post "/api/projects", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "新建项目");
+  if (not get(gate, "allowed", false)) { return denied(gate, "新建项目"); }
+  return api.project_create(body_of(req));
+};
+
+// 放在 /api/projects/:id 之前：静态段优先匹配（路由按注册顺序，先命中先返回）。
+post "/api/projects/scan", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "扫描工作目录");
+  if (not get(gate, "allowed", false)) { return denied(gate, "扫描工作目录"); }
+  return api.project_scan(qstr(req, "dir", ""));
+};
+
+// 发布单独一条：唯一受审批闸门保护的动作（构建可重跑，发布不可逆）。
 post "/api/projects/:id/deploy", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  let lc_gate = guard.deploy_allowed(req);
-  if (not get(lc_gate, "allowed", false)) {
-    return {
-      status: 403,
-      body: {
-        ok: false,
-        error: get(lc_gate, "reason", "发布被审批闸门拒绝"),
-        approval: lc_gate,
-      },
-    };
+  let id = str(get(req.params, "id", ""));
+  let gate = guard.deploy_allowed(req);
+  if (not get(gate, "allowed", false)) {
+    return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
   }
-  return api.proxy("POST", "/api/projects/" + lc_id + "/deploy" + qs(req), body_of(req));
+  return api.project_deploy(id, body_of(req));
 };
 
-// 其余动作（build / pipeline / validate / probe / generate）原样透传上游。
+// 指定发布目标：POST /api/projects/:id/deploy?target=xxx 已经覆盖绝大多数用法，
+// 这里保留一个 target 走 path 的形状，方便前端按目标列按钮。
+post "/api/projects/:id/targets/:target/deploy", (req) => {
+  let id = str(get(req.params, "id", ""));
+  let target = str(get(req.params, "target", ""));
+  let gate = guard.deploy_allowed(req);
+  if (not get(gate, "allowed", false)) {
+    return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
+  }
+  return api.project_deploy(id, "{\"target\":\"" + target + "\"}");
+};
+
 post "/api/projects/:id/:action", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  let lc_action = str(get(req.params, "action", ""));
-  return api.proxy("POST", "/api/projects/" + lc_id + "/" + lc_action + qs(req), body_of(req));
+  let id = str(get(req.params, "id", ""));
+  let action = str(get(req.params, "action", ""));
+  return api.project_action(id, action, body_of(req));
 };
 
 get "/api/projects/:id", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy("GET", "/api/projects/" + lc_id + qs(req), null);
+  return api.project_get(str(get(req.params, "id", "")));
 };
 
-// 项目编辑：上游 PUT 是整份替换（不是 patch），所以前端必须把读到的完整对象
-// 改完再写回，否则 targets/probe 这些没在表单里的字段会被清空。
-// build.context 决定 docker 在服务器上从哪里取构建上下文，写错就是一类真实失败，
-// 因此写配置与改 LLM 配置同级：要求 ?role=human_admin。
 put "/api/projects/:id", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  let lc_gate = guard.role_allowed(req, "human_admin", "修改项目配置");
-  if (not get(lc_gate, "allowed", false)) {
-    return {
-      status: 403,
-      body: { ok: false, error: get(lc_gate, "reason", "项目配置被闸门拒绝"), approval: lc_gate },
-    };
-  }
-  return api.proxy("PUT", "/api/projects/" + lc_id, body_of(req));
+  let gate = guard.role_allowed(req, "human_admin", "修改项目配置");
+  if (not get(gate, "allowed", false)) { return denied(gate, "项目配置"); }
+  return api.project_put(str(get(req.params, "id", "")), body_of(req));
 };
 
-// ---- 服务器目录浏览（编辑 build.context 用）----
-// 只读，但会暴露服务器上的目录名，所以和「保存项目配置」用同一个门禁：
-// 能改配置的人才能看见目录树，其他人连探索都不需要。上游只允许配置里的
-// FS_ROOTS 范围内的路径（含 symlink 解析后二次校验）。
+delete "/api/projects/:id", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "删除项目");
+  if (not get(gate, "allowed", false)) { return denied(gate, "删除项目"); }
+  return api.project_delete(str(get(req.params, "id", "")));
+};
+
+// ---------- 服务器目录浏览（编辑 build.context 用）----------
+// 只读，但会暴露目录名，所以与「保存项目配置」同门禁。
 get "/api/fs/roots", (req) => {
-  let lc_gate = guard.role_allowed(req, "human_admin", "浏览服务器目录");
-  if (not get(lc_gate, "allowed", false)) {
-    return {
-      status: 403,
-      body: { ok: false, error: get(lc_gate, "reason", "目录浏览被闸门拒绝"), approval: lc_gate },
-    };
-  }
-  return api.proxy("GET", "/api/fs/roots", null);
+  let gate = guard.role_allowed(req, "human_admin", "浏览服务器目录");
+  if (not get(gate, "allowed", false)) { return denied(gate, "目录浏览"); }
+  return { status: 200, body: api.fs_roots() };
 };
 
 get "/api/fs/list", (req) => {
-  let lc_gate = guard.role_allowed(req, "human_admin", "浏览服务器目录");
-  if (not get(lc_gate, "allowed", false)) {
-    return {
-      status: 403,
-      body: { ok: false, error: get(lc_gate, "reason", "目录浏览被闸门拒绝"), approval: lc_gate },
-    };
-  }
-  return api.proxy("GET", "/api/fs/list" + qs(req), null);
+  let gate = guard.role_allowed(req, "human_admin", "浏览服务器目录");
+  if (not get(gate, "allowed", false)) { return denied(gate, "目录浏览"); }
+  return api.fs_list(qstr(req, "dir", ""));
 };
 
-// ---- 运行 ----
+// ---------- 运行 ----------
+
 get "/api/runs", (req) => {
-  return api.proxy("GET", "/api/runs" + qs(req), null);
+  return { status: 200, body: api.run_list(qstr(req, "project_id", ""), qint(req, "limit", 100), qint(req, "offset", 0)) };
 };
 
-// 增量日志尾：前端带已渲染字节数 from，轮询只取新增部分。
+delete "/api/runs", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "清空运行记录");
+  if (not get(gate, "allowed", false)) { return denied(gate, "清空运行记录"); }
+  return api.run_clear();
+};
+
+// 日志尾放在 :id 之前也无所谓（路径段数不同），但按具体优先写更清楚。
 get "/api/runs/:id/log", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy("GET", "/api/runs/" + lc_id + "/log" + qs(req), null);
+  return api.run_log(str(get(req.params, "id", "")), qint(req, "from", 0));
 };
 
 post "/api/runs/:id/cancel", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy("POST", "/api/runs/" + lc_id + "/cancel" + qs(req), body_of(req));
+  return api.run_cancel(str(get(req.params, "id", "")));
+};
+
+post "/api/runs/:id/diagnose", (req) => {
+  return api.run_diagnose(str(get(req.params, "id", "")));
+};
+
+post "/api/runs/:id/diagnosis/adopt", (req) => {
+  return api.run_adopt(str(get(req.params, "id", "")), body_of(req));
 };
 
 get "/api/runs/:id", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy("GET", "/api/runs/" + lc_id + qs(req), null);
+  return api.run_get(str(get(req.params, "id", "")));
 };
 
-// ---- AI 故障诊断（可选 LLM：配置与模型调用都在上游 cicdkit）----
-//
-// 读配置是掩码的（只有 api_key_set），可以公开；写配置 / 测试连接能改 BaseURL
-// 并使用已存密钥（等于让服务端把密钥发到任意地址），所以强制要求
-// ?role=human_admin。与发布闸门一样，这是流程门禁——真正的身份边界仍是
-// HTPASSWD_FILE 或反向代理。
-get "/api/config/llm", (req) => {
-  return api.proxy("GET", "/api/config/llm", null);
+// ---------- 部署历史 ----------
+
+get "/api/deployments", (req) => {
+  return { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qint(req, "limit", 100), qint(req, "offset", 0)) };
 };
 
-put "/api/config/llm", (req) => {
-  let lc_gate = guard.role_allowed(req, "human_admin", "修改 LLM 配置");
-  if (not get(lc_gate, "allowed", false)) {
-    return {
-      status: 403,
-      body: { ok: false, error: get(lc_gate, "reason", "LLM 配置被闸门拒绝"), approval: lc_gate },
-    };
-  }
-  return api.proxy("PUT", "/api/config/llm", body_of(req));
+delete "/api/deployments", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "清空部署历史");
+  if (not get(gate, "allowed", false)) { return denied(gate, "清空部署历史"); }
+  return api.deployment_clear();
 };
 
-post "/api/config/llm/test", (req) => {
-  let lc_gate = guard.role_allowed(req, "human_admin", "测试 LLM 连接");
-  if (not get(lc_gate, "allowed", false)) {
-    return {
-      status: 403,
-      body: { ok: false, error: get(lc_gate, "reason", "LLM 配置被闸门拒绝"), approval: lc_gate },
-    };
-  }
-  return api.proxy_slow("POST", "/api/config/llm/test", body_of(req));
-};
+// ---------- 知识库 ----------
 
-// 上游会：匹配知识库同类失败 → 命中则复用结论，否则脱敏日志后调用模型，
-// 并把结果缓存在运行记录上（重复点击不会重复计费）。
-post "/api/runs/:id/diagnose", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy_slow("POST", "/api/runs/" + lc_id + "/diagnose", body_of(req));
-};
-
-// 采纳会把结论写入上游知识库（kb.json），后续同类失败直接复用。
-post "/api/runs/:id/diagnosis/adopt", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy("POST", "/api/runs/" + lc_id + "/diagnosis/adopt", body_of(req));
-};
-
-// ---- 知识库（已采纳的 AI 诊断）----
-// 只有列表与删除：新增条目走运行页的「采纳」，上游没有可用的写入接口。
-// 删除和「取消运行」一样是运维操作、不涉及凭据外发，因此不加角色门禁；
-// 真正的身份边界仍是 HTPASSWD_FILE / 反向代理。
 get "/api/kb", (req) => {
-  return api.proxy("GET", "/api/kb" + qs(req), null);
+  return { status: 200, body: api.kb_list(qstr(req, "q", ""), qint(req, "limit", 200)) };
+};
+
+post "/api/kb", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "写入知识库");
+  if (not get(gate, "allowed", false)) { return denied(gate, "写入知识库"); }
+  return api.kb_add(body_of(req));
 };
 
 delete "/api/kb/:id", (req) => {
-  let lc_id = str(get(req.params, "id", ""));
-  return api.proxy("DELETE", "/api/kb/" + lc_id + qs(req), null);
+  return api.kb_delete(str(get(req.params, "id", "")));
 };
 
-// ---- 部署历史 ----
-get "/api/deployments", (req) => {
-  return api.proxy("GET", "/api/deployments" + qs(req), null);
+// ---------- LLM 配置 ----------
+// 读配置是掩码的，可以公开；写/测能改 BaseURL 并使用已存密钥（等于让服务端把
+// 密钥发到任意地址），强制 human_admin。
+
+get "/api/config/llm", (req) => {
+  return { status: 200, body: api.llm_get() };
+};
+
+put "/api/config/llm", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "修改 LLM 配置");
+  if (not get(gate, "allowed", false)) { return denied(gate, "LLM 配置"); }
+  return api.llm_put(body_of(req));
+};
+
+post "/api/config/llm/test", (req) => {
+  let gate = guard.role_allowed(req, "human_admin", "测试 LLM 连接");
+  if (not get(gate, "allowed", false)) { return denied(gate, "LLM 配置"); }
+  return api.llm_test(body_of(req));
+};
+
+// 表单预填用：只给「兜底值是否存在」，不把私钥路径回传给浏览器以外的用途。
+get "/api/config/ssh-defaults", (req) => {
+  return { status: 200, body: api.ssh_defaults() };
 };
 
 run();  // 注册窗口关闭，开始伺服

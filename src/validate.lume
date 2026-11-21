@@ -1,0 +1,337 @@
+// src/validate.lume — 项目配置校验（移植 cicdkit internal/store/validate.go）
+//
+// 存储层不再有 Go 结构体兜底，配置就是一段 JSON，因此「什么算合法」必须在这里
+// 显式写出来。校验只做两件事：挡住错误的形状（发布到不存在的 target、把
+// build.context 指到 / 之外），以及挡住会被拼进远程 shell 的元字符。
+//
+// 与 cicdkit 的差异只有一处：路径越界用「前缀比较」而不是 filepath.Abs+Rel
+// （DSL 没有 realpath/Rel）。因此含 ".." 的路径一律拒绝，宁严不宽。
+
+let METHODS = ["kubectl-apply", "kubectl-set-image", "helm", "local-k3s", "ssh"];
+let IMPORTS = ["k3s", "k3d", "ctr", "crictl", "nerdctl", "microk8s"];
+let PROBE_METHODS = ["GET", "POST", "PUT", "DELETE", "HEAD", "PATCH", "OPTIONS"];
+let METACHARS = "|;&$`><\"'(){}\n\\";
+let DURATION_RE = "^[0-9]+(\\.[0-9]+)?(ns|us|ms|s|m|h)$";
+
+export func methods() { return METHODS; }
+
+func known_method(m) {
+  if (len(m) == 0) { return true; }
+  let i = 0;
+  while (i < len(METHODS)) {
+    if (METHODS[i] == m) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+func in_list(list, v) {
+  let i = 0;
+  while (i < len(list)) {
+    if (list[i] == v) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+func has_metachar(s) {
+  if (len(s) == 0) { return false; }
+  let i = 0;
+  while (i < len(METACHARS)) {
+    let ch = substr(METACHARS, i, 1);
+    if (ch == "\n") { if (contains(s, "\n")) { return true; } } else {
+      if (contains(s, ch)) { return true; }
+    }
+    i = i + 1;
+  }
+  return false;
+}
+
+// env 兜底：项目字段优先，其次 CICD_SSH_* 环境变量（连接信息更适合放 .env）。
+export func env_or(v, key) {
+  if (v != null and len(trim(str(v))) > 0) { return trim(str(v)); }
+  let e = env(key);
+  if (e == null) { return ""; }
+  return trim(str(e));
+}
+
+// 镜像导入命令：不允许 shell 元字符，且只允许已知容器运行时（可带 sudo 前缀）。
+export func check_import_cmd(raw) {
+  let s = trim(str(raw));
+  if (len(s) == 0) { return ""; }
+  let parts = split(s, " ");
+  let i = 0;
+  while (i < len(parts)) {
+    let p = trim(parts[i]);
+    if (len(p) > 0 and has_metachar(p)) {
+      return "镜像导入命令不支持 shell 元字符: \"" + p + "\"";
+    }
+    i = i + 1;
+  }
+  let idx = 0;
+  if (len(parts) > 0 and base_of(parts[0]) == "sudo") {
+    idx = 1;
+    while (idx < len(parts) and substr(trim(parts[idx]), 0, 1) == "-") { idx = idx + 1; }
+    if (idx >= len(parts)) { return "sudo 后缺少要执行的命令"; }
+  }
+  if (idx >= len(parts)) { return ""; }
+  let bin = base_of(parts[idx]);
+  if (not in_list(IMPORTS, bin)) {
+    return "不允许的镜像导入命令 \"" + bin + "\"；仅允许 k3s, k3d, crictl, ctr, microk8s, nerdctl（可加 sudo 前缀）";
+  }
+  return "";
+}
+
+func base_of(path) {
+  let p = trim(str(path));
+  if (len(p) == 0) { return ""; }
+  let i = len(p) - 1;
+  while (i >= 0) {
+    if (substr(p, i, 1) == "/") { return substr(p, i + 1, len(p) - i - 1); }
+    i = i - 1;
+  }
+  return p;
+}
+
+// 工作目录内的路径约束：空 workDir = 不限制（本机单人开发）。
+export func check_path(label, work_dir, path) {
+  let p = trim(str(path));
+  if (len(p) == 0) { return ""; }
+  let root = trim(str(work_dir));
+  if (len(root) == 0) {
+    if (contains(p, "..")) { return label + ": 路径不允许包含 .."; }
+    return "";
+  }
+  if (substr(root, len(root) - 1) == "/") { root = substr(root, 0, len(root) - 1); }
+  if (contains(p, "..")) { return label + ": 路径不允许包含 .."; }
+  if (p == root) { return ""; }
+  if (substr(p, 0, len(root) + 1) == root + "/") { return ""; }
+  return label + ": 路径 " + p + " 不在允许目录 " + root + " 内";
+}
+
+func check_ssh(label, spec) {
+  let host = trim(str(get(spec, "ssh_host", "")));
+  let user = env_or(get(spec, "ssh_user", ""), "CICD_SSH_USER");
+  let port = env_or(get(spec, "ssh_port", ""), "CICD_SSH_PORT");
+  let cport = env_or(get(spec, "ssh_container_port", ""), "CICD_SSH_CONTAINER_PORT");
+  let container = env_or(get(spec, "ssh_container", ""), "CICD_SSH_CONTAINER");
+  let key_path = env_or(get(spec, "ssh_key_path", ""), "CICD_SSH_KEY_PATH");
+  let run_args = env_or(get(spec, "ssh_run_args", ""), "CICD_SSH_RUN_ARGS");
+
+  if (len(host) == 0) { return label + ": ssh 部署缺少 deploy.ssh_host"; }
+  if (len(user) == 0) { return label + ": ssh 部署缺少 deploy.ssh_user（或环境变量 CICD_SSH_USER）"; }
+  if (len(port) > 0 and not is_int(port)) { return label + ": deploy.ssh_port 非法（应为数字）: " + port; }
+  if (len(cport) > 0 and not is_int(cport)) { return label + ": deploy.ssh_container_port 非法（应为数字）: " + cport; }
+
+  let checks = {
+    "ssh_host": host,
+    "ssh_user": user,
+    "ssh_container": container,
+    "ssh_key_path": key_path,
+    "ssh_run_args": run_args,
+    "ssh_image": trim(str(get(spec, "ssh_image", ""))),
+    "ssh_command": env_or(get(spec, "ssh_command", ""), "CICD_SSH_COMMAND"),
+  };
+  // 与 cicdkit 保持同一严格度：所有会进远程 docker 命令的字段一律不许 shell
+  // 元字符（含引号、括号、花括号、反斜杠）。ssh_run_args 也不例外 —— 它会被拼进
+  // 远程 `docker run` 的参数串，放宽一格就等于给配置开一个注入口。
+  let ks = keys(checks);
+  let i = 0;
+  while (i < len(ks)) {
+    let k = ks[i];
+    if (has_metachar(str(get(checks, k, "")))) {
+      return label + ": " + k + " 含非法字符（不允许 shell 元字符）";
+    }
+    i = i + 1;
+  }
+  if (len(container) > 0 and substr(container, 0, 1) == "-") {
+    return label + ": ssh_container 不能以 - 开头";
+  }
+  return "";
+}
+
+func is_int(s) {
+  let v = trim(str(s));
+  if (len(v) == 0) { return false; }
+  let i = 0;
+  // 注意：Lume 的 < > 只对数字生效（字符串比较会报 "operator needs numbers"），
+  // 所以字符判定用「在不在数字集合里」而不是 '0' <= ch <= '9'。
+  while (i < len(v)) {
+    let ch = substr(v, i, 1);
+    if (not contains("0123456789", ch) or len(ch) != 1) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+func check_probe(spec) {
+  if (spec == null) { return ""; }
+  if (not bool(get(spec, "enabled", false))) { return ""; }
+  let method = upper(trim(str(get(spec, "method", ""))));
+  if (len(method) > 0 and not in_list(PROBE_METHODS, method)) {
+    return "probe 不支持的 HTTP 方法 \"" + method + "\"；可选 " + join(PROBE_METHODS, "/");
+  }
+  let url = trim(str(get(spec, "url", "")));
+  if (len(url) > 0 and not is_http_url(url)) {
+    return "probe.url " + url + " 不是合法的 http(s) 地址";
+  }
+  let urls = get(spec, "urls", null);
+  if (urls != null) {
+    let ks = keys(urls);
+    let i = 0;
+    while (i < len(ks)) {
+      let u = trim(str(get(urls, ks[i], "")));
+      if (len(u) > 0 and not is_http_url(u)) {
+        return "probe.urls[" + ks[i] + "] 不是合法的 http(s) 地址";
+      }
+      i = i + 1;
+    }
+  }
+  let st = int(get(spec, "expected_status", 0));
+  if (st != 0 and (st < 100 or st > 599)) {
+    return "probe.expected_status " + str(st) + " 不在 100-599 范围内";
+  }
+  let to = trim(str(get(spec, "timeout", "")));
+  if (len(to) > 0 and len(str_match(DURATION_RE, to)) == 0) {
+    return "probe.timeout " + to + " 非法（例: 5s, 500ms）";
+  }
+  return "";
+}
+
+func is_http_url(u) {
+  let s = trim(str(u));
+  if (substr(s, 0, 7) == "http://") { return len(s) > 9; }
+  if (substr(s, 0, 8) == "https://") { return len(s) > 10; }
+  return false;
+}
+
+// 返回 "" = 合法；否则是给前端看的错误消息。
+export func check_project(p, work_dir) {
+  if (p == null) { return "请求体不是 JSON 对象"; }
+  let name = trim(str(get(p, "name", "")));
+  if (len(name) == 0) { return "name 为必填"; }
+
+  let dep = get(p, "deploy", null);
+  if (dep != null) {
+    let err = check_import_cmd(get(dep, "k3s_import_cmd", ""));
+    if (len(err) > 0) { return err; }
+    let method = trim(str(get(dep, "method", "")));
+    if (not known_method(method)) {
+      return "未知的部署方式 \"" + method + "\"；可选 " + join(METHODS, " | ");
+    }
+    if (method == "ssh") {
+      let e = check_ssh("deploy", dep);
+      if (len(e) > 0) { return e; }
+    }
+  }
+
+  let build = get(p, "build", null);
+  if (build != null) {
+    let e = check_path("build.context", work_dir, get(build, "context", ""));
+    if (len(e) > 0) { return e; }
+    e = check_path("build.dockerfile", work_dir, get(build, "dockerfile", ""));
+    if (len(e) > 0) { return e; }
+  }
+  if (dep != null) {
+    let e = check_path("deploy.manifest_path", work_dir, get(dep, "manifest_path", ""));
+    if (len(e) > 0) { return e; }
+    e = check_path("deploy.chart_path", work_dir, get(dep, "chart_path", ""));
+    if (len(e) > 0) { return e; }
+  }
+
+  let e = check_probe(get(p, "probe", null));
+  if (len(e) > 0) { return e; }
+
+  let targets = get(p, "targets", null);
+  let seen = {};
+  if (targets != null) {
+    let i = 0;
+    while (i < len(targets)) {
+      let t = targets[i];
+      let tname = trim(str(get(t, "name", "")));
+      if (len(tname) == 0) { return "第 " + str(i + 1) + " 个发布目标缺少名称"; }
+      if (get(seen, tname, null) != null) { return "发布目标名称重复: " + tname; }
+      put(seen, tname, true);
+      let m = trim(str(get(t, "method", "")));
+      if (not known_method(m)) {
+        return "发布目标 \"" + tname + "\" 的部署方式非法: \"" + m + "\"";
+      }
+      if (m == "ssh") {
+        let e2 = check_ssh("发布目标 " + tname, t);
+        if (len(e2) > 0) { return e2; }
+      }
+      i = i + 1;
+    }
+  }
+  let primary = trim(str(get(p, "primary_target", "")));
+  if (len(primary) > 0 and get(seen, primary, null) == null) {
+    return "主发布目标 \"" + primary + "\" 不存在";
+  }
+  return "";
+}
+
+// 一次发布用哪个 DeploySpec：显式 target > primary_target > 顶层 deploy。
+export func resolve_deploy(p, target_name, method_override) {
+  let all = get(p, "targets", null);
+  let tn = trim(str(target_name));
+  let mo = trim(str(method_override));
+  if (len(tn) > 0) {
+    if (all != null) {
+      let i = 0;
+      while (i < len(all)) {
+        if (trim(str(get(all[i], "name", ""))) == tn) {
+          let spec = base_spec(all[i]);
+          if (len(mo) > 0) { put(spec, "method", mo); }
+          return { ok: true, spec: spec, target: tn, err: "" };
+        }
+        i = i + 1;
+      }
+    }
+    return { ok: false, spec: null, target: tn, err: "未找到发布目标 \"" + tn + "\"" };
+  }
+  let primary = trim(str(get(p, "primary_target", "")));
+  let spec = base_spec(get(p, "deploy", {}));
+  let used = "deploy";
+  if (len(primary) > 0) {
+    let found = false;
+    if (all != null) {
+      let i = 0;
+      while (i < len(all)) {
+        if (trim(str(get(all[i], "name", ""))) == primary) {
+          spec = base_spec(all[i]);
+          found = true;
+          used = primary;
+          break;
+        }
+        i = i + 1;
+      }
+    }
+    if (not found) {
+      return { ok: false, spec: null, target: primary, err: "主发布目标 \"" + primary + "\" 不存在" };
+    }
+  }
+  if (len(mo) > 0) { put(spec, "method", mo); }
+  return { ok: true, spec: spec, target: used, err: "" };
+}
+
+// DeployTarget = DeploySpec + name/note；抽成纯 DeploySpec，丢掉 name/note。
+// 字段名必须与 cicdkit store.DeploySpec 的 json tag 完全一致 —— 这份 JSON 会被
+// 原样投给执行器拼命令行，键名差一个字母就等于少一个参数。
+func base_spec(src) {
+  let keys_keep = ["method", "kubeconfig", "namespace", "manifest_path", "deployment",
+    "container", "chart_path", "release_name", "helm_values", "helm_set_image",
+    "helm_image_key", "k3s_import_cmd", "wait", "timeout",
+    "ssh_host", "ssh_user", "ssh_port", "ssh_key_path", "ssh_image", "ssh_container",
+    "ssh_run_args", "ssh_probe_port", "ssh_container_port", "ssh_command",
+    "ssh_pull", "ssh_transfer", "ssh_build_platforms"];
+  let out = {};
+  if (src == null) { return out; }
+  let i = 0;
+  while (i < len(keys_keep)) {
+    let k = keys_keep[i];
+    let v = get(src, k, null);
+    if (v != null) { put(out, k, v); }
+    i = i + 1;
+  }
+  return out;
+}

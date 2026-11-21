@@ -1,0 +1,481 @@
+// src/store.lume — 原生状态存储（SQLite），取代 cicdkit 的 store.json
+//
+// 为什么是「JSON blob + 少量索引列」而不是把每个字段拆成列：
+// Project/Build/Deploy/Probe 的字段随版本一直在长（现在就有 targets[]、
+// ssh_build_platforms[]、helm_values{} 这类嵌套），拆列等于每加一个字段就要
+// 一次 schema 迁移；而 Lume 的 SQL 护栏不允许 DROP/ALTER TABLE（只允许
+// CREATE TABLE 与 ALTER ADD），迁移能力本来就受限。所以：
+//   - 整条记录留 json（读写都走 stringify/json，字段演进零成本）；
+//   - 只把「要过滤、要排序、要分组」的字段单独列出来（id/name/status/时间/int）；
+//   - 运行日志不进库：一个运行一个文件 <data>/logs/<run_id>.log，前端按字节
+//     偏移增量拉（256KB 的日志写进 SQLite 只会让每次列表查询都变慢）。
+//
+// 时间：库里存 created_ts/updated_ts（整数 unix 秒）用于排序，展示用的
+// created_at/updated_at 仍放在 json 里（导入的历史记录原样保留 cicdkit 的
+// RFC3339 字符串，新建的记录用 fmt_iso 生成）。
+
+let g_seq = 0;
+
+// ---------- 路径 ----------
+
+export func data_dir() {
+  let d = env("LUME_DATA");
+  let s = "";
+  if (d != null) { s = trim(str(d)); }
+  if (len(s) == 0) { return "./.data"; }
+  if (substr(s, len(s) - 1) == "/") { return substr(s, 0, len(s) - 1); }
+  return s;
+}
+
+export func db() { return data_dir() + "/store.db"; }
+export func log_dir() { return data_dir() + "/logs"; }
+export func run_log_path(id) { return log_dir() + "/" + str(id) + ".log"; }
+
+export func fmt_iso(ts) { return strftime("%Y-%m-%dT%H:%M:%S%z", ts); }
+
+// ---------- 初始化 ----------
+// sql_write 的路径模式用 SQLITE_OPEN_READWRITE（不会自动建库），所以先落一个
+// 空文件再建表。CREATE TABLE IF NOT EXISTS 是幂等的，每次启动都跑一遍。
+
+export func init() {
+  mkdir(data_dir());
+  mkdir(log_dir());
+  if (read_file(db()) == null) { write_file(db(), ""); }
+
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS projects (id TEXT PRIMARY KEY, name TEXT, description TEXT, repository TEXT, branch TEXT, json TEXT, created_ts INTEGER, updated_ts INTEGER)");
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS runs (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, trigger TEXT, status TEXT, image_ref TEXT, job_id TEXT, exit_code INTEGER, created_ts INTEGER, started_ts INTEGER, ended_ts INTEGER, json TEXT)");
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS deployments (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, method TEXT, status TEXT, image_ref TEXT, created_ts INTEGER, json TEXT)");
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS kb (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, stage TEXT, signature TEXT, error_keyword TEXT, created_ts INTEGER, json TEXT)");
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_ts INTEGER)");
+}
+
+// ---------- id ----------
+// 与 cicdkit 的 GenID 一样形如 "proj-<hex>"，前端只当不透明串用。
+// 这里没有 rand()，用 「秒 + 进程内自增」；同秒同序号只会出现在「进程重启且
+// 恰好落到同一秒」的情形，create_* 里再查一次库做兜底。
+
+func new_id(prefix) {
+  g_seq = g_seq + 1;
+  return str(prefix) + "-" + str(now()) + "-" + str(g_seq);
+}
+
+func id_free(table, prefix) {
+  let i = 0;
+  while (i < 20) {
+    let id = new_id(prefix);
+    let rows = sql_query(db(), "SELECT id FROM " + str(table) + " WHERE id = ?", [id]);
+    if (len(rows) == 0) { return id; }
+    i = i + 1;
+  }
+  return new_id(prefix);
+}
+
+func parse_json(text, fallback) {
+  if (text == null) { return fallback; }
+  let s = str(text);
+  if (len(s) == 0) { return fallback; }
+  let r = try(() => json(s));
+  if (r.err != null) { return fallback; }
+  return r.ok;
+}
+
+func count_of(sql, params) {
+  let rows = sql_query(db(), sql, params);
+  if (len(rows) == 0) { return 0; }
+  return int(get(rows[0], "n", 0));
+}
+
+// ---------- 项目 ----------
+
+// q 为空时不过滤（? = '' 恒真，所以一条 SQL 覆盖两种情况）。
+export func list_projects(q, limit, offset) {
+  let qq = trim(str(q));
+  let like = "%" + qq + "%";
+  let where = "WHERE (? = '' OR name LIKE ? OR description LIKE ? OR repository LIKE ?)";
+  let params = [qq, like, like, like];
+  let total = count_of("SELECT COUNT(*) AS n FROM projects " + where, params);
+  let rows = sql_query(db(),
+    "SELECT json, created_ts, updated_ts FROM projects " + where +
+    " ORDER BY updated_ts DESC, id DESC LIMIT " + str(int(limit)) + " OFFSET " + str(int(offset)),
+    params);
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let row = rows[i];
+    let p = parse_json(get(row, "json", ""), null);
+    if (p != null) { push(out, p); }
+    i = i + 1;
+  }
+  return { projects: out, total: total };
+}
+
+// 库里那份（含真值口令/私钥路径），只给服务端内部用。
+export func get_project(id) {
+  let rows = sql_query(db(), "SELECT json FROM projects WHERE id = ?", [str(id)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "json", ""), null);
+}
+
+export func project_exists(id) {
+  let rows = sql_query(db(), "SELECT id FROM projects WHERE id = ?", [str(id)]);
+  return len(rows) > 0;
+}
+
+export func put_project(p, is_new) {
+  let id = str(get(p, "id", ""));
+  let ts = now();
+  let created = int(get(p, "created_ts", 0));
+  if (created == 0) { created = ts; }
+  let sql = "INSERT OR REPLACE INTO projects (id, name, description, repository, branch, json, created_ts, updated_ts) VALUES (?, ?, ?, ?, ?, ?, " + str(created) + ", " + str(ts) + ")";
+  let rows = [id,
+    str(get(p, "name", "")),
+    str(get(p, "description", "")),
+    str(get(p, "repository", "")),
+    str(get(p, "branch", "")),
+    stringify(p)];
+  let r = try(() => sql_write(db(), sql, rows));
+  if (r.err != null) { return { ok: false, err: str(r.err) }; }
+  return { ok: true, err: "" };
+}
+
+export func delete_project(id) {
+  let n = sql_write(db(), "DELETE FROM projects WHERE id = ?", [str(id)]);
+  return int(n);
+}
+
+// ---------- 运行 ----------
+
+export func list_runs(project_id, limit, offset) {
+  let pid = trim(str(project_id));
+  let where = "WHERE (? = '' OR project_id = ?)";
+  let params = [pid, pid];
+  let total = count_of("SELECT COUNT(*) AS n FROM runs " + where, params);
+  let rows = sql_query(db(),
+    "SELECT json, created_ts FROM runs " + where +
+    " ORDER BY created_ts DESC, id DESC LIMIT " + str(int(limit)) + " OFFSET " + str(int(offset)),
+    params);
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let r = parse_json(get(rows[i], "json", ""), null);
+    if (r != null) { push(out, r); }
+    i = i + 1;
+  }
+  return { runs: out, total: total };
+}
+
+export func get_run(id) {
+  let rows = sql_query(db(), "SELECT json, job_id, exit_code FROM runs WHERE id = ?", [str(id)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "json", ""), null);
+}
+
+export func put_run(r) {
+  let id = str(get(r, "id", ""));
+  let created = int(get(r, "created_ts", 0));
+  if (created == 0) { created = now(); }
+  let started = int(get(r, "started_ts", 0));
+  let ended = int(get(r, "ended_ts", 0));
+  let sql = "INSERT OR REPLACE INTO runs (id, project_id, project_name, trigger, status, image_ref, job_id, exit_code, created_ts, started_ts, ended_ts, json) VALUES (?, ?, ?, ?, ?, ?, ?, " + str(int(get(r, "exit_code", -1))) + ", " + str(created) + ", " + str(started) + ", " + str(ended) + ", ?)";
+  let params = [id,
+    str(get(r, "project_id", "")),
+    str(get(r, "project_name", "")),
+    str(get(r, "trigger", "")),
+    str(get(r, "status", "")),
+    str(get(r, "image_ref", "")),
+    str(get(r, "job_id", "")),
+    stringify(r)];
+  let res = try(() => sql_write(db(), sql, params));
+  if (res.err != null) { return { ok: false, err: str(res.err) }; }
+  return { ok: true, err: "" };
+}
+
+// 只更新状态/时间这类小字段：读-改-写，避免调用方每次都要拼接完整对象。
+export func patch_run(id, changes) {
+  let r = get_run(id);
+  if (r == null) { return null; }
+  let ks = keys(changes);
+  let i = 0;
+  while (i < len(ks)) {
+    put(r, ks[i], get(changes, ks[i], null));
+    i = i + 1;
+  }
+  put_run(r);
+  return r;
+}
+
+export func finish_run(id, status, exit_code, ended_ts) {
+  return patch_run(id, {
+    status: str(status),
+    exit_code: int(exit_code),
+    ended_ts: int(ended_ts),
+    ended_at: fmt_iso(int(ended_ts)),
+  });
+}
+
+// 清空运行记录（DELETE 必须带 WHERE，护栏要求；这里用恒真条件代替）。
+export func clear_runs() {
+  let n = sql_write(db(), "DELETE FROM runs WHERE id <> ''");
+  // 日志文件一并清空，否则 data 目录只涨不跌。DSL 没有 remove_file，
+  // 用原子写把每个日志截成 0 字节（记录已删，内容留着也没人引用）。
+  let names = files(log_dir());
+  let i = 0;
+  while (i < len(names)) {
+    let nm = str(names[i]);
+    if (contains(nm, ".log") and not contains(nm, "/")) {
+      write_file(log_dir() + "/" + nm, "");
+    }
+    i = i + 1;
+  }
+  return int(n);
+}
+
+// 日志尾：from 是客户端已渲染的字节偏移；0 = 从尾部最多 tail_max 字节开始。
+export func read_log_tail(run_id, from, tail_max) {
+  let path = run_log_path(run_id);
+  let text = read_file(path);
+  if (text == null) { return { log: "", log_len: 0, from: 0, reset: from > 0 }; }
+  let src = str(text);
+  let total = len(src);
+  let start = int(from);
+  let reset = false;
+  if (start <= 0 or start > total) {
+    if (total > int(tail_max)) { start = total - int(tail_max); } else { start = 0; }
+    reset = true;
+  }
+  return { log: substr(src, start, total - start), log_len: total, from: start, reset: reset };
+}
+
+export func write_log(run_id, text) {
+  return write_file(run_log_path(run_id), str(text));
+}
+
+// ---------- 部署 ----------
+
+export func list_deployments(project_id, limit, offset) {
+  let pid = trim(str(project_id));
+  let where = "WHERE (? = '' OR project_id = ?)";
+  let params = [pid, pid];
+  let total = count_of("SELECT COUNT(*) AS n FROM deployments " + where, params);
+  let rows = sql_query(db(),
+    "SELECT json FROM deployments " + where +
+    " ORDER BY created_ts DESC, id DESC LIMIT " + str(int(limit)) + " OFFSET " + str(int(offset)),
+    params);
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let d = parse_json(get(rows[i], "json", ""), null);
+    if (d != null) { push(out, d); }
+    i = i + 1;
+  }
+  return { deployments: out, total: total };
+}
+
+export func put_deployment(d) {
+  let id = str(get(d, "id", ""));
+  if (len(id) == 0) { id = id_free("deployments", "dep"); put(d, "id", id); }
+  let created = int(get(d, "created_ts", 0));
+  if (created == 0) { created = now(); }
+  let sql = "INSERT OR REPLACE INTO deployments (id, project_id, project_name, method, status, image_ref, created_ts, json) VALUES (?, ?, ?, ?, ?, ?, " + str(created) + ", ?)";
+  let params = [id,
+    str(get(d, "project_id", "")),
+    str(get(d, "project_name", "")),
+    str(get(d, "method", "")),
+    str(get(d, "status", "")),
+    str(get(d, "image_ref", "")),
+    stringify(d)];
+  let res = try(() => sql_write(db(), sql, params));
+  if (res.err != null) { return { ok: false, err: str(res.err) }; }
+  return { ok: true, err: "" };
+}
+
+export func clear_deployments() {
+  let n = sql_write(db(), "DELETE FROM deployments WHERE id <> ''");
+  return int(n);
+}
+
+// ---------- 知识库 ----------
+// 条目结构照抄 cicdkit kb.json：signature 是关键（同项目同阶段同错误 → 复用结论）。
+
+export func list_kb(q, limit) {
+  let qq = trim(str(q));
+  let like = "%" + qq + "%";
+  let params = [qq, like, like, like, like];
+  // diagnosis 只存在于 json 列里（不做独立列），所以用 json LIKE 兜住全文搜索。
+  let where = "WHERE (? = '' OR project_name LIKE ? OR stage LIKE ? OR error_keyword LIKE ? OR json LIKE ?)";
+  let rows = sql_query(db(),
+    "SELECT json FROM kb " + where +
+    " ORDER BY created_ts DESC, id DESC LIMIT " + str(int(limit)),
+    params);
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let e = parse_json(get(rows[i], "json", ""), null);
+    if (e != null) { push(out, e); }
+    i = i + 1;
+  }
+  return { entries: out };
+}
+
+export func kb_by_signature(sig) {
+  let rows = sql_query(db(), "SELECT json FROM kb WHERE signature = ?", [str(sig)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "json", ""), null);
+}
+
+export func put_kb(entry) {
+  let id = str(get(entry, "id", ""));
+  if (len(id) == 0) { id = id_free("kb", "kb"); put(entry, "id", id); }
+  let created = int(get(entry, "created_ts", 0));
+  if (created == 0) { created = now(); }
+  if (len(str(get(entry, "created_at", ""))) == 0) { put(entry, "created_at", fmt_iso(created)); }
+  let sql = "INSERT OR REPLACE INTO kb (id, project_id, project_name, stage, signature, error_keyword, created_ts, json) VALUES (?, ?, ?, ?, ?, ?, " + str(created) + ", ?)";
+  let params = [id,
+    str(get(entry, "project_id", "")),
+    str(get(entry, "project_name", "")),
+    str(get(entry, "stage", "")),
+    str(get(entry, "signature", "")),
+    str(get(entry, "error_keyword", "")),
+    stringify(entry)];
+  let res = try(() => sql_write(db(), sql, params));
+  if (res.err != null) { return { ok: false, err: str(res.err) }; }
+  return { ok: true, err: "" };
+}
+
+export func delete_kb(id) {
+  let n = sql_write(db(), "DELETE FROM kb WHERE id = ?", [str(id)]);
+  return int(n);
+}
+
+// ---------- 设置（LLM 配置等）----------
+
+export func get_setting(key) {
+  let rows = sql_query(db(), "SELECT value FROM settings WHERE key = ?", [str(key)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "value", ""), null);
+}
+
+export func put_setting(key, value) {
+  let sql = "INSERT OR REPLACE INTO settings (key, value, updated_ts) VALUES (?, ?, " + str(now()) + ")";
+  let res = try(() => sql_write(db(), sql, [str(key), stringify(value)]));
+  if (res.err != null) { return { ok: false, err: str(res.err) }; }
+  return { ok: true, err: "" };
+}
+
+export func delete_setting(key) {
+  return int(sql_write(db(), "DELETE FROM settings WHERE key = ?", [str(key)]));
+}
+
+// ---------- 历史数据导入（一次性）----------
+// cicdkit 的数据在两个文件里：store.json {projects, runs, deployments} 与 kb.json
+// （条目数组）。容器里把这两个文件挂到 <data>/ 下，首次启动时如果库是空的就导入，
+// 之后不再碰（幂等：只看 projects 表是否为空）。
+//
+// 运行日志：store.json 里每条 run 的 log 字段（最长 256KB）被写成
+// logs/<run_id>.log 并从 json 里摘掉 —— 库里只留元数据。
+
+export func empty() {
+  return count_of("SELECT COUNT(*) AS n FROM projects", []) == 0 and
+    count_of("SELECT COUNT(*) AS n FROM runs", []) == 0;
+}
+
+export func import_legacy() {
+  if (not empty()) { return { imported: false, reason: "store 非空，跳过导入" }; }
+
+  let base = data_dir();
+  let raw = read_file(base + "/store.json");
+  // 注意：env() 未设置时返回 null，不能直接 get(null, ...) —— 会在启动时抛
+  // "get() expects a map or list and a key"，表现为「服务起不来」。
+  if (raw == null) {
+    let alt = env("CICD_LEGACY_STORE");
+    if (alt != null and len(trim(str(alt))) > 0) { raw = read_file(trim(str(alt))); }
+  }
+  let projects = 0;
+  let runs = 0;
+  let deployments = 0;
+
+  if (raw != null) {
+    let data = parse_json(str(raw), null);
+    if (data != null) {
+      let ps = get(data, "projects", []);
+      let i = 0;
+      while (i < len(ps)) {
+        let p = ps[i];
+        if (len(str(get(p, "id", ""))) == 0) { put(p, "id", id_free("projects", "proj")); }
+        ensure_created(p, "created_at", "updated_at");
+        put_project(p, true);
+        projects = projects + 1;
+        i = i + 1;
+      }
+
+      let rs = get(data, "runs", []);
+      let j = 0;
+      while (j < len(rs)) {
+        let r = rs[j];
+        if (len(str(get(r, "id", ""))) == 0) { put(r, "id", id_free("runs", "run")); }
+        let id = str(get(r, "id", ""));
+        let log = str(get(r, "log", ""));
+        if (len(log) > 0) { write_log(id, log); }
+        // log 不留在 json 里（库里只存元数据，日志走文件）
+        let slim = {};
+        let ks = keys(r);
+        let k = 0;
+        while (k < len(ks)) {
+          if (ks[k] != "log") { put(slim, ks[k], get(r, ks[k], null)); }
+          k = k + 1;
+        }
+        ensure_created(slim, "created_at", "started_at");
+        put_run(slim);
+        runs = runs + 1;
+        j = j + 1;
+      }
+
+      let ds = get(data, "deployments", []);
+      let m = 0;
+      while (m < len(ds)) {
+        let d = ds[m];
+        if (len(str(get(d, "id", ""))) == 0) { put(d, "id", id_free("deployments", "dep")); }
+        ensure_created(d, "created_at", "created_at");
+        put_deployment(d);
+        deployments = deployments + 1;
+        m = m + 1;
+      }
+    }
+  }
+
+  let kbraw = read_file(base + "/kb.json");
+  let kb_n = 0;
+  if (kbraw != null) {
+    let kb = parse_json(str(kbraw), null);
+    if (kb != null) {
+      // kb.json 有两种历史形状：[...] 与 {"entries": [...]}。get(list, "entries")
+      // 会报 "list index must be a number"，所以先用 try 探一下是不是 map。
+      let entries = kb;
+      let probe = try(() => get(kb, "entries", null));
+      if (probe.err == null and probe.ok != null) { entries = probe.ok; }
+      let i2 = 0;
+      while (i2 < len(entries)) {
+        let e = entries[i2];
+        ensure_created(e, "created_at", "adopted_at");
+        put_kb(e);
+        kb_n = kb_n + 1;
+        i2 = i2 + 1;
+      }
+    }
+  }
+
+  return { imported: true, projects: projects, runs: runs, deployments: deployments, kb: kb_n };
+}
+
+// 导入的记录里 created_at 等字段由 cicdkit 写过；缺了就按当前时间补一个，
+// 保证前端「时间」列不会出现空值（排序只用整数列，不依赖这里）。
+func ensure_created(obj, created_key, updated_key) {
+  let ca = str(get(obj, "created_at", ""));
+  if (len(ca) == 0) {
+    put(obj, created_key, fmt_iso(now()));
+  }
+  let ua = str(get(obj, updated_key, ""));
+  if (len(ua) == 0) {
+    put(obj, updated_key, str(get(obj, created_key, "")));
+  }
+}

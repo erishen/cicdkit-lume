@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# scripts/test_gate.sh —— 起一个临时 Lume 实例（上游故意指向死端口），验证本层自己的行为：
+# scripts/test_gate.sh —— 起一个临时实例验证控制面自己的行为（不依赖 cicdkit，也不依赖 runner）
 #
-#   1) 审批闸门：无 role / 错角色 → 403，且响应里带审批链
-#   2) 合法角色放行后上游不可达 → 502（不是 500，也不是静默空数据）
-#   3) 只读但会暴露服务器目录的接口（/api/fs/*）同样要求 human_admin
-#   4) /api/overview 上游不可达 → 快速降级成 connected:false + errors 原因
-#   5) /api/health 上游不可达 → HTTP 200 + ok:false（容器探针不会误判进程死亡）
+# 覆盖：
+#   1) 发布闸门：无 role / 错角色 → 403，且响应里带审批链
+#   2) 闸门放行后项目不存在 → 404（证明请求真的进了本地存储层，而不是转发给谁）
+#   3) 目录浏览 / 改配置 / 清数据同级门禁：无 role → 403
+#   4) 首屏聚合 runner 不可达 → 200 + connected:false（快速降级，不是 500）
+#   5) 健康检查 runner 不可达 → HTTP 200 + ok:false（容器探针不会误判进程死亡）
+#   6) 新建 / 删除项目走本地库：无 role 403、有 role 200
+#   7) 静态站不受影响
 #
-# 全程不碰真实 cicdkit：CICD_BASE 指向 127.0.0.1:9（discard，连接立即被拒），
-# 闸门用 approve，端口挑一个未被占用的高位端口。
+# RUNNER_BASE 指向 127.0.0.1:9（discard，连接立即被拒），LUME_DATA 用临时目录，
+# 全程不碰真实数据。端口挑一个未被占用的高位端口。
 #
 # 用法: bash scripts/test_gate.sh [lume 二进制路径]
 
@@ -16,7 +19,7 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LUME="${1:-$ROOT/vendor/lume/bin/lume}"
-DEAD_UPSTREAM="http://127.0.0.1:9"
+DEAD_RUNNER="http://127.0.0.1:9"
 
 fail=0
 ok() { echo "✓ $*"; }
@@ -27,7 +30,6 @@ if [ ! -x "$LUME" ]; then
   exit 1
 fi
 
-# 挑一个空闲端口（避开 8096 / 18107 这些常用端口范围的低段）。
 PORT=""
 for p in $(seq 18099 18160); do
   if ! lsof -nP -iTCP:"$p" -sTCP:LISTEN -t >/dev/null 2>&1; then PORT="$p"; break; fi
@@ -35,44 +37,64 @@ done
 [ -n "$PORT" ] || { echo "✗ 18099-18160 都被占用，没有空闲端口" >&2; exit 1; }
 BASE="http://127.0.0.1:$PORT"
 
-LOG="$(mktemp -t cicdkit-lume-test)"
+DATA="$(mktemp -d -t cicdkit-lume-test)"
+LOG="$(mktemp -t cicdkit-lume-test-log)"
 cd "$ROOT" || exit 1
-CICD_BASE="$DEAD_UPSTREAM" CICD_DEPLOY_APPROVAL=approve \
+LUME_DATA="$DATA" RUNNER_BASE="$DEAD_RUNNER" CICD_DEPLOY_APPROVAL=approve \
+  CICD_WORK_DIR="$DATA" CICD_FS_ROOTS="$DATA" \
   LUME_BIND=127.0.0.1 LUME_PORT="$PORT" \
   "$LUME" cicdkit_lume.lume >"$LOG" 2>&1 &
 LUME_PID=$!
-trap 'kill "$LUME_PID" 2>/dev/null; wait "$LUME_PID" 2>/dev/null; rm -f "$LOG"' EXIT
+# lume 是多进程（主进程 + worker），只 SIGTERM 主进程时它要等 worker，收尾会卡住；
+# 这里直接硬杀，并按端口兜底清掉残留 worker。
+cleanup() {
+  kill -9 "$LUME_PID" 2>/dev/null
+  wait "$LUME_PID" 2>/dev/null || true
+  for pid in $(lsof -ti tcp:"$PORT" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
+  rm -rf "$DATA" "$LOG"
+}
+trap cleanup EXIT
 
-# 等服务起来（最多 10s）。健康检查在死上游下也是 200，所以看连通性而不是 ok 字段。
 up=0
 for _ in $(seq 1 40); do
   if curl -s -m 2 -o /dev/null "$BASE/"; then up=1; break; fi
   sleep 0.25
 done
-[ "$up" = 1 ] || { echo "✗ 临时实例 10s 内没起来，日志：$LOG" >&2; sed -n '1,20p' "$LOG" >&2; exit 1; }
+[ "$up" = 1 ] || { echo "✗ 临时实例 10s 内没起来，日志：${LOG}" >&2; sed -n '1,20p' "${LOG}" >&2; exit 1; }
 
-# call <METHOD> <PATH> → CODE / BODY
 CODE=""
 BODY=""
+# call <METHOD> <PATH> [BODY]
 call() {
-  local out
-  out="$(curl -s -m 10 -X "$1" -w '\n%{http_code}' "$BASE$2" 2>/dev/null)"
+  local method="$1" path="$2" body="${3:-}" out
+  if [ -n "$body" ]; then
+    out="$(curl -s -m 10 -X "$method" -H 'Content-Type: application/json' -d "$body" -w '\n%{http_code}' "$BASE$path" 2>/dev/null)"
+  else
+    out="$(curl -s -m 10 -X "$method" -w '\n%{http_code}' "$BASE$path" 2>/dev/null)"
+  fi
   CODE="${out##*$'\n'}"
   BODY="${out%$'\n'*}"
 }
 
 expect_code() { # <期望> <说明>
-  if [ "$CODE" = "$1" ]; then ok "$2 → $CODE"; else ng "$2 → ${CODE}（期望 $1）：$BODY"; fi
+  if [ "${CODE}" = "$1" ]; then ok "$2 → ${CODE}"; else ng "$2 → ${CODE}（期望 $1）：${BODY}"; fi
 }
 
-expect_body() { # <fixed 字符串> <说明>
+expect_body() { # <固定子串> <说明>
   case "$BODY" in
     *"$1"*) ok "$2" ;;
-    *) ng "$2（响应里没有「$1」）：$BODY" ;;
+    *) ng "$2（响应里没有「$1」）：${BODY}" ;;
   esac
 }
 
-echo "▶ 临时实例 http://127.0.0.1:$PORT （上游 ${DEAD_UPSTREAM}，闸门 approve）"
+expect_absent() {
+  case "$BODY" in
+    *"$1"*) ng "$2（不该出现「$1」）：${BODY}" ;;
+    *) ok "$2" ;;
+  esac
+}
+
+echo "▶ 临时实例 ${BASE} （runner ${DEAD_RUNNER}，闸门 approve，数据 ${DATA}）"
 
 # 1) 发布闸门
 call POST "/api/projects/p1/deploy"
@@ -83,30 +105,50 @@ expect_body '"chain"' "发布：附审批链"
 call POST "/api/projects/p1/deploy?role=agent_operator"
 expect_code 403 "发布：操作员不能 approve"
 
-# 2) 合法角色放行后，上游不可达 → 502（证明闸门之后真的走到了代理层）
+# 2) 放行后进本地存储：项目不存在 → 404，而不是转发给上游的 502
 call POST "/api/projects/p1/deploy?role=human_admin"
-expect_code 502 "发布：终审放行（上游不可达）"
-expect_body '无法连接 cicdkit 上游' "发布：502 带上游原因"
+expect_code 404 "发布：放行后按本地库判定（项目不存在）"
+expect_body '项目不存在' "发布：404 说明来源"
+expect_absent 'cicdkit 上游' "发布：没有残留的上游代理错误"
 
-# 3) 目录浏览与改配置同级
+# 3) 门禁一致性
 call GET "/api/fs/roots"
 expect_code 403 "目录浏览：未声明 role 被拦"
-
 call GET "/api/fs/roots?role=human_admin"
-expect_code 502 "目录浏览：放行后上游不可达"
+expect_code 200 "目录浏览：放行后读本地根目录"
+expect_body '"roots"' "目录浏览：返回根列表"
 
-# 4) 首屏聚合快速降级
+call PUT "/api/config/llm"
+expect_code 403 "LLM 配置：未声明 role 被拦"
+call DELETE "/api/runs"
+expect_code 403 "清空运行：未声明 role 被拦"
+call DELETE "/api/deployments"
+expect_code 403 "清空部署：未声明 role 被拦"
+call POST "/api/kb"
+expect_code 403 "写知识库：未声明 role 被拦"
+
+# 4) 首屏聚合：runner 不可达也要快速返回
 call GET "/api/overview"
 expect_code 200 "总览：降级后仍是正常响应"
-expect_body '"connected":false' "总览：标出上游未连接"
-expect_body '"errors"' "总览：给出每个数据源的原因"
+expect_body '"connected":false' "总览：标出 runner 未连接"
 
 # 5) 探针只看本进程
 call GET "/api/health"
 expect_code 200 "健康：本进程仍在服务"
-expect_body '"ok":false' "健康：上游不可达体现在 ok 字段"
+expect_body '"runner_ok":false' "健康：runner 不可达体现在 runner_ok 字段"
 
-# 6) 静态站不受影响
+# 6) 新建 / 删除走本地库
+call POST "/api/projects"
+expect_code 403 "新建项目：未声明 role 被拦"
+call POST "/api/projects?role=human_admin" '{"id":"gate-demo","name":"gate demo","build":{"context":"'"$DATA"'","image_repo":"local/gate-demo"},"deploy":{"method":"ssh","ssh_host":"10.0.0.9","ssh_user":"root"}}'
+expect_code 200 "新建项目：human_admin 放行"
+expect_body '"id":"gate-demo"' "新建项目：返回落库后的对象"
+call GET "/api/projects/gate-demo"
+expect_code 200 "读取项目：新建后可见"
+call DELETE "/api/projects/gate-demo?role=human_admin"
+expect_code 200 "删除项目：human_admin 放行"
+
+# 7) 静态站
 call GET "/"
 expect_code 200 "静态：index.html 正常伺服"
 

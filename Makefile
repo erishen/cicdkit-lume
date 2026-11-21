@@ -1,30 +1,36 @@
 # cicdkit-lume — Makefile
 #
 #   make vendor   同步 lume 二进制 + lume-core/lib 到 vendor/
-#   make check    lume --check 语法/类型校验
+#   make check    lume --check 语法/类型校验（入口 + 所有模块）
 #   make ui       构建 React 控制台（esbuild → www/app.js）
-#   make dev      check + ui + 前台启动（http://127.0.0.1:8096）
+#   make test     存储 / 计划 / 闸门 三层自测（不碰真实 runner 与真实数据）
+#   make runner   编 runner 并在宿主机启动（推荐：与 docker/kubectl 同机同路径）
+#   make dev      check + ui + 前台启动控制面（http://127.0.0.1:8096）
 #   make run      只启动（假定 ui 已构建）
 #   make stop     停掉本端口上的服务
 #   make smoke    对运行中的服务做一次 HTTP 冒烟
-#   make test     起临时实例验证闸门 403 / 上游 502 降级（不碰真实上游）
-#   make docker   构建镜像并起容器（127.0.0.1:18107）
+#   make plan     对着真实数据把每个项目的 argv 计划打出来（干跑）
+#   make docker   构建镜像并起控制面 + runner（127.0.0.1:18107）
 #   make docker-logs / docker-down
 #
-# 上游 cicdkit 默认 http://127.0.0.1:8080；API Token 用 CICD_AUTH（或 CICD_AUTH_FILE）传入。
+# cicdkit 已被取代：执行面是 runner/（Go，单二进制），不再有上游 HTTP 服务。
+# 令牌用 RUNNER_AUTH（或 RUNNER_AUTH_FILE）传入，不能叫 RUNNER_TOKEN。
 
 SHELL := /bin/bash
 LUME  ?= vendor/lume/bin/lume
 PORT  ?= 8096
-CICD_BASE ?= http://127.0.0.1:8080
+WORK  ?= $(HOME)/Workspace
+DATA  ?= ./.data
+RUNNER_PORT ?= 8899
 
-.PHONY: vendor check ui node_modules run dev stop smoke test clean docker docker-logs docker-down
+.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan docker docker-logs docker-down clean
 
 vendor:
 	@bash scripts/vendor_lume.sh
 
 check: vendor
-	@$(LUME) --check cicdkit_lume.lume
+	@for f in cicdkit_lume.lume src/*.lume scripts/*.lume; do $(LUME) --check $$f || exit 1; done
+	@echo "✓ 全部模块语法通过"
 
 node_modules: package.json
 	@npm install --no-audit --no-fund
@@ -33,13 +39,27 @@ ui: node_modules
 	@./node_modules/.bin/esbuild src/web/app.tsx --bundle --minify --format=esm --jsx=automatic --outfile=www/app.js
 	@echo "✓ www/app.js 已构建"
 
+# runner 在宿主机跑：docker.sock、kubectl、~/.ssh 都是现成的，
+# 也不存在「容器内路径 ≠ 宿主路径」导致 docker build 找不到 context 的问题。
+runner-build:
+	@mkdir -p bin
+	@cd runner && CGO_ENABLED=0 GOWORK=off go build -o ../bin/cicd-runner . && echo "✓ bin/cicd-runner"
+
+runner: runner-build
+	@echo "▶ runner 127.0.0.1:$(RUNNER_PORT)  日志 $(DATA)/logs"
+	@RUNNER_BIND=127.0.0.1:$(RUNNER_PORT) RUNNER_LOG_DIR=$(DATA)/logs \
+	 RUNNER_AUTH=$${RUNNER_AUTH:-devtoken} \
+	 ./bin/cicd-runner
+
 run: ui
-	@echo "▶ http://127.0.0.1:$(PORT)  (上游 $(CICD_BASE))"
-	@LUME_PORT=$(PORT) CICD_BASE=$(CICD_BASE) $(LUME) cicdkit_lume.lume
+	@echo "▶ 控制面 http://127.0.0.1:$(PORT)  (runner $(RUNNER_BASE))"
+	@LUME_PORT=$(PORT) LUME_DATA=$(DATA) CICD_WORK_DIR=$(WORK) CICD_FS_ROOTS=$(WORK) \
+	 RUNNER_BASE=$${RUNNER_BASE:-http://127.0.0.1:$(RUNNER_PORT)} \
+	 RUNNER_AUTH=$${RUNNER_AUTH:-devtoken} \
+	 $(LUME) cicdkit_lume.lume
 
 dev: check ui
-	@echo "▶ http://127.0.0.1:$(PORT)  (上游 $(CICD_BASE))"
-	@LUME_PORT=$(PORT) CICD_BASE=$(CICD_BASE) $(LUME) cicdkit_lume.lume
+	@$(MAKE) run
 
 stop:
 	@pids=$$(lsof -ti tcp:$(PORT) 2>/dev/null || true); \
@@ -48,12 +68,19 @@ stop:
 smoke:
 	@bash scripts/smoke.sh http://127.0.0.1:$(PORT)
 
+# 三层自测：存储 34 项、执行计划 61 项、闸门/降级（临时实例，不碰真实上游）。
 test: vendor
+	@rm -rf /tmp/lume_test_store && LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
+	@$(LUME) scripts/exec_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 
-# 容器：http://127.0.0.1:18107，接入 cicdkit 容器的 cicdkit_default 网络。
+# 干跑：把真实项目配置翻译成 argv，先看一遍再动手。
+plan:
+	@LUME_DATA=$(DATA) $(LUME) scripts/plan_dump.lume
+
+# 容器：http://127.0.0.1:18107（控制面）+ 内网 runner（不映射端口）。
 docker:
-	@docker compose up -d --build
+	@PROJECTS_ROOT=$(WORK) docker compose up -d --build
 	@echo "▶ http://127.0.0.1:18107"
 
 docker-logs:
@@ -63,5 +90,5 @@ docker-down:
 	@docker compose down
 
 clean:
-	@rm -f www/app.js
+	@rm -f www/app.js bin/cicd-runner
 	@rm -rf node_modules

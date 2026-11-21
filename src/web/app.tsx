@@ -17,6 +17,7 @@ import API, {
   Project,
   Run,
   RunLog,
+  ScanCandidate,
   StageResult,
 } from './api'
 
@@ -283,6 +284,7 @@ function ProjectsPage({ role }: { role: string }) {
   const [busy, setBusy] = useState('')
   const [notice, setNotice] = useState<Notice | null>(null)
   const [editing, setEditing] = useState<Project | null>(null)
+  const [creating, setCreating] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -337,6 +339,21 @@ function ProjectsPage({ role }: { role: string }) {
     }
   }
 
+  const remove = async (p: Project) => {
+    if (!window.confirm(`删除项目「${p.name}」？\n运行/部署历史会保留，但项目配置不可恢复。`)) return
+    setBusy(p.id + ':delete')
+    setNotice(null)
+    try {
+      await API.deleteProject(p.id, role)
+      setNotice({ id: p.id, kind: 'ok', text: '项目已删除' })
+      load()
+    } catch (e: any) {
+      setNotice({ id: p.id, kind: 'err', text: e.message || String(e) })
+    } finally {
+      setBusy('')
+    }
+  }
+
   if (loading && projects.length === 0) return <Spinner label="正在读取项目…" />
   if (error) return <ErrorBox error={error} onRetry={load} />
 
@@ -358,6 +375,9 @@ function ProjectsPage({ role }: { role: string }) {
           />
           <button className="btn" onClick={load}>
             刷新
+          </button>
+          <button className="btn primary" onClick={() => setCreating(true)}>
+            新建项目
           </button>
         </div>
       </div>
@@ -439,6 +459,13 @@ function ProjectsPage({ role }: { role: string }) {
                   <button className="btn ghost" disabled={busy !== ''} onClick={() => setEditing(p)}>
                     编辑
                   </button>
+                  <button
+                    className="btn ghost"
+                    disabled={busy !== ''}
+                    onClick={() => remove(p)}
+                  >
+                    {busy === p.id + ':delete' ? '删除中…' : '删除'}
+                  </button>
                 </div>
 
                 {notice && notice.id === p.id && (
@@ -448,6 +475,18 @@ function ProjectsPage({ role }: { role: string }) {
             )
           })}
         </div>
+      )}
+
+      {creating && (
+        <NewProjectModal
+          role={role}
+          onClose={() => setCreating(false)}
+          onSaved={(created) => {
+            setCreating(false)
+            setNotice({ id: created.id, kind: 'ok', text: '项目已创建，接下来可以补部署配置' })
+            load()
+          }}
+        />
       )}
 
       {editing && (
@@ -630,6 +669,272 @@ function DirPicker({
 // 上游 PUT /api/projects/:id 是整份替换：这里从 getProject 读完整对象，
 // 只改表单覆盖的字段，再整份写回，避免把 targets / probe 清空。
 // 保存要求顶栏角色是「终审」（?role=human_admin）。
+// ---------- 新建项目 ----------
+//
+// 取代 cicdkit 之后，新增项目必须从界面走（原来靠 cicdkit 的「采纳诊断」顺带建项目）。
+// 表单只覆盖必填项：其余字段（build_args / helm_values / targets）留给「编辑」补。
+// 「扫描」把工作目录里像项目的目录列出来，点一下就把路径填好——手打绝对路径是
+// 「构建上下文不存在」这类失败的头号来源。
+function NewProjectModal({
+  role,
+  onClose,
+  onSaved,
+}: {
+  role: string
+  onClose: () => void
+  onSaved: (created: Project) => void
+}) {
+  const [name, setName] = useState('')
+  const [pid, setPid] = useState('')
+  const [repo, setRepo] = useState('')
+  const [context, setContext] = useState('')
+  const [dockerfile, setDockerfile] = useState('')
+  const [imageRepo, setImageRepo] = useState('')
+  const [push, setPush] = useState(false)
+  const [method, setMethod] = useState('ssh')
+  const [ns, setNs] = useState('')
+  const [deployment, setDeployment] = useState('')
+  const [container, setContainer] = useState('')
+  const [sshHost, setSshHost] = useState('')
+  const [sshUser, setSshUser] = useState('')
+  const [sshContainer, setSshContainer] = useState('')
+  const [probePort, setProbePort] = useState('')
+  const [containerPort, setContainerPort] = useState('')
+  const [candidates, setCandidates] = useState<ScanCandidate[]>([])
+  const [scanning, setScanning] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    let alive = true
+    setScanning(true)
+    API.scanProjects('', role)
+      .then((r) => {
+        if (alive) setCandidates((r.candidates || []).filter((c) => !c.exists))
+      })
+      .catch(() => {
+        // 扫描失败不影响手工填写，静默即可（角色不够时也是这里）
+      })
+      .finally(() => {
+        if (alive) setScanning(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [role])
+
+  const pick = (c: ScanCandidate) => {
+    setName(c.name)
+    setPid(c.id)
+    setContext(c.path)
+    setImageRepo(c.id)
+    if (c.dockerfile) setDockerfile(c.dockerfile)
+    if (!sshContainer) setSshContainer(c.id)
+    if (!container) setContainer('app')
+  }
+
+  const save = async () => {
+    if (!name.trim()) {
+      setError('名称必填')
+      return
+    }
+    setSaving(true)
+    setError('')
+    try {
+      const project: Project = {
+        id: pid.trim(),
+        name: name.trim(),
+        repository: repo.trim(),
+        build: {
+          context: context.trim(),
+          dockerfile: dockerfile.trim(),
+          image_repo: imageRepo.trim(),
+          tag_strategy: 'timestamp',
+          push,
+        },
+        deploy:
+          method === 'ssh'
+            ? {
+                method,
+                ssh_host: sshHost.trim(),
+                ssh_user: sshUser.trim(),
+                ssh_container: sshContainer.trim(),
+                ssh_probe_port: probePort.trim(),
+                ssh_container_port: containerPort.trim(),
+              }
+            : method === 'kubectl-apply' || method === 'kubectl-set-image' || method === 'helm'
+              ? { method, namespace: ns.trim(), deployment: deployment.trim(), container: container.trim() }
+              : { method },
+      }
+      const created = await API.createProject(project, role)
+      onSaved(created)
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>新建项目</h3>
+          <button className="btn ghost" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <div className="modal-body">
+          {candidates.length > 0 && (
+            <div className="fld">
+              <span>工作目录里的候选（点一下自动填路径）</span>
+              <div className="row wrap">
+                {candidates.map((c) => (
+                  <button key={c.id} className="btn ghost" type="button" onClick={() => pick(c)}>
+                    {c.name}
+                    {c.has_manifests ? ' · 有部署目录' : ''}
+                  </button>
+                ))}
+              </div>
+              <span className="muted small">
+                {scanning ? '扫描中…' : '只列出带 Dockerfile 或 deploy/ chart/ k8s/ 的目录'}
+              </span>
+            </div>
+          )}
+
+          <div className="row wrap">
+            <label className="fld grow">
+              <span>名称</span>
+              <input className="input" value={name} onChange={(e) => setName(e.target.value)} />
+            </label>
+            <label className="fld">
+              <span>ID（留空自动生成）</span>
+              <input
+                className="input mono"
+                value={pid}
+                onChange={(e) => setPid(e.target.value)}
+                placeholder="会出现在容器名与运行 ID 里"
+              />
+            </label>
+          </div>
+
+          <label className="fld">
+            <span>仓库</span>
+            <input className="input mono" value={repo} onChange={(e) => setRepo(e.target.value)} />
+          </label>
+
+          <label className="fld">
+            <span>构建上下文（绝对路径）</span>
+            <input
+              className="input mono"
+              value={context}
+              onChange={(e) => setContext(e.target.value)}
+              placeholder="/绝对/路径"
+            />
+          </label>
+
+          <label className="fld">
+            <span>Dockerfile</span>
+            <input
+              className="input mono"
+              value={dockerfile}
+              onChange={(e) => setDockerfile(e.target.value)}
+              placeholder="Dockerfile"
+            />
+          </label>
+
+          <div className="row wrap">
+            <label className="fld grow">
+              <span>镜像仓库</span>
+              <input
+                className="input mono"
+                value={imageRepo}
+                onChange={(e) => setImageRepo(e.target.value)}
+                placeholder="registry/ns/name"
+              />
+            </label>
+            <label className="fld">
+              <span>部署方式</span>
+              <select className="input" value={method} onChange={(e) => setMethod(e.target.value)}>
+                {Object.entries(METHOD_LABEL).map(([k, v]) => (
+                  <option key={k} value={k}>
+                    {v}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+
+          <label className="chk-row">
+            <input type="checkbox" checked={push} onChange={(e) => setPush(e.target.checked)} />
+            <span>构建后推送镜像</span>
+          </label>
+
+          {method === 'ssh' && (
+            <div className="row wrap">
+              <label className="fld grow">
+                <span>SSH 主机</span>
+                <input className="input mono" value={sshHost} onChange={(e) => setSshHost(e.target.value)} />
+              </label>
+              <label className="fld">
+                <span>SSH 用户</span>
+                <input
+                  className="input"
+                  value={sshUser}
+                  onChange={(e) => setSshUser(e.target.value)}
+                  placeholder="留空用 CICD_SSH_USER"
+                />
+              </label>
+              <label className="fld">
+                <span>容器名</span>
+                <input className="input" value={sshContainer} onChange={(e) => setSshContainer(e.target.value)} />
+              </label>
+              <label className="fld">
+                <span>宿主端口</span>
+                <input className="input" value={probePort} onChange={(e) => setProbePort(e.target.value)} />
+              </label>
+              <label className="fld">
+                <span>容器端口</span>
+                <input className="input" value={containerPort} onChange={(e) => setContainerPort(e.target.value)} />
+              </label>
+            </div>
+          )}
+
+          {(method === 'kubectl-apply' || method === 'kubectl-set-image' || method === 'helm') && (
+            <div className="row wrap">
+              <label className="fld">
+                <span>命名空间</span>
+                <input className="input" value={ns} onChange={(e) => setNs(e.target.value)} />
+              </label>
+              <label className="fld grow">
+                <span>Deployment</span>
+                <input className="input" value={deployment} onChange={(e) => setDeployment(e.target.value)} />
+              </label>
+              <label className="fld">
+                <span>容器</span>
+                <input className="input" value={container} onChange={(e) => setContainer(e.target.value)} />
+              </label>
+            </div>
+          )}
+
+          {error && <div className="notice err">{error}</div>}
+          <span className="muted small">
+            新建需要 human_admin 角色；创建后可到「编辑」补 build_args / targets / helm 参数。
+          </span>
+        </div>
+        <div className="modal-foot">
+          <button className="btn ghost" onClick={onClose}>
+            取消
+          </button>
+          <button className="btn primary" disabled={saving} onClick={save}>
+            {saving ? '创建中…' : '创建'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function EditProjectModal({
   project,
   role,

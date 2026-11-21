@@ -2,8 +2,9 @@
 www/app.js
 www/app.js.map
 
-# 依赖
+# 依赖 / 本地二进制
 node_modules/
+bin/
 
 # vendor：二进制不入库（体积大、平台相关），lume-core/lib 入库
 vendor/lume/bin/lume

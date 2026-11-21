@@ -1,0 +1,712 @@
+// src/app_api.lume — 控制面自身的 API 实现（不再转发给 cicdkit）
+//
+// 视图字段与 cicdkit 的 JSON tag 保持一致：前端 React 组件是按那些键名写的，
+// 换后端不该顺手改协议。差异只体现在「谁提供数据」：这里全部来自本地 SQLite
+// （src/store.lume）与本地 runner（src/exec.lume）。
+
+import "store.lume" as store;
+import "redact.lume" as redact;
+import "validate.lume" as validate;
+import "exec.lume" as exec;
+import "jobs.lume" as jobs;
+
+// ---------- 小工具 ----------
+
+func sget(m, k, def) {
+  if (m == null) { return def; }
+  let v = get(m, k, null);
+  if (v == null) { return def; }
+  return v;
+}
+
+func s(v, def) {
+  if (v == null) { return def; }
+  let t = str(v);
+  if (len(t) == 0) { return def; }
+  return t;
+}
+
+func clamp_int(v, def, lo, hi) {
+  let n = int(v);
+  if (n < lo) { n = lo; }
+  if (n > hi) { n = hi; }
+  if (n == 0) { return def; }
+  return n;
+}
+
+func parse_body(raw) {
+  if (raw == null) { return {}; }
+  let t = str(raw);
+  if (len(t) == 0) { return {}; }
+  let p = try(() => json(t));
+  if (p.err != null) { return null; }
+  return p.ok;
+}
+
+// ---------- 健康 / 元信息 ----------
+
+export func health() {
+  let st_ok = true;
+  let err = "";
+  let r = try(() => store.init());
+  if (r.err != null) { st_ok = false; err = str(r.err); }
+  let alive = false;
+  let are = try(() => exec.alive());
+  if (are.err == null) { alive = bool(are.ok); }
+  return {
+    ok: st_ok and alive,
+    service: "cicdkit-lume",
+    upstream: exec.runner_base(),
+    upstream_status: 200,
+    runner_ok: alive,
+    store_ok: st_ok,
+    version: { version: "native", mode: "lume-control-plane" },
+    error: err,
+  };
+}
+
+export func meta() {
+  return {
+    service: "cicdkit-lume",
+    upstream: exec.runner_base(),
+    mode: "native",
+    runner_ok: exec.alive(),
+    work_dir: jobs.work_dir(),
+    llm: llm_get(),
+  };
+}
+
+// ---------- 总览 ----------
+
+export func overview() {
+  let ps = store.list_projects("", 500, 0);
+  let rs = store.list_runs("", 200, 0);
+  let ds = store.list_deployments("", 200, 0);
+  let projects = get(ps, "projects", []);
+  let runs = get(rs, "runs", []);
+  let deployments = get(ds, "deployments", []);
+
+  let running = 0;
+  let failed = 0;
+  let i = 0;
+  while (i < len(runs)) {
+    let st = str(get(runs[i], "status", ""));
+    if (st == "running" or st == "queued") { running = running + 1; }
+    if (st == "failed" or st == "canceled") { failed = failed + 1; }
+    i = i + 1;
+  }
+
+  let recent_runs = [];
+  i = 0;
+  while (i < len(runs) and i < 8) { push(recent_runs, runs[i]); i = i + 1; }
+  let recent_deps = [];
+  i = 0;
+  while (i < len(deployments) and i < 8) { push(recent_deps, deployments[i]); i = i + 1; }
+  let redacted = [];
+  i = 0;
+  while (i < len(projects) and i < 8) { push(redacted, redact.redact_project(projects[i])); i = i + 1; }
+
+  return {
+    ok: true,
+    upstream: exec.runner_base(),
+    connected: exec.alive(),
+    projects: int(get(ps, "total", len(projects))),
+    runs: int(get(rs, "total", len(runs))),
+    deployments: int(get(ds, "total", len(deployments))),
+    running: running,
+    failed: failed,
+    recent_runs: recent_runs,
+    recent_deployments: recent_deps,
+    recent_projects: redacted,
+  };
+}
+
+// ---------- 项目 ----------
+
+export func project_list(q, limit, offset) {
+  let page = store.list_projects(q, limit, offset);
+  let items = get(page, "projects", []);
+  let out = [];
+  let i = 0;
+  while (i < len(items)) {
+    push(out, redact.redact_project(items[i]));
+    i = i + 1;
+  }
+  return { projects: out, total: int(get(page, "total", len(out))) };
+}
+
+export func project_get(id) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  return { status: 200, body: redact.redact_project(p) };
+}
+
+// 保存：整份替换（与 cicdkit 的 PUT 语义一致）。
+// 顺序很重要——先校验、再回填机密、最后落库；漏掉 merge_secrets 就会
+// 把前端回传的 "********" 当成真口令存进去，下次构建 docker login 直接失败。
+export func project_put(id, raw) {
+  let body = parse_body(raw);
+  if (body == null) { return { status: 400, body: { ok: false, error: "请求体不是合法 JSON" } }; }
+  if (get(body, "id", null) == null) { put(body, "id", str(id)); }
+  let stored = store.get_project(id);
+  let incoming = body;
+  if (stored != null) { incoming = redact.merge_secrets(body, stored); }
+  let err = validate.check_project(incoming, jobs.work_dir());
+  if (len(err) > 0) { return { status: 400, body: { ok: false, error: err } }; }
+  let old_ts = 0;
+  if (stored != null) { old_ts = int(get(stored, "created_ts", 0)); }
+  if (old_ts > 0) { put(incoming, "created_ts", old_ts); }
+  if (len(str(get(incoming, "created_at", ""))) == 0) { put(incoming, "created_at", store.fmt_iso(now())); }
+  put(incoming, "updated_at", store.fmt_iso(now()));
+  let w = try(() => store.put_project(incoming, stored == null));
+  if (w.err != null) { return { status: 500, body: { ok: false, error: str(w.err) } }; }
+  return { status: 200, body: redact.redact_project(store.get_project(id)) };
+}
+
+// 新建：id 由前端给（或从 name 推），重名直接拒。
+export func project_create(raw) {
+  let body = parse_body(raw);
+  if (body == null) { return { status: 400, body: { ok: false, error: "请求体不是合法 JSON" } }; }
+  let id = trim(s(get(body, "id", ""), ""));
+  let name = trim(s(get(body, "name", ""), ""));
+  if (len(name) == 0) { return { status: 400, body: { ok: false, error: "name 为必填" } }; }
+  if (len(id) == 0) {
+    // id 会出现在容器名、run id 里，只保留 [A-Za-z0-9-_.]，其余换 -
+    let keep = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.";
+    let out = "";
+    let i = 0;
+    while (i < len(name)) {
+      let ch = substr(name, i, 1);
+      if (contains(keep, ch)) { out = out + ch; } else { out = out + "-"; }
+      i = i + 1;
+    }
+    id = out;
+  }
+  if (store.project_exists(id)) { return { status: 409, body: { ok: false, error: "项目已存在: " + id } }; }
+  put(body, "id", id);
+  return project_put(id, stringify(body));
+}
+
+export func project_delete(id) {
+  if (not store.project_exists(id)) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  store.delete_project(id);
+  return { status: 200, body: { ok: true, deleted: str(id) } };
+}
+
+// 扫描：把工作目录下「像项目」的目录列出来，用它们的 Dockerfile / manifest 预填表单。
+export func project_scan(dir) {
+  let root = trim(s(dir, ""));
+  if (len(root) == 0) { root = jobs.work_dir(); }
+  let err = validate.check_path("dir", jobs.work_dir(), root);
+  if (len(err) > 0) { return { status: 400, body: { ok: false, error: err } }; }
+  let entries = files(root);
+  let out = [];
+  let i = 0;
+  while (i < len(entries)) {
+    let e = str(entries[i]);
+    if (len(e) > 0 and substr(e, len(e) - 1) == "/") {
+      let raw_name = substr(e, 0, len(e) - 1);
+      let path = root;
+      if (substr(path, len(path) - 1) == "/") { path = path + raw_name; } else { path = path + "/" + raw_name; }
+      let kids = files(path);
+      let dockerfile = "";
+      let has_git = false;
+      let manifests = 0;
+      let j = 0;
+      while (j < len(kids)) {
+        let k = str(kids[j]);
+        if (k == "Dockerfile" or k == "dockerfile") { dockerfile = path + "/" + k; }
+        if (k == ".git/") { has_git = true; }
+        if (k == "deploy/" or k == "k8s/" or k == "chart/" or k == "charts/") { manifests = manifests + 1; }
+        j = j + 1;
+      }
+      if (len(dockerfile) > 0 or manifests > 0) {
+        push(out, {
+          id: raw_name,
+          name: raw_name,
+          path: path,
+          dockerfile: dockerfile,
+          has_git: has_git,
+          has_manifests: manifests > 0,
+          exists: store.project_exists(raw_name),
+        });
+      }
+    }
+    i = i + 1;
+  }
+  return { status: 200, body: { ok: true, root: root, candidates: out } };
+}
+
+// ---------- 动作 ----------
+
+// action: build | pipeline | validate | probe
+export func project_action(id, action, raw) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+
+  if (action == "validate") {
+    let err = validate.check_project(p, jobs.work_dir());
+    let rd = validate.resolve_deploy(p, "", "");
+    return {
+      status: 200,
+      body: {
+        ok: len(err) == 0,
+        error: err,
+        methods: validate.methods(),
+        target: str(get(rd, "target", "")),
+        deploy_ok: get(rd, "ok", false),
+        deploy_error: str(get(rd, "err", "")),
+      },
+    };
+  }
+
+  if (action == "probe") {
+    return probe_run(p, body);
+  }
+
+  if (action == "build" or action == "pipeline") {
+    let opts = { trigger: action, image_ref: str(get(body, "image_ref", "")) };
+    let r = jobs.start(p, action, opts);
+    if (not get(r, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(r, "err", "")) } }; }
+    return { status: 200, body: { ok: true, run_id: str(get(r, "run_id", "")), image_ref: str(get(r, "image_ref", "")) } };
+  }
+
+  return { status: 400, body: { ok: false, error: "未知动作: " + str(action) } };
+}
+
+export func project_deploy(id, raw) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let opts = {
+    trigger: "deploy",
+    target: str(get(body, "target", "")),
+    method: str(get(body, "method", "")),
+    image_ref: str(get(body, "image_ref", "")),
+  };
+  let r = jobs.start(p, "deploy", opts);
+  if (not get(r, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(r, "err", "")) } }; }
+  return {
+    status: 200,
+    body: { ok: true, run_id: str(get(r, "run_id", "")), image_ref: str(get(r, "image_ref", "")), target: str(get(r, "target", "")) },
+  };
+}
+
+// 探测：控制面直接发 HTTP，不经 runner（runner 不装 curl，也不需要）。
+// 支持 probe.url 或 body.urls（多地址时逐个试，返回 results）。
+func probe_run(p, body) {
+  let urls = get(body, "urls", null);
+  let one = trim(s(get(body, "url", ""), ""));
+  if (len(one) == 0) { one = trim(s(get(get(p, "probe", {}), "url", ""), "")); }
+  let list = [];
+  if (urls != null) {
+    let i = 0;
+    while (i < len(urls)) { push(list, str(urls[i])); i = i + 1; }
+  }
+  if (len(list) == 0 and len(one) > 0) { push(list, one); }
+  if (len(list) == 0) { return { status: 400, body: { ok: false, error: "没有可探测的地址（配置 probe.url 或传 url/urls）" } }; }
+
+  let results = [];
+  let i = 0;
+  while (i < len(list)) {
+    let u = str(list[i]);
+    let t0 = now();
+    let r = null;
+    let re = try(() => http_get(u, { timeout: 8, max_bytes: 65536, allow_private: true }));
+    let code = 0;
+    let err = "";
+    if (re.err == null) {
+      code = int(get(re.ok, "status", 0));
+      err = str(get(re.ok, "err", ""));
+    } else {
+      err = str(re.err);
+    }
+    let ms = int((now() - t0) * 1000);
+    let st = "down";
+    if (code >= 200 and code < 400) { st = "up"; }
+    push(results, { url: u, status: st, status_code: code, latency_ms: ms, error: err });
+    i = i + 1;
+  }
+  let first = get(results, 0, {});
+  return {
+    status: 200,
+    body: {
+      ok: str(get(first, "status", "down")) == "up",
+      probe: first,
+      results: results,
+    },
+  };
+}
+
+// ---------- 运行 ----------
+
+export func run_list(project_id, limit, offset) {
+  let page = store.list_runs(project_id, limit, offset);
+  return { runs: get(page, "runs", []), total: int(get(page, "total", 0)) };
+}
+
+export func run_get(id) {
+  let r = jobs.sync(id);
+  if (r == null) { return { status: 404, body: { ok: false, error: "运行不存在: " + str(id) } }; }
+  return { status: 200, body: r };
+}
+
+// 日志尾：顺手把状态同步一次（前端只轮询这一个端点）。
+export func run_log(id, from) {
+  let t = jobs.tail(id, from);
+  if (t == null) { return { status: 404, body: { ok: false, error: "运行不存在: " + str(id) } }; }
+  let r = get(t, "run", {});
+  // 日志里可能带 --build-arg LLM_API_KEY=... / -e *_VISIT_PIN=... 这类真值，
+  // 发给浏览器前统一脱敏（磁盘上的原件不动，排障去看文件）。
+  put(r, "log", redact.mask_log(str(get(t, "log", ""))));
+  put(r, "log_len", get(t, "log_len", 0));
+  put(r, "reset", get(t, "reset", false));
+  return { status: 200, body: r };
+}
+
+export func run_cancel(id) {
+  let c = jobs.cancel(id);
+  if (not get(c, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(c, "err", "")) } }; }
+  return { status: 200, body: { ok: true, canceled: str(id) } };
+}
+
+export func run_clear() {
+  let n = store.clear_runs();
+  return { status: 200, body: { ok: true, deleted: int(n) } };
+}
+
+// ---------- 部署历史 ----------
+
+export func deployment_list(project_id, limit, offset) {
+  let page = store.list_deployments(project_id, limit, offset);
+  return { deployments: get(page, "deployments", []), total: int(get(page, "total", 0)) };
+}
+
+export func deployment_clear() {
+  let n = store.clear_deployments();
+  return { status: 200, body: { ok: true, deleted: int(n) } };
+}
+
+// ---------- 知识库 ----------
+
+export func kb_list(q, limit) {
+  return store.list_kb(q, limit);
+}
+
+export func kb_add(raw) {
+  let body = parse_body(raw);
+  if (body == null) { return { status: 400, body: { ok: false, error: "请求体不是合法 JSON" } }; }
+  if (len(trim(s(get(body, "diagnosis", ""), ""))) == 0) {
+    return { status: 400, body: { ok: false, error: "diagnosis 为必填" } };
+  }
+  let w = store.put_kb(body);
+  if (not get(w, "ok", false)) { return { status: 500, body: { ok: false, error: str(get(w, "err", "")) } }; }
+  return { status: 200, body: { ok: true, id: str(get(body, "id", "")) } };
+}
+
+export func kb_delete(id) {
+  let n = store.delete_kb(id);
+  if (int(n) == 0) { return { status: 404, body: { ok: false, error: "条目不存在: " + str(id) } }; }
+  return { status: 200, body: { ok: true, deleted: str(id) } };
+}
+
+// ---------- SSH 兜底值（表单预填用）----------
+// 只回答「有没有配」，不回传私钥路径本身：路径本身不是密钥，但也没必要让
+// 浏览器知道（前端只需要判断「这栏能不能留空」）。
+func has_env(k) {
+  let v = env(k);
+  if (v == null) { return false; }
+  return len(trim(str(v))) > 0;
+}
+
+func env_str(k) {
+  let v = env(k);
+  if (v == null) { return ""; }
+  return trim(str(v));
+}
+
+export func ssh_defaults() {
+  return {
+    user: env_str("CICD_SSH_USER"),
+    port: env_str("CICD_SSH_PORT"),
+    key_path_set: has_env("CICD_SSH_KEY_PATH"),
+    container: env_str("CICD_SSH_CONTAINER"),
+    container_port: env_str("CICD_SSH_CONTAINER_PORT"),
+    probe_port: env_str("CICD_SSH_PROBE_PORT"),
+    run_args: env_str("CICD_SSH_RUN_ARGS"),
+    command: env_str("CICD_SSH_COMMAND"),
+  };
+}
+
+// ---------- 目录浏览（编辑 build.context 用）----------
+
+export func fs_roots() {
+  let raw = env("CICD_FS_ROOTS");
+  let out = [];
+  if (raw != null and len(trim(str(raw))) > 0) {
+    let parts = split(str(raw), ":");
+    let i = 0;
+    while (i < len(parts)) {
+      let t = trim(parts[i]);
+      if (len(t) > 0) { push(out, t); }
+      i = i + 1;
+    }
+  }
+  if (len(out) == 0) { push(out, jobs.work_dir()); }
+  return { roots: out };
+}
+
+func in_root(dir) {
+  let roots = get(fs_roots(), "roots", []);
+  let d = str(dir);
+  let i = 0;
+  while (i < len(roots)) {
+    let r = str(roots[i]);
+    if (d == r) { return true; }
+    if (len(d) > len(r) and substr(d, 0, len(r)) == r) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+export func fs_list(dir) {
+  let d = trim(s(dir, ""));
+  if (len(d) == 0) {
+    let roots = get(fs_roots(), "roots", []);
+    d = str(get(roots, 0, "."));
+  }
+  if (not in_root(d)) {
+    return { status: 403, body: { ok: false, error: "目录不在允许范围内: " + d + "（用 CICD_FS_ROOTS 放行）" } };
+  }
+  let entries = files(d);
+  let dirs = [];
+  let fls = [];
+  let i = 0;
+  while (i < len(entries)) {
+    let name = str(entries[i]);
+    if (len(name) > 0 and substr(name, len(name) - 1) == "/") {
+      push(dirs, { name: substr(name, 0, len(name) - 1), is_dir: true, size: 0 });
+    } else {
+      push(fls, { name: name, is_dir: false, size: 0 });
+    }
+    i = i + 1;
+  }
+  let all = [];
+  i = 0;
+  while (i < len(dirs)) { push(all, dirs[i]); i = i + 1; }
+  i = 0;
+  while (i < len(fls)) { push(all, fls[i]); i = i + 1; }
+  return { status: 200, body: { dir: d, entries: all } };
+}
+
+// ---------- LLM 配置与诊断 ----------
+//
+// 配置住在 settings 表的 "llm" 键里（与 cicdkit 的 llm.json 等价）。
+// api_key 永不回传：GET 只给 api_key_set；PUT 收到空值或掩码 = 不修改。
+
+func llm_raw() {
+  let cfg = store.get_setting("llm");
+  if (cfg == null) {
+    return { enabled: false, base_url: "https://api.deepseek.com", model: "deepseek-chat", system: "", api_key: "", api_key_set: false };
+  }
+  if (get(cfg, "api_key_set", null) == null) {
+    put(cfg, "api_key_set", len(s(get(cfg, "api_key", ""), "")) > 0);
+  }
+  return cfg;
+}
+
+export func llm_get() {
+  let c = llm_raw();
+  return {
+    enabled: bool(get(c, "enabled", false)),
+    base_url: s(get(c, "base_url", ""), ""),
+    model: s(get(c, "model", ""), ""),
+    system: s(get(c, "system", ""), ""),
+    api_key_set: len(s(get(c, "api_key", ""), "")) > 0,
+  };
+}
+
+export func llm_put(raw) {
+  let body = parse_body(raw);
+  if (body == null) { return { status: 400, body: { ok: false, error: "请求体不是合法 JSON" } }; }
+  let cur = llm_raw();
+  let key = s(get(body, "api_key", ""), "");
+  if (len(key) == 0 or key == redact.masked()) {
+    // 空值 / 掩码 = 沿用旧密钥
+    let old = s(get(cur, "api_key", ""), "");
+    put(body, "api_key", old);
+  }
+  let cfg = {
+    enabled: bool(get(body, "enabled", false)),
+    base_url: s(get(body, "base_url", get(cur, "base_url", "")), ""),
+    model: s(get(body, "model", get(cur, "model", "")), ""),
+    system: s(get(body, "system", get(cur, "system", "")), ""),
+    api_key: s(get(body, "api_key", ""), ""),
+  };
+  let w = store.put_setting("llm", cfg);
+  if (not get(w, "ok", false)) { return { status: 500, body: { ok: false, error: str(get(w, "err", "")) } }; }
+  return { status: 200, body: llm_get() };
+}
+
+func chat_url(cfg) {
+  let base = s(get(cfg, "base_url", "https://api.deepseek.com"), "");
+  if (substr(base, len(base) - 1) == "/") { base = substr(base, 0, len(base) - 1); }
+  if (substr(base, len(base) - 9) == "/chat/completions") { return base; }
+  if (substr(base, len(base) - 4) == "/v1") { return base + "/chat/completions"; }
+  return base + "/v1/chat/completions";
+}
+
+func chat(cfg, sys_prompt, user_prompt, secs) {
+  let key = s(get(cfg, "api_key", ""), "");
+  if (len(key) == 0) { return { ok: false, status: 0, text: "", err: "未配置 api_key" }; }
+  let hdrs = { "Content-Type": "application/json", "Authorization": "Bearer " + key };
+  let msgs = [{ role: "user", content: user_prompt }];
+  if (len(sys_prompt) > 0) { msgs = [{ role: "system", content: sys_prompt }, { role: "user", content: user_prompt }]; }
+  let payload = {
+    model: s(get(cfg, "model", "deepseek-chat"), "deepseek-chat"),
+    messages: msgs,
+    temperature: 0.2,
+  };
+  let o = { headers: hdrs, timeout: secs, max_bytes: 4194304, body: stringify(payload), allow_private: true };
+  let r = null;
+  let re = try(() => http_post(chat_url(cfg), o));
+  if (re.err != null) { return { ok: false, status: 0, text: "", err: str(re.err) }; }
+  r = re.ok;
+  let code = int(get(r, "status", 0));
+  let data = null;
+  let raw = get(r, "body", "");
+  if (raw != null and len(str(raw)) > 0) {
+    let p = try(() => json(str(raw)));
+    if (p.err == null) { data = p.ok; }
+  }
+  if (code < 200 or code >= 300) {
+    let msg = "HTTP " + str(code);
+    if (data != null) {
+      let e = get(get(data, "error", null), "message", "");
+      if (len(str(e)) > 0) { msg = msg + "：" + str(e); }
+    }
+    return { ok: false, status: code, text: "", err: msg };
+  }
+  if (data == null) { return { ok: false, status: code, text: "", err: "返回不是 JSON" }; }
+  let choices = get(data, "choices", null);
+  if (choices == null or len(choices) == 0) { return { ok: false, status: code, text: "", err: "返回里没有 choices" }; }
+  let msg = get(get(choices, 0, {}), "message", {});
+  return { ok: true, status: code, text: str(get(msg, "content", "")), err: "" };
+}
+
+export func llm_test(raw) {
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let cfg = llm_raw();
+  // 允许表单里现填的密钥/地址直接测，不用先保存
+  let k = s(get(body, "api_key", ""), "");
+  if (len(k) > 0 and k != redact.masked()) { put(cfg, "api_key", k); }
+  let b = s(get(body, "base_url", ""), "");
+  if (len(b) > 0) { put(cfg, "base_url", b); }
+  let m = s(get(body, "model", ""), "");
+  if (len(m) > 0) { put(cfg, "model", m); }
+  let r = chat(cfg, "", "回复两个字：可用", 30);
+  if (not get(r, "ok", false)) { return { status: 200, body: { ok: false, error: str(get(r, "err", "")) } }; }
+  return { status: 200, body: { ok: true, reply: str(get(r, "text", "")) } };
+}
+
+// 错误行提取：日志里第一条含 error/failed 的行，截断到 120 字。
+// 这是 signature 的原料——同类失败要能被认成「同类」。
+func error_keyword(log) {
+  let lines = split(log, "\n");
+  let i = 0;
+  while (i < len(lines)) {
+    let l = trim(str(lines[i]));
+    let lo = lower(l);
+    if (contains(lo, "error") or contains(lo, "failed") or contains(lo, "no such") or contains(lo, "denied")) {
+      if (len(l) > 120) { return substr(l, 0, 120); }
+      return l;
+    }
+    i = i + 1;
+  }
+  return "";
+}
+
+func last_stage(run) {
+  let st = get(run, "stages", null);
+  if (st == null or len(st) == 0) { return ""; }
+  let i = len(st) - 1;
+  return str(get(get(st, i, {}), "name", ""));
+}
+
+export func run_diagnose(id) {
+  let r = jobs.sync(id);
+  if (r == null) { return { status: 404, body: { ok: false, error: "运行不存在: " + str(id) } }; }
+  let old = get(r, "diagnosis", null);
+  if (old != null) {
+    // 已经诊断过：直接复用，不重复计费（cicdkit 的行为也是这个）
+    if (len(s(get(old, "analysis", ""), "")) > 0) {
+      return { status: 200, body: { analysis: str(get(old, "analysis", "")), run_id: str(id), cached: true } };
+    }
+  }
+  let cfg = llm_raw();
+  if (not bool(get(cfg, "enabled", false))) {
+    return { status: 400, body: { ok: false, error: "LLM 未启用，请先到设置页配置并启用" } };
+  }
+  let tail = store.read_log_tail(id, 0, 8000);
+  // 送给模型的日志同样先脱敏：诊断不需要真密钥，也不能把它发到第三方端点。
+  let log = redact.mask_log(str(get(tail, "log", "")));
+  let kw = error_keyword(log);
+  let stage = last_stage(r);
+  let proj = str(get(r, "project_id", ""));
+  let sig = proj + "|" + stage + "|" + kw;
+  let hit = store.kb_by_signature(sig);
+  if (hit != null) {
+    let text = str(get(hit, "diagnosis", ""));
+    store.patch_run(id, { diagnosis: { analysis: text, adopted: bool(get(hit, "adopted", false)), cached_from_kb: true, signature: sig } });
+    return { status: 200, body: { analysis: text, run_id: str(id), cached: true, cached_from_kb: true, similar: [hit] } };
+  }
+  let user_prompt = "项目：" + str(get(r, "project_name", proj)) + "\n阶段：" + stage + "\n镜像：" + str(get(r, "image_ref", "")) + "\n状态：" + str(get(r, "status", "")) + "\n\n构建/发布日志（已截断）：\n" + log + "\n\n请用中文回答：最可能的根因是什么？给出 1-3 条可执行的修复步骤。不要泛泛而谈。";
+  let sys = s(get(cfg, "system", ""), "你是一名资深 CI/CD 与容器运维工程师，回答要短、具体、可执行。");
+  let c = chat(cfg, sys, user_prompt, 150);
+  if (not get(c, "ok", false)) {
+    return { status: 502, body: { ok: false, error: "模型调用失败：" + str(get(c, "err", "")) } };
+  }
+  let text = str(get(c, "text", ""));
+  store.patch_run(id, { diagnosis: { analysis: text, adopted: false, rejected: false, signature: sig, error_keyword: kw, stage: stage } });
+  return { status: 200, body: { analysis: text, run_id: str(id), cached: false, signature: sig, error_keyword: kw } };
+}
+
+// 采纳：把结论写进知识库，下次同签名失败直接复用（省一次模型调用）。
+export func run_adopt(id, raw) {
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let adopt = bool(get(body, "adopt", true));
+  let r = store.get_run(id);
+  if (r == null) { return { status: 404, body: { ok: false, error: "运行不存在: " + str(id) } }; }
+  let diag = get(r, "diagnosis", null);
+  if (diag == null) { return { status: 400, body: { ok: false, error: "这条运行还没有诊断结果" } }; }
+  if (not adopt) {
+    put(diag, "rejected", true);
+    put(diag, "adopted", false);
+    store.patch_run(id, { diagnosis: diag });
+    return { status: 200, body: { ok: true, rejected: true } };
+  }
+  let entry = {
+    project_id: str(get(r, "project_id", "")),
+    project_name: str(get(r, "project_name", "")),
+    stage: str(get(diag, "stage", "")),
+    signature: str(get(diag, "signature", "")),
+    error_keyword: str(get(diag, "error_keyword", "")),
+    error_excerpt: substr(str(get(diag, "error_keyword", "")), 0, 200),
+    diagnosis: str(get(diag, "analysis", "")),
+    run_id: str(id),
+    adopted: true,
+    adopted_count: 1,
+    adopted_at: store.fmt_iso(now()),
+  };
+  let w = store.put_kb(entry);
+  if (not get(w, "ok", false)) { return { status: 500, body: { ok: false, error: str(get(w, "err", "")) } }; }
+  put(diag, "adopted", true);
+  put(diag, "rejected", false);
+  store.patch_run(id, { diagnosis: diag });
+  return { status: 200, body: { ok: true, adopted: true, kb_id: str(get(entry, "id", "")) } };
+}

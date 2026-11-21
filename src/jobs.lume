@@ -1,0 +1,314 @@
+// src/jobs.lume — 运行生命周期：建记录 → 投给 runner → 轮询同步 → 落部署历史
+//
+// 这里没有后台线程。Lume 单进程里跑不了常驻调度器，所以「同步」由前端轮询
+// （/api/runs/:id/log 每秒一次）顺带驱动：每次轮询读一次 runner 的 /jobs/:id，
+// 状态变了就写回库。好处是不用引入第二套运行时；代价是没人看的时候状态停在
+// 「running」，重启服务后第一次轮询会补上——可接受，因为日志与结论都在盘上。
+//
+// 一次运行 = 一个 runner job。job 的 name 就是 run id，runner 把 stdout 写进
+// <RUNNER_LOG_DIR>/<run id>.log，控制面按字节偏移读，两边必须是同一目录。
+
+import "store.lume" as store;
+import "validate.lume" as validate;
+import "exec.lume" as exec;
+
+export func work_dir() {
+  let w = env("CICD_WORK_DIR");
+  if (w != null and len(trim(str(w))) > 0) { return trim(str(w)); }
+  return ".";
+}
+
+// run id 里带时间戳：前端按时间读人眼友好。
+// 尾巴用微秒（6 位）而不是毫秒：同一秒内连点两次「构建 + 发布」时，
+// 3 位毫秒在同一个 tick 里会算出同一个值，于是两条运行撞成同一个主键，
+// 后一条把前一条覆盖掉 —— 取消时就会取消错的 job。
+// now() 是整数秒，微秒/毫秒尾巴都恒为 0，同秒两次调用必然撞 —— 所以尾巴
+// 用进程内自增序号（map 才能跨函数共享状态，见文件末尾的 idseq）。
+let idseq = { n: 0 };
+
+export func new_id(prefix) {
+  put(idseq, "n", int(get(idseq, "n", 0)) + 1);
+  let seq = int(get(idseq, "n", 0));
+  let ts = strftime("%Y%m%d-%H%M%S", now());
+  let tail = str(seq % 10000);
+  while (len(tail) < 4) { tail = "0" + tail; }
+  return str(prefix) + "-" + ts + "-" + tail;
+}
+
+// 每步都有 timeout_s，整体给「各步之和 + 30s」的余量：
+// runner 的 job 级超时会把整个 job 掐掉，卡太紧会误杀正常的 rollout 等待。
+func total_timeout(steps) {
+  let sum = 0;
+  let i = 0;
+  while (i < len(steps)) {
+    sum = sum + int(get(get(steps, i, {}), "timeout_s", 60));
+    i = i + 1;
+  }
+  return sum + 30;
+}
+
+// 所有步骤统一带上工作目录：build.context 是相对项目根算的，
+// cwd 不对 docker 会拿到空上下文（报 "no such file" 而不是明显错）。
+func with_cwd(steps, wd) {
+  let i = 0;
+  while (i < len(steps)) {
+    put(get(steps, i, {}), "cwd", wd);
+    i = i + 1;
+  }
+  return steps;
+}
+
+func stage_names(steps) {
+  let out = [];
+  let i = 0;
+  while (i < len(steps)) {
+    push(out, { name: str(get(get(steps, i, {}), "label", "step")), status: "pending" });
+    i = i + 1;
+  }
+  return out;
+}
+
+// ---------- 启动 ----------
+
+// kind: build | pipeline | deploy
+// opts: { target: "", method: "", image_ref: "", trigger: "" }
+export func start(project, kind, opts) {
+  let p = project;
+  if (p == null) { return { ok: false, run_id: "", err: "项目不存在" }; }
+  let wd = work_dir();
+  let steps = [];
+  let image = "";
+  let target = "";
+  let plan_err = "";
+
+  if (kind == "build" or kind == "pipeline") {
+    let tag = exec.make_tag();
+    let b = exec.build_steps(p, tag);
+    if (not get(b, "ok", false)) { return { ok: false, run_id: "", err: str(get(b, "err", "构建计划生成失败")) }; }
+    image = str(get(b, "image_ref", ""));
+    let bs = get(b, "steps", []);
+    let i = 0;
+    while (i < len(bs)) { push(steps, get(bs, i, {})); i = i + 1; }
+    let ps = exec.push_steps(p, image);
+    i = 0;
+    while (i < len(ps)) { push(steps, get(ps, i, {})); i = i + 1; }
+  }
+
+  if (kind == "deploy" or kind == "pipeline") {
+    let want = str(get(opts, "image_ref", ""));
+    if (len(trim(want)) == 0) {
+      // 单独发布时用项目上次发布的镜像；没有就现打一个 tag（会拉不到，所以提示）。
+      let ld = get(p, "last_deploy", null);
+      if (ld != null) { want = str(get(ld, "image_ref", "")); }
+    }
+    if (len(trim(want)) == 0) {
+      want = exec.image_ref(p, exec.make_tag());
+      if (kind == "deploy") {
+        return { ok: false, run_id: "", err: "不知道该发哪个镜像：项目还没有发布记录，请先构建或指定 image_ref" };
+      }
+    }
+    image = want;
+    let rd = validate.resolve_deploy(p, get(opts, "target", ""), get(opts, "method", ""));
+    if (not get(rd, "ok", false)) { return { ok: false, run_id: "", err: str(get(rd, "err", "发布目标解析失败")) }; }
+    target = str(get(rd, "target", ""));
+    let d = exec.deploy_steps(p, get(rd, "spec", {}), image, {});
+    if (not get(d, "ok", false)) { return { ok: false, run_id: "", err: str(get(d, "err", "发布计划生成失败")) }; }
+    let ds = get(d, "steps", []);
+    let j = 0;
+    while (j < len(ds)) { push(steps, get(ds, j, {})); j = j + 1; }
+  }
+
+  if (len(steps) == 0) { return { ok: false, run_id: "", err: "没有可执行的步骤" }; }
+
+  let rid = new_id(str(get(p, "id", "run")));
+  // 极端情况（同一微秒）仍可能撞：撞了就换一个，绝不复用已有主键。
+  let guard = 0;
+  while (store.get_run(rid) != null and guard < 5) {
+    rid = new_id(str(get(p, "id", "run")));
+    guard = guard + 1;
+  }
+  let ts = now();
+  let run = {
+    id: rid,
+    project_id: str(get(p, "id", "")),
+    project_name: str(get(p, "name", "")),
+    trigger: str(get(opts, "trigger", kind)),
+    kind: kind,
+    target: target,
+    image_ref: image,
+    status: "queued",
+    exit_code: -1,
+    created_ts: ts,
+    created_at: store.fmt_iso(ts),
+    stages: stage_names(steps),
+    log: "",
+  };
+  let pr = store.put_run(run);
+  if (not get(pr, "ok", false)) { return { ok: false, run_id: "", err: str(get(pr, "err", "写运行记录失败")) }; }
+
+  // 日志文件先落空：runner 是追加写，控制面读的时候文件必须存在，
+  // 否则第一次轮询会拿到 null 而误判成「没有日志」。
+  store.write_log(rid, "");
+
+  let sub = exec.submit(rid, with_cwd(steps, wd), total_timeout(steps));
+  if (not get(sub, "ok", false)) {
+    store.patch_run(rid, { status: "failed", error: str(get(sub, "err", "")) });
+    return { ok: false, run_id: rid, err: str(get(sub, "err", "提交失败")) };
+  }
+  let patched = store.patch_run(rid, {
+    job_id: str(get(sub, "id", "")),
+    status: "running",
+    started_ts: now(),
+    started_at: store.fmt_iso(now()),
+  });
+  return { ok: true, run_id: rid, err: "", image_ref: image, target: target };
+}
+
+// ---------- 同步 ----------
+
+func set_stages(run, job) {
+  let st = get(job, "steps", null);
+  if (st == null) { return run; }
+  let out = [];
+  let i = 0;
+  while (i < len(st)) {
+    let s = get(st, i, {});
+    push(out, {
+      name: str(get(s, "label", "step")),
+      status: str(get(s, "status", "pending")),
+      exit: int(get(s, "exit", 0)),
+    });
+    i = i + 1;
+  }
+  put(run, "stages", out);
+  return run;
+}
+
+// runner 的终态映射到 run 的终态：done→success，failed→failed，canceled→canceled。
+func terminal_status(js) {
+  if (js == "done") { return "success"; }
+  if (js == "canceled") { return "canceled"; }
+  return "failed";
+}
+
+// 返回最新的 run 记录（可能已更新）。job 还没结束就只刷新阶段状态。
+export func sync(run_id) {
+  let r = store.get_run(run_id);
+  if (r == null) { return null; }
+  let status = str(get(r, "status", ""));
+  if (status == "success" or status == "failed" or status == "canceled") { return r; }
+
+  let job_id = str(get(r, "job_id", ""));
+  let job = exec.status(job_id);
+  if (job == null) {
+    // runner 重启会丢 job 表：这时不能再等，标成 interrupted 让人重新跑。
+    if (status == "running") {
+      let ts = now();
+      return store.patch_run(run_id, {
+        status: "interrupted",
+        error: "runner 上找不到这个 job（runner 可能重启过）",
+        ended_ts: ts,
+        ended_at: store.fmt_iso(ts),
+      });
+    }
+    return r;
+  }
+
+  let js = str(get(job, "status", ""));
+  let r2 = set_stages(r, job);
+  if (js != "done" and js != "failed" and js != "canceled" and js != "error") {
+    if (status == "queued") {
+      r2 = store.patch_run(run_id, {
+        status: "running",
+        started_ts: now(),
+        started_at: store.fmt_iso(now()),
+        stages: get(r2, "stages", []),
+      });
+    } else {
+      store.patch_run(run_id, { stages: get(r2, "stages", []) });
+    }
+    return r2;
+  }
+
+  let fin = terminal_status(js);
+  let ts = now();
+  let done = store.patch_run(run_id, {
+    status: fin,
+    exit_code: int(get(job, "exit", 0)),
+    stages: get(r2, "stages", []),
+    ended_ts: ts,
+    ended_at: store.fmt_iso(ts),
+    error: str(get(job, "error", "")),
+  });
+  if (fin == "success") { record_success(done); }
+  return done;
+}
+
+// 成功之后才写部署历史与项目的 last_deploy：
+// 失败的发布不该污染「上次发的是哪个镜像」。
+func record_success(run) {
+  let kind = str(get(run, "kind", ""));
+  if (kind != "deploy" and kind != "pipeline") { return; }
+  let p = store.get_project(str(get(run, "project_id", "")));
+  let target = str(get(run, "target", ""));
+  let dep = {
+    id: new_id("dep"),
+    project_id: str(get(run, "project_id", "")),
+    project_name: str(get(run, "project_name", "")),
+    image_ref: str(get(run, "image_ref", "")),
+    method: "",
+    target: target,
+    status: "success",
+    run_id: str(get(run, "id", "")),
+    created_at: str(get(run, "created_at", "")),
+  };
+  if (p != null) {
+    let rd = validate.resolve_deploy(p, target, "");
+    if (get(rd, "ok", false)) { put(dep, "method", str(get(get(rd, "spec", {}), "method", ""))); }
+    put(dep, "namespace", str(get(get(rd, "spec", {}), "namespace", "")));
+    put(dep, "cluster", str(get(get(rd, "spec", {}), "ssh_host", "")));
+  }
+  store.put_deployment(dep);
+
+  if (p != null) {
+    let at = str(get(run, "created_at", ""));
+    let last = { method: str(get(dep, "method", "")), target: target, image_ref: str(get(dep, "image_ref", "")), at: at };
+    put(p, "last_deploy", last);
+    let all = get(p, "last_deploys", null);
+    if (all == null) { all = {}; put(p, "last_deploys", all); }
+    put(all, target, last);
+    store.put_project(p, false);
+  }
+}
+
+export func cancel(run_id) {
+  let r = store.get_run(run_id);
+  if (r == null) { return { ok: false, err: "运行不存在" }; }
+  let status = str(get(r, "status", ""));
+  if (status == "success" or status == "failed" or status == "canceled") {
+    return { ok: false, err: "运行已结束（" + status + "），无法取消" };
+  }
+  let job_id = str(get(r, "job_id", ""));
+  if (len(job_id) > 0) { exec.cancel(job_id); }
+  let ts = now();
+  store.patch_run(run_id, {
+    status: "canceled",
+    canceled: true,
+    ended_ts: ts,
+    ended_at: store.fmt_iso(ts),
+  });
+  return { ok: true, err: "" };
+}
+
+// 轮询入口：同步状态 + 读日志尾。reset=true 表示前端该清屏重放（偏移对不上）。
+export func tail(run_id, from) {
+  let r = sync(run_id);
+  if (r == null) { return null; }
+  let t = store.read_log_tail(run_id, from, 262144);
+  return {
+    run: r,
+    log: str(get(t, "log", "")),
+    log_len: int(get(t, "log_len", 0)),
+    reset: get(t, "reset", false),
+  };
+}

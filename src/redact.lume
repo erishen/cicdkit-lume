@@ -1,0 +1,241 @@
+// src/redact.lume — 项目配置的脱敏与回填（移植 cicdkit internal/store/validate.go）
+//
+// 为什么必须有这一层：Project 里混着「运维想看」和「不该出现在浏览器」的字段。
+//   build.registry.password   镜像仓库口令
+//   deploy.ssh_key_path       私钥绝对路径（泄漏用户名与家目录结构）
+//   deploy.kubeconfig         同上
+//   deploy.ssh_run_args 里的  <APP>_VISIT_PIN=<pin>（站点访客统计的 owner PIN）
+// GET /api/projects 一旦原样返回，这些就进了浏览器缓存与截图。
+//
+// 回写也要配套：前端拿到的是掩码，PUT 回来时必须保留库里那份真值，
+// 否则一次「改个名字保存」就把私钥路径擦成 "********"。这与空值同义（不修改）。
+
+let MASK = "********";
+
+// posix ERE：组 1 = "<APP>_VISIT_PIN=" 前缀，组 2 = 值
+let PIN_RE = "([A-Z][A-Z0-9_]*_VISIT_PIN=)([^ \t\r\n]+)";
+
+export func masked() { return MASK; }
+
+// 把 run-args 里所有 *_VISIT_PIN= 的值换成掩码，其余原样保留。
+export func mask_visit_pins(s) {
+  if (s == null) { return ""; }
+  let text = str(s);
+  if (len(text) == 0) { return ""; }
+  let hits = str_match(PIN_RE, text);
+  if (len(hits) == 0) { return text; }
+
+  let out = "";
+  let pos = 0;
+  let i = 0;
+  while (i < len(hits)) {
+    let mo = hits[i];
+    let idx = int(get(mo, "index", 0));
+    let whole = str(get(mo, "text", ""));
+    let gs = get(mo, "groups", []);
+    let prefix = "";
+    if (len(gs) > 0) { prefix = str(get(gs, 0, "")); }
+    if (idx > pos) { out = out + substr(text, pos, idx - pos); }
+    out = out + prefix + MASK;
+    pos = idx + len(whole);
+    i = i + 1;
+  }
+  if (pos < len(text)) { out = out + substr(text, pos, len(text) - pos); }
+  return out;
+}
+
+// 回填：incoming 里带掩码的 PIN 槽位换回 stored 的真值；未掩码（可能是新值）原样保留。
+export func restore_visit_pins(incoming, stored) {
+  if (incoming == null) { return ""; }
+  let inc = str(incoming);
+  if (len(inc) == 0) { return ""; }
+  if (stored == null) { return inc; }
+  let old = str(stored);
+  if (len(old) == 0) { return inc; }
+  if (not contains(inc, MASK)) { return inc; }
+
+  // 先从真值里收集 prefix -> 真值
+  let real = {};
+  let olds = str_match(PIN_RE, old);
+  let j = 0;
+  while (j < len(olds)) {
+    let gs = get(olds[j], "groups", []);
+    if (len(gs) > 1) { put(real, str(get(gs, 0, "")), str(get(gs, 1, ""))); }
+    j = j + 1;
+  }
+
+  let hits = str_match(PIN_RE, inc);
+  if (len(hits) == 0) { return inc; }
+  let out = "";
+  let pos = 0;
+  let i = 0;
+  while (i < len(hits)) {
+    let mo = hits[i];
+    let idx = int(get(mo, "index", 0));
+    let whole = str(get(mo, "text", ""));
+    let gs = get(mo, "groups", []);
+    if (idx > pos) { out = out + substr(inc, pos, idx - pos); }
+    let prefix = "";
+    let value = "";
+    if (len(gs) > 1) { prefix = str(get(gs, 0, "")); value = str(get(gs, 1, "")); }
+    let slot = prefix + value;
+    if (contains(value, MASK)) {
+      let kept = get(real, prefix, null);
+      if (kept != null) { slot = prefix + str(kept); }
+    }
+    out = out + slot;
+    pos = idx + len(whole);
+    i = i + 1;
+  }
+  if (pos < len(inc)) { out = out + substr(inc, pos, len(inc) - pos); }
+  return out;
+}
+
+// 一份可安全返回给浏览器的项目副本（深拷贝后改字段，不动库里的原对象）。
+export func redact_project(p) {
+  if (p == null) { return null; }
+  let copy = json(stringify(p));
+
+  let build = get(copy, "build", null);
+  if (build != null) {
+    let reg = get(build, "registry", null);
+    if (reg != null and len(str(get(reg, "password", ""))) > 0) {
+      put(reg, "password", MASK);
+    }
+  }
+
+  let dep = get(copy, "deploy", null);
+  if (dep != null) {
+    if (len(str(get(dep, "ssh_key_path", ""))) > 0) { put(dep, "ssh_key_path", MASK); }
+    if (len(str(get(dep, "kubeconfig", ""))) > 0) { put(dep, "kubeconfig", MASK); }
+    let ra = str(get(dep, "ssh_run_args", ""));
+    if (len(ra) > 0) { put(dep, "ssh_run_args", mask_visit_pins(ra)); }
+  }
+
+  let targets = get(copy, "targets", null);
+  if (targets != null) {
+    let i = 0;
+    while (i < len(targets)) {
+      let t = targets[i];
+      if (t != null) {
+        if (len(str(get(t, "ssh_key_path", ""))) > 0) { put(t, "ssh_key_path", MASK); }
+        if (len(str(get(t, "kubeconfig", ""))) > 0) { put(t, "kubeconfig", MASK); }
+        let ra = str(get(t, "ssh_run_args", ""));
+        if (len(ra) > 0) { put(t, "ssh_run_args", mask_visit_pins(ra)); }
+      }
+      i = i + 1;
+    }
+  }
+  return copy;
+}
+
+// 保持私钥/口令不回退：空值或掩码 = 「不修改」，沿用 stored 里的真值。
+export func merge_secrets(incoming, stored) {
+  if (incoming == null) { return stored; }
+  let p = json(stringify(incoming));
+  if (stored == null) { return p; }
+  let old = stored;
+
+  let build = get(p, "build", null);
+  if (build != null) {
+    let reg = get(build, "registry", null);
+    if (reg != null) {
+      let pw = str(get(reg, "password", ""));
+      if (len(pw) == 0 or pw == MASK) {
+        let ob = get(old, "build", null);
+        if (ob != null) {
+          let orr = get(ob, "registry", null);
+          if (orr != null) { put(reg, "password", str(get(orr, "password", ""))); }
+        }
+      }
+    }
+  }
+
+  let dep = get(p, "deploy", null);
+  if (dep != null) {
+    let od = get(old, "deploy", null);
+    let kp = str(get(dep, "ssh_key_path", ""));
+    if (len(kp) == 0 or kp == MASK) {
+      if (od != null) { put(dep, "ssh_key_path", str(get(od, "ssh_key_path", ""))); }
+    }
+    let kc = str(get(dep, "kubeconfig", ""));
+    if (len(kc) == 0 or kc == MASK) {
+      if (od != null) { put(dep, "kubeconfig", str(get(od, "kubeconfig", ""))); }
+    }
+    let ra = str(get(dep, "ssh_run_args", ""));
+    if (od != null) {
+      put(dep, "ssh_run_args", restore_visit_pins(ra, str(get(od, "ssh_run_args", ""))));
+    }
+  }
+
+  let targets = get(p, "targets", null);
+  if (targets != null) {
+    let ot = get(old, "targets", null);
+    let i = 0;
+    while (i < len(targets)) {
+      let t = targets[i];
+      if (t != null) {
+        let key = str(get(t, "ssh_key_path", ""));
+        if (len(key) == 0 or key == MASK) {
+          if (ot != null and i < len(ot)) { put(t, "ssh_key_path", str(get(ot[i], "ssh_key_path", ""))); }
+        }
+        let kc = str(get(t, "kubeconfig", ""));
+        if (len(kc) == 0 or kc == MASK) {
+          if (ot != null and i < len(ot)) { put(t, "kubeconfig", str(get(ot[i], "kubeconfig", ""))); }
+        }
+        let ra = str(get(t, "ssh_run_args", ""));
+        if (ot != null and i < len(ot)) {
+          put(t, "ssh_run_args", restore_visit_pins(ra, str(get(ot[i], "ssh_run_args", ""))));
+        }
+      }
+      i = i + 1;
+    }
+  }
+  return p;
+}
+
+// ---------- 运行日志的脱敏 ----------
+//
+// 为什么在「读」这一侧做：日志里出现密钥是因为它们本来就是构建参数
+// （docker build --build-arg LLM_API_KEY=... / docker run -e LLM_API_KEY=...），
+// 传值那一刻无法避免；但把日志原样发给浏览器就没必要了。控制面读日志尾时
+// 统一过一遍 mask_log()，落盘的原始日志仍保留，排障时可以去看原件。
+//
+// runner 侧不解释内容，所以脱敏只能在这一层做——这也是 runner 保持愚蠢的代价之一。
+
+let SECRET_RE = "([A-Za-z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_PIN)=)([^ \t\r\n'\"&]+)";
+let KEY_RE = "(sk-)[A-Za-z0-9_-]{12,}";
+let BEARER_RE = "(Bearer[ \t]+)([A-Za-z0-9._-]{16,})";
+
+// 保留 group 1（键名/前缀），把后面那截值换成掩码。
+func mask_after_prefix(text, re) {
+  let hits = str_match(re, text);
+  if (len(hits) == 0) { return text; }
+  let out = "";
+  let pos = 0;
+  let i = 0;
+  while (i < len(hits)) {
+    let mo = hits[i];
+    let idx = int(get(mo, "index", 0));
+    let whole = str(get(mo, "text", ""));
+    let gs = get(mo, "groups", []);
+    let prefix = "";
+    if (len(gs) > 0) { prefix = str(get(gs, 0, "")); }
+    if (idx > pos) { out = out + substr(text, pos, idx - pos); }
+    out = out + prefix + MASK;
+    pos = idx + len(whole);
+    i = i + 1;
+  }
+  if (pos < len(text)) { out = out + substr(text, pos, len(text) - pos); }
+  return out;
+}
+
+export func mask_log(text) {
+  if (text == null) { return ""; }
+  let s = str(text);
+  if (len(s) == 0) { return ""; }
+  s = mask_after_prefix(s, SECRET_RE);
+  s = mask_after_prefix(s, KEY_RE);
+  s = mask_after_prefix(s, BEARER_RE);
+  return s;
+}

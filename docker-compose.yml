@@ -1,20 +1,23 @@
-# cicdkit-lume —— 本机容器运行（宿主机 127.0.0.1:18107）
+# cicdkit-lume —— 控制面 + 内网 runner（取代 cicdkit 容器）
 #
-# 与已在运行的 cicdkit 容器（compose 项目 cicdkit，网络 cicdkit_default）对接：
-# 容器内用 http://cicdkit:8080 访问上游，Token 走挂载的文件而不是命令行。
+# 两个服务，职责不重叠：
+#    cicdkit-lume  控制面：界面 / API / 状态（SQLite）/ 审批闸门 / LLM 诊断
+#    runner        执行器：只按 argv 跑 docker/kubectl/helm/ssh，流式写日志
 #
-#   make docker            # 构建 + 起容器
-#   make docker-logs       # 跟日志
+# 共享一个日志目录，因为控制面按**字节偏移**增量读 runner 写的日志：
+#   ./.data/logs（宿主机）→ 控制面 /app/.data/logs、runner /logs
+# 两者必须指向同一个卷，否则前端永远看到空日志。
+#
+#   make docker            # 构建 + 起两个服务
+#   make docker-logs       # 跟控制面日志
 #   make docker-down       # 停掉
 
 services:
   cicdkit-lume:
     build:
       context: .
-      # lume 二进制来源。本机默认取自编的 lume-bin:0.14.2（在 lume 仓库
-      # 用 `docker build --target lume-build` 产出：动态路由全走 worker 池 +
-      # 池/队列指标 + 大静态文件在主循环非阻塞流式，不占 worker）；
-      # 想回到共享基座镜像：LUME_BIN_IMAGE=windgl-china-lume:latest。
+      # lume 二进制来源。本机默认取自编的 lume-bin:0.14.2（动态路由全走 worker 池 +
+      # 池/队列指标 + 大静态文件在主循环非阻塞流式，不占 worker）。
       args:
         LUME_BIN_IMAGE: ${LUME_BIN_IMAGE:-lume-bin:0.14.2}
     image: cicdkit-lume:dev
@@ -22,18 +25,52 @@ services:
     ports:
       - "127.0.0.1:18107:18107"
     environment:
-      CICD_BASE: ${CICD_BASE:-http://cicdkit:8080}
-      CICD_DEPLOY_APPROVAL: ${CICD_DEPLOY_APPROVAL:-off}
-      # 文件不存在时 token() 退回空串（上游未开鉴权的情况）。
-      CICD_AUTH_FILE: /app/.data/upstream.token
       LUME_BIND: 0.0.0.0
       LUME_PORT: "18107"
+      LUME_DATA: /app/.data
+      RUNNER_BASE: http://runner:8899
+      # runner 的令牌与 cicdkit 的 CICD_AUTH 同一个坑：env 名含 TOKEN 会被
+      # Lume 的 env() 屏蔽，所以这里叫 RUNNER_AUTH。
+      RUNNER_AUTH: ${RUNNER_AUTH:-change-me-runner}
+      CICD_DEPLOY_APPROVAL: ${CICD_DEPLOY_APPROVAL:-off}
+      # build.context 的允许根目录：容器里看到的项目根。
+      CICD_WORK_DIR: ${CICD_WORK_DIR:-/projects}
+      CICD_FS_ROOTS: ${CICD_FS_ROOTS:-/projects}
+      CICD_DEFAULT_KUBECONFIG: ${CICD_DEFAULT_KUBECONFIG:-}
+      CICD_SSH_USER: ${CICD_SSH_USER:-}
+      CICD_SSH_PORT: ${CICD_SSH_PORT:-}
+      CICD_SSH_KEY_PATH: ${CICD_SSH_KEY_PATH:-}
     volumes:
-      - ./.data:/app/.data:ro
-    networks:
-      - cicdkit_default
+      # 可写：SQLite（store.db）+ 运行日志。原来是 :ro，接管存储后必须放开。
+      - ./.data:/app/.data
+      # 项目目录按「相同绝对路径」挂给两个容器，docker daemon 才能解析路径。
+      - ${PROJECTS_ROOT:-.}:/projects
+    depends_on:
+      runner:
+        condition: service_healthy
     restart: unless-stopped
 
-networks:
-  cicdkit_default:
-    external: true
+  runner:
+    build:
+      context: ./runner
+    image: cicdkit-runner:dev
+    container_name: cicdkit-runner
+    # 不映射到宿主机：runner 只该被控制面访问（内网 compose 网络）。
+    expose:
+      - "8899"
+    environment:
+      RUNNER_BIND: 0.0.0.0:8899
+      RUNNER_LOG_DIR: /logs
+      RUNNER_AUTH: ${RUNNER_AUTH:-change-me-runner}
+      RUNNER_ALLOW: ${RUNNER_ALLOW:-docker,kubectl,helm,ssh,scp,git,sudo}
+      RUNNER_MAX_JOBS: ${RUNNER_MAX_JOBS:-4}
+    volumes:
+      # 与控制面共享日志目录（字节偏移增量读的前提）。
+      - ./.data/logs:/logs
+      # 宿主 docker daemon：runner 不跑自己的 docker-in-docker。
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 项目目录：必须与宿主相同路径，否则 docker build 的 context 解析不到。
+      - ${PROJECTS_ROOT:-.}:${PROJECTS_ROOT:-/projects}
+      # SSH 私钥与 kubeconfig 按需挂入（没有就注释掉）。
+      - ${SSH_KEYS_DIR:-./.data/keys}:/keys:ro
+    restart: unless-stopped

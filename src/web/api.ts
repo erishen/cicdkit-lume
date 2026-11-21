@@ -28,7 +28,28 @@ export interface Project {
     method?: string
     namespace?: string
     deployment?: string
+    container?: string
+    kubeconfig?: string
+    manifest_path?: string
+    chart_path?: string
+    release_name?: string
+    helm_image_key?: string
+    helm_set_image?: boolean
+    k3s_import_cmd?: string
+    wait?: boolean
+    timeout?: string
     ssh_host?: string
+    ssh_user?: string
+    ssh_port?: string
+    ssh_key_path?: string
+    ssh_container?: string
+    ssh_run_args?: string
+    ssh_probe_port?: string
+    ssh_container_port?: string
+    ssh_command?: string
+    ssh_pull?: boolean
+    ssh_transfer?: boolean
+    ssh_build_platforms?: string[]
   }
   targets?: Array<{ name: string; method?: string }>
   primary_target?: string
@@ -169,6 +190,17 @@ export interface FsListing {
   entries: FsEntry[]
 }
 
+// 工作目录扫描结果：接管 cicdkit 后「新建项目」不再靠手打绝对路径
+export interface ScanCandidate {
+  id: string
+  name: string
+  path: string
+  dockerfile: string
+  has_git: boolean
+  has_manifests: boolean
+  exists: boolean
+}
+
 export interface ProjectPage {
   projects: Project[]
   total: number
@@ -213,6 +245,41 @@ export const API = {
   listProjects: (q?: string) =>
     request<ProjectPage>(`/api/projects?limit=200${q ? `&q=${encodeURIComponent(q)}` : ''}`),
   getProject: (id: string) => request<Project>(`/api/projects/${encodeURIComponent(id)}`),
+  // 新建：id 可选，缺省由 name 净化得到；重名返回 409
+  createProject: (project: Project, role?: string) =>
+    request<Project>(`/api/projects${roleQuery(role)}`, {
+      method: 'POST',
+      body: JSON.stringify(project),
+    }),
+  // 扫描工作目录，列出「像项目」的目录（有 Dockerfile 或 deploy/ chart/ k8s/）
+  scanProjects: (dir: string, role?: string) =>
+    request<{ ok: boolean; root: string; candidates: ScanCandidate[] }>(
+      `/api/projects/scan${roleQuery(role)}`,
+      { method: 'POST', body: JSON.stringify({ dir }) },
+    ),
+  deleteProject: (id: string, role?: string) =>
+    request<{ ok: boolean; deleted: string }>(
+      `/api/projects/${encodeURIComponent(id)}${roleQuery(role)}`,
+      { method: 'DELETE' },
+    ),
+  clearRuns: (role?: string) =>
+    request<{ ok: boolean; deleted: number }>(`/api/runs${roleQuery(role)}`, { method: 'DELETE' }),
+  clearDeployments: (role?: string) =>
+    request<{ ok: boolean; deleted: number }>(`/api/deployments${roleQuery(role)}`, {
+      method: 'DELETE',
+    }),
+  sshDefaults: () =>
+    request<{
+      user: string
+      port: string
+      key_path_set: boolean
+      container: string
+      container_port: string
+      probe_port: string
+      run_args: string
+      command: string
+    }>('/api/config/ssh-defaults'),
+
   // 上游 PUT 是整份替换：传入 getProject 读到的完整对象（改完再写回），
   // 不要只传表单字段，否则 targets / probe 会被清空。
   updateProject: (id: string, project: Project, role?: string) =>
