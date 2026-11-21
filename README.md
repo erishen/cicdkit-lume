@@ -82,14 +82,14 @@ docker compose down
   不上命令行；文件缺失时按“上游未开鉴权”处理。
 - lume 二进制从已有的 lume 镜像里取，因为 lume 是静态 C 单二进制、release 包在本机
   网络下不可达：`--build-arg LUME_BIN_IMAGE=<含 /usr/local/bin/lume 的镜像>` 可换成自编版本。
-  本机默认 `lume-bin:0.14.0`，由 lume 仓库在容器内编译后打包：
+  本机默认 `lume-bin:0.14.1`，由 lume 仓库在容器内编译后打包：
 
   ```sh
   cd work/lume/lume
   docker build --target lume-build -t lume-buildcache:0.14.0 -f docker/Dockerfile .
   docker create --name lume-tmp lume-buildcache:0.14.0
   docker cp lume-tmp:/build/lume/bin/lume ./lume && docker rm lume-tmp
-  printf 'FROM scratch\nCOPY lume /usr/local/bin/lume\n' > Dockerfile.bin && docker build -t lume-bin:0.14.0 .
+  printf 'FROM scratch\nCOPY lume /usr/local/bin/lume\n' > Dockerfile.bin && docker build -t lume-bin:0.14.1 .
   ```
 
   该版本把动态路由（无 body 的 GET/HEAD 也算）整体送进 worker 池，`GET /api/*` 不再
