@@ -246,7 +246,7 @@ curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm?secret=$CICD_HOOK_KEY" 
 
 - 只收 `POST`；`id` 缺失 400、项目不存在 404。
 - 密钥只从 query `?secret=` 取（Lume 的请求对象不暴露请求头，`X-Webhook-Secret` 这条上游兼容没做）。
-- body 全部可选：`tag`（覆盖自动时间戳 tag）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）。
+- body 全部可选：`tag`（覆盖自动时间戳 tag，只允许 `[A-Za-z0-9][A-Za-z0-9._-]*`，最长 128，否则 400）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）。
 - 成功返回 `202` 和 `run_id` —— 只是**受理**，进度照样去 `/api/runs/:id` 看。
 - 触发的是 `pipeline`（构建 + 部署），`trigger` 记为 `webhook`，方便在运行列表里区分人点还是机器点。
 - 自测：`scripts/test_gate.sh` 覆盖 503 / 401 / 404 / 400 四条拒绝路径（`CICD_HOOK_KEY=testkey` 起临时实例）。

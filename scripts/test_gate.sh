@@ -159,6 +159,8 @@ call POST "/api/webhook/gate-hook?secret=wrong"
 expect_code 401 "webhook：错 secret 被拒"
 call POST "/api/webhook/nope?secret=testkey"
 expect_code 404 "webhook：项目不存在"
+call POST "/api/webhook/gate-hook?secret=testkey" '{"tag":"bad tag; rm -rf /"}'
+expect_code 400 "webhook：非法 tag 被拒"
 call POST "/api/webhook/gate-hook?secret=testkey"
 expect_code 400 "webhook：key 对但 runner 不可达（不静默成功）"
 expect_body 'runner' "webhook：错误说明指向 runner"

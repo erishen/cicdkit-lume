@@ -257,6 +257,10 @@ export func webhook(id, raw, secret) {
   if (len(method) > 0 and not validate.method_ok(method)) {
     return { status: 400, body: { ok: false, error: "非法的部署方式覆盖: " + method } };
   }
+  let tag = trim(str(get(body, "tag", "")));
+  if (not validate.tag_ok(tag)) {
+    return { status: 400, body: { ok: false, error: "非法的 tag: " + tag } };
+  }
   let tn = trim(str(get(body, "target", "")));
   if (len(tn) > 0) {
     let rd = validate.resolve_deploy(p, tn, method);
@@ -265,7 +269,7 @@ export func webhook(id, raw, secret) {
 
   let opts = {
     trigger: "webhook",
-    tag: trim(str(get(body, "tag", ""))),
+    tag: tag,
     method: method,
     target: tn,
     image_ref: trim(str(get(body, "image_ref", ""))),

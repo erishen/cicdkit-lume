@@ -20,6 +20,16 @@ export func method_ok(m) {
   return known_method(lower(trim(str(m))));
 }
 
+// 镜像 tag 只允许 docker 认的字符集：它会进 argv 拼进 `repo:tag`，
+// 放行空白/`..`/引号之类的字符只会让构建莫名其妙地失败，不如直接拒。
+export func tag_ok(t) {
+  let v = trim(str(t));
+  if (len(v) == 0) { return true; }
+  if (len(v) > 128) { return false; }
+  if (not str_match("^[A-Za-z0-9][A-Za-z0-9._-]*$", v)) { return false; }
+  return true;
+}
+
 func known_method(m) {
   if (len(m) == 0) { return true; }
   let i = 0;

@@ -98,6 +98,9 @@ export func start(project, kind, opts) {
 
   if (kind == "deploy" or kind == "pipeline") {
     let want = str(get(opts, "image_ref", ""));
+    // pipeline：刚构建出来的镜像就是要发的镜像，不能再去猜一个 tag
+    // （否则会覆盖掉构建用的 tag，发出去的是另一个不存在的引用）。
+    if (len(trim(want)) == 0 and kind == "pipeline" and len(image) > 0) { want = image; }
     if (len(trim(want)) == 0) {
       // 单独发布时用项目上次发布的镜像；没有就现打一个 tag（会拉不到，所以提示）。
       let ld = get(p, "last_deploy", null);
