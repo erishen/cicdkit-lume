@@ -116,6 +116,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `RUNNER_AUTH` / `RUNNER_AUTH_FILE` | 空 | 令牌，所有端点（含 `/healthz`）都要带 `X-Runner-Token` |
 | `RUNNER_ALLOW` | `docker,kubectl,ssh,helm,git,scp,sudo` | argv[0] 白名单 |
 | `RUNNER_MAX_JOBS` | `4` | 并发 job 上限 |
+| `RUNNER_LOG_MAX_BYTES` | `16769024`（16 MiB − 8 KiB） | 单个 job 日志文件的封顶大小。到顶后停写并追加一行 `[log capped at ...]`，**不会**让构建失败 |
 
 ## 执行模型
 
@@ -317,8 +318,11 @@ make docker-down
   挡不住知道 URL 的人。对外暴露必须加 `HTPASSWD_FILE` 或前置反代，把 `?role=` 当成流程标签而不是凭证。
 - **`patch_run` 是读-改-写，没有事务**（Lume 的 SQL 护栏不开放事务，也没有进程内互斥）。
   已做的是「阶段没变化就不写库」把触发次数压到最低；单人多标签页同时盯同一运行仍有极窄的覆盖窗口。
-- **日志超过 16 MiB 只显示前 16 MiB**（`read_file` 有硬上限，无分片读），接口会带 `truncated` 和 `log_note`，
-  前端顶部有提示，完整日志去 `.data/logs/<run_id>.log` 看。
+- **日志超过 16 MiB 有双层兜底**：runner 把文件封顶在 `RUNNER_LOG_MAX_BYTES`（默认 16 MiB − 8 KiB）并追加一行封顶标记；
+  控制面的 `read_file` 对超限文件是**抛错而非截断**，所以接口侧再用 `try()` 兜住——遇到老 runner 或人为塞进来的超大日志也返回 200，
+  带 `truncated` / `log_note`，前端顶部提示，完整日志去看控制面的 `<LUME_DATA>/logs/<run_id>.log`。
+- **`write_file` 也有 16 MiB 上限**：控制面侧无法用 DSL 自己生成超大文件（自测里的 17 MiB 日志样本由 Makefile 用 dd 预置）。
+  runner 是 Go 写的，写日志不受这条限制，但控制面读回来时仍受 16 MiB 读取上限约束，所以才有上面的封顶。
 - **SQLite 不能建索引**：DDL 护栏只允许 `CREATE TABLE`，`CREATE INDEX` 被拒。当前 200 来条记录无所谓，
   记录量上百倍增长后列表查询会变慢，到那时得换存储层而不是硬扛。
 - **runner 的任务表只在内存里**：重启即丢，控制面会把还在跑的运行标成 `interrupted`（不会再标成 running 干等）。

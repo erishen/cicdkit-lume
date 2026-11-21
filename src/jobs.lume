@@ -340,5 +340,7 @@ export func tail(run_id, from) {
     log: str(get(t, "log", "")),
     log_len: int(get(t, "log_len", 0)),
     reset: get(t, "reset", false),
+    truncated: get(t, "truncated", false),
+    err: str(get(t, "err", "")),
   };
 }

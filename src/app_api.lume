@@ -428,7 +428,9 @@ export func run_log(id, from) {
   put(r, "reset", get(t, "reset", false));
   put(r, "truncated", get(t, "truncated", false));
   if (bool(get(t, "truncated", false))) {
-    put(r, "log_note", "日志超过 16 MiB（read_file 上限），这里只显示前 16 MiB，完整内容去看 .data/logs/" + str(id) + ".log");
+    let why = "日志超过 16 MiB（read_file 上限），无法通过接口读取";
+    if (len(str(get(t, "log", ""))) > 0) { why = "日志超过 16 MiB（read_file 上限），这里只显示前 16 MiB"; }
+    put(r, "log_note", why + "；完整内容在控制面日志目录：" + store.run_log_path(id));
   }
   return { status: 200, body: r };
 }

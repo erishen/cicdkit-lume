@@ -92,6 +92,47 @@ type Job struct {
 	mu      sync.Mutex
 }
 
+type cappedWriter struct {
+	f        *os.File
+	left     int64
+	limit    int64
+	clipOnce bool
+	mu       sync.Mutex
+}
+
+// 日志封顶：docker build / npm 这类输出能轻易上百 MB，而控制面的 read_file
+// 超过 16 MiB 会直接抛错（不是截断），接口就变成 500、前端一片空白。
+// 所以在这里就把文件按住：超限后停止写入并落一行标记，绝不返回 error ——
+// 日志写不下不该让构建失败。
+func newCappedWriter(f *os.File, limit int64) *cappedWriter {
+	return &cappedWriter{f: f, left: limit, limit: limit}
+}
+
+func (w *cappedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.left <= 0 {
+		if !w.clipOnce {
+			w.clipOnce = true
+			fmt.Fprintf(w.f, "\n[log capped at %d bytes; see the runner host for the full output]\n", w.limit)
+		}
+		return len(p), nil
+	}
+	if int64(len(p)) > w.left {
+		n, err := w.f.Write(p[:w.left])
+		w.left = 0
+		if err != nil {
+			return n, err
+		}
+		w.clipOnce = true
+		fmt.Fprintf(w.f, "\n[log capped at %d bytes; see the runner host for the full output]\n", w.limit)
+		return len(p), nil
+	}
+	n, err := w.f.Write(p)
+	w.left -= int64(n)
+	return n, err
+}
+
 type server struct {
 	allow  map[string]bool
 	logDir string
@@ -100,6 +141,7 @@ type server struct {
 	jobs   map[string]*Job
 	order  []string
 	sem    chan struct{}
+	logMax int64
 }
 
 // ---------- 入口 ----------
@@ -108,6 +150,11 @@ func main() {
 	bind := envOr("RUNNER_BIND", "127.0.0.1:8899")
 	logDir := envOr("RUNNER_LOG_DIR", "./logs")
 	allow := envOr("RUNNER_ALLOW", "docker,kubectl,ssh,helm,git,scp,sudo")
+	// 默认 16 MiB - 8 KiB：控制面的 read_file 上限是 16 MiB，留出写封顶标记的余量。
+	logMaxBytes, _ := strconv.ParseInt(envOr("RUNNER_LOG_MAX_BYTES", "16769024"), 10, 64)
+	if logMaxBytes <= 0 {
+		logMaxBytes = 16769024
+	}
 	maxJobs, _ := strconv.Atoi(envOr("RUNNER_MAX_JOBS", "4"))
 	if maxJobs <= 0 {
 		maxJobs = 1
@@ -135,6 +182,7 @@ func main() {
 		token:  token,
 		jobs:   map[string]*Job{},
 		sem:    make(chan struct{}, maxJobs),
+		logMax: logMaxBytes,
 	}
 	for _, b := range strings.Split(allow, ",") {
 		if v := strings.TrimSpace(b); v != "" {
@@ -380,6 +428,7 @@ func (s *server) run(job *Job, timeoutS int) {
 		return
 	}
 	defer f.Close()
+	out := newCappedWriter(f, s.logMax)
 
 	if timeoutS > 0 {
 		var stop context.CancelFunc
@@ -396,7 +445,7 @@ func (s *server) run(job *Job, timeoutS int) {
 			break
 		}
 		job.setStep(i, "running", -1, nowISO())
-		fmt.Fprintf(f, "\n$ %s\n", joinArgv(step.Argv))
+		fmt.Fprintf(out, "\n$ %s\n", joinArgv(step.Argv))
 
 		stepCtx := ctx
 		stopStep := func() {}
@@ -405,7 +454,7 @@ func (s *server) run(job *Job, timeoutS int) {
 			stepCtx, stop = context.WithTimeout(ctx, time.Duration(step.Timeout)*time.Second)
 			stopStep = stop
 		}
-		code, runErr := execStep(stepCtx, step, f)
+		code, runErr := execStep(stepCtx, step, out)
 		// 取消有两种来源：整 job 的 cancel 端点和单步超时。两种都必须走 canceled，
 		// 不能落成 failed —— 否则前端会把「人工取消」当成一次失败构建，
 		// 还会触发 AI 诊断。
@@ -417,7 +466,7 @@ func (s *server) run(job *Job, timeoutS int) {
 
 		if canceled {
 			job.setStep(i, "canceled", code, nowISO())
-			fmt.Fprintf(f, "\n[step %d canceled: %v]\n", i+1, stepCtx.Err())
+			fmt.Fprintf(out, "\n[step %d canceled: %v]\n", i+1, stepCtx.Err())
 			job.mu.Lock()
 			job.Canceled = true
 			job.mu.Unlock()
@@ -430,7 +479,7 @@ func (s *server) run(job *Job, timeoutS int) {
 			if exit == 0 {
 				exit = 1
 			}
-			fmt.Fprintf(f, "\n[step %d failed: exit=%d err=%v]\n", i+1, code, runErr)
+			fmt.Fprintf(out, "\n[step %d failed: exit=%d err=%v]\n", i+1, code, runErr)
 			break
 		}
 		job.setStep(i, "done", 0, nowISO())
@@ -467,7 +516,7 @@ func (s *server) finish(job *Job, exit int) {
 
 // execStep 直接 exec（不经 shell），stdout/stderr 逐行写入日志文件：
 // 控制面每 1.5s 按字节偏移拉新增部分，所以必须「写一条就落盘」，不能缓冲。
-func execStep(ctx context.Context, step Step, f *os.File) (int, error) {
+func execStep(ctx context.Context, step Step, out io.Writer) (int, error) {
 	cmd := exec.CommandContext(ctx, step.Argv[0], step.Argv[1:]...)
 	if step.Cwd != "" {
 		cmd.Dir = step.Cwd
@@ -479,8 +528,8 @@ func execStep(ctx context.Context, step Step, f *os.File) (int, error) {
 	if step.Stdin != "" {
 		cmd.Stdin = strings.NewReader(step.Stdin)
 	}
-	cmd.Stdout = f
-	cmd.Stderr = f
+	cmd.Stdout = out
+	cmd.Stderr = out
 	cmd.WaitDelay = 5 * time.Second
 	err := cmd.Run()
 	if err == nil {

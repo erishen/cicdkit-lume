@@ -96,6 +96,13 @@ let tail = store.read_log_tail("run-t1", 0, 4096);
 ok("日志全文", contains(str(get(tail, "log", "")), "step 2"));
 ok("日志长度", int(get(tail, "log_len", 0)) == 34);
 
+// 超 16 MiB 的日志：read_file 是**抛错**而不是截断。read_log_tail 必须 try 住，
+// 否则 /api/runs/:id/log 在超大日志上直接 500（前端一片空白）。
+// 这个 17 MiB 的文件由 Makefile 的 test 目标用 dd 预置——write_file 自己也有
+// 16 MiB 上限，在 DSL 里造不出来（这也是同一个上限的另一面）。
+let tb = store.read_log_tail("run-big", 0, 4096);
+ok("超大日志返回 truncated 而不是抛错", bool(get(tb, "truncated", false)) == true);
+ok("超大日志给出 err 说明", len(str(get(tb, "err", ""))) > 0);
 let tail2 = store.read_log_tail("run-t1", 20, 4096);
 ok("增量偏移生效", substr(str(get(tail2, "log", "")), 0, 1) == "s" or true);
 

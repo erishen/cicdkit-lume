@@ -258,7 +258,14 @@ let LOG_READ_MAX = 16777216;
 
 export func read_log_tail(run_id, from, tail_max) {
   let path = run_log_path(run_id);
-  let text = read_file(path);
+  // read_file 对超过 16 MiB 的文件是**抛错**而不是截断：不 try 住的话，
+  // 一个超大日志会让整个接口 500，前端一片空白。runner 虽然已经封顶，
+  // 但老 runner 或人为塞进来的大文件仍会走到这里。
+  let got = try(() => read_file(path));
+  if (got.err != null) {
+    return { log: "", log_len: 0, from: 0, reset: true, truncated: true, err: str(got.err) };
+  }
+  let text = got.ok;
   if (text == null) { return { log: "", log_len: 0, from: 0, reset: from > 0, truncated: false }; }
   let src = str(text);
   let total = len(src);
