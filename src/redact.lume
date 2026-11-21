@@ -230,6 +230,65 @@ func mask_after_prefix(text, re) {
   return out;
 }
 
+// ---------- 项目配置里的明文密钥清洗 ----------
+//
+// 与 mask_log 的区别：那个只处理「日志文本」里的 `K=V`，且是给人看的；
+// 这里处理的是**已经解析好的项目 JSON**，要能认出两种形态：
+//   1) 字符串里内嵌 `LLM_API_KEY=sk-...`（`--build-arg` / `-e` 拼成的参数）
+//   2) map 形态的 `build_args: {LLM_API_KEY: "sk-..."}`（值本身就是密钥）
+// 形态 2 必须整值换成掩码，否则会留下 `sk-********` 这种带前缀的残形。
+let SECRET_KEY_RE = "^[A-Za-z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_PIN)$";
+
+// 递归改写 node（就地改 map/list），命中路径与条数记在 acc（acc = {n, items}）。
+// 没有 typeof/is_map 内建，所以用「试探调用」判别容器：keys() 只在 map 上成功、
+// substr() 只在 string 上成功，两者都失败就当标量。
+export func mask_values(node, path, acc) {
+  if (node == null) { return node; }
+
+  let km = try(() => keys(node));
+  if (km.err == null) {
+    let ks = km.ok;
+    let i = 0;
+    while (i < len(ks)) {
+      let k = str(ks[i]);
+      let child = get(node, k, null);
+      if (len(str_match(SECRET_KEY_RE, k)) > 0 and child != null and len(str(child)) > 0 and str(child) != MASK) {
+        put(node, k, MASK);
+        put(acc, "n", int(get(acc, "n", 0)) + 1);
+        push(get(acc, "items", []), path + "." + k);
+      } else {
+        put(node, k, mask_values(child, path + "." + k, acc));
+      }
+      i = i + 1;
+    }
+    return node;
+  }
+
+  let ss = try(() => substr(node, 0, 0));
+  if (ss.err == null) {
+    let s = str(node);
+    let masked = mask_log(s);
+    if (masked != s) {
+      put(acc, "n", int(get(acc, "n", 0)) + 1);
+      push(get(acc, "items", []), path);
+      return masked;
+    }
+    return node;
+  }
+
+  let ln = try(() => len(node));
+  if (ln.err == null) {
+    let out = [];
+    let i = 0;
+    while (i < len(node)) {
+      push(out, mask_values(node[i], path + "[" + str(i) + "]", acc));
+      i = i + 1;
+    }
+    return out;
+  }
+  return node;
+}
+
 export func mask_log(text) {
   if (text == null) { return ""; }
   let s = str(text);

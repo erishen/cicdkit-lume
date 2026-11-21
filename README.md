@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 三层自测：store 34 项 + exec 61 项 + 闸门 24 项（临时实例，不碰真实数据）
+make test       # 三层自测：store 39 项 + exec 61 项 + 闸门 24 项（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -188,16 +188,31 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
   （`SECRET_RE` / `KEY_RE` / `BEARER_RE`），因为构建参数里本来就有
   `--build-arg LLM_API_KEY=...`、`-e *_VISIT_PIN=...` 这类真值。
 
-> 已知遗留：真实历史数据里 `build.build_args` / `ssh_run_args` 明文存着 LLM Key 和
-> `*_VISIT_PIN`。当前只做了读出侧脱敏，库里仍是明文，需要时另行清洗。
+### 清洗历史明文密钥
+
+真实历史数据里 `build.build_args`（map 或被拼成 `--build-arg K=V`）与 `ssh_run_args`
+存着 LLM Key 和 `*_VISIT_PIN`。读出口已经挡住，但库里仍是明文，任何能读 `store.db`
+或其备份的人都拿得到。两步处理：
+
+```bash
+make sanitize          # 干跑：只列「哪个项目的哪个字段命中」，不打印明文
+make sanitize-apply    # 先备份 store.db 再写库
+```
+
+- 判定逻辑在 `redact.mask_values()`（store_test 里有断言）：字符串形态走 `mask_log()`，
+  map 形态（`build_args: {LLM_API_KEY: "sk-..."}`）整值换成 `********`，不留 `sk-********` 残形。
+- 历史运行/部署的 json 里存着当初执行过的命令行，也会按字符串级脱敏（报告里单列 `history:`）。
+- 幂等：清洗完再跑一次全部 `clean`。
+- **是有损操作**：这些参数会变成掩码，依赖它们注入密钥的构建会失效——要么改成从
+  环境变量/secret 文件读取，要么确认该构建不再需要。清洗后 `plan_dump` 仍能正常生成计划。
 
 ## 自测
 
 ```bash
-make test     # store 34 + exec 61 + gate 24
+make test     # store 39 + exec 61 + gate 24
 ```
 
-- `scripts/store_test.lume`：建库/迁移/掩码合并/时间列/清理。
+- `scripts/store_test.lume`：建库/迁移/掩码合并/时间列/清理，含明文密钥清洗的两种形态。
 - `scripts/exec_test.lume`：argv 计划的 61 个断言（含 ssh 四步、helm set 顺序、kubeconfig 缺失）。
 - `scripts/test_gate.sh`：起临时实例（runner 指向死端口 `127.0.0.1:9`），验证闸门 403、
   本地存储 404、`overview connected:false`、`health runner_ok:false`、建删项目、静态站 200。

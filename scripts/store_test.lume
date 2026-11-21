@@ -131,6 +131,22 @@ print("store: settings");
 store.put_setting("llm", { enabled: false, model: "x" });
 ok("设置读写", str(get(store.get_setting("llm"), "model", "")) == "x");
 
+// ---- 明文密钥清洗（redact.mask_values）----
+// 覆盖两种真实形态：字符串里内嵌 `K=V`、map 形态的 build_args（值就是密钥本身）。
+print("store: sanitize secrets");
+let acc = { n: 0, items: [] };
+let dirty = {
+  id: "proj-t2",
+  build: { build_args: { LLM_API_KEY: "sk-abcdefghijklmnop1234" } },
+  deploy: { ssh_run_args: "-e DEMO_READONLY=1 -e DEMO_VISIT_PIN=p1n2s3" }
+};
+let cleaned = redact.mask_values(dirty, "proj-t2", acc);
+ok("map 形态密钥整值替换", str(get(get(get(cleaned, "build", {}), "build_args", {}), "LLM_API_KEY", "")) == "********");
+ok("不留 sk- 残形", len(str_match("sk-", stringify(cleaned))) == 0);
+ok("字符串内嵌密钥被替换", len(str_match("DEMO_VISIT_PIN=", stringify(cleaned))) > 0 and len(str_match("p1n2s3", stringify(cleaned))) == 0);
+ok("非密钥参数保持原样", len(str_match("DEMO_READONLY=1", stringify(cleaned))) > 0);
+ok("命中计数与路径", int(get(acc, "n", 0)) == 2 and len(get(acc, "items", [])) == 2);
+
 // ---- 清空 ----
 print("store: clear");
 ok("清空运行", int(store.clear_runs()) == 1);

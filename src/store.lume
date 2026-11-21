@@ -70,7 +70,7 @@ func id_free(table, prefix) {
   return new_id(prefix);
 }
 
-func parse_json(text, fallback) {
+export func parse_json(text, fallback) {
   if (text == null) { return fallback; }
   let s = str(text);
   if (len(s) == 0) { return fallback; }
@@ -110,6 +110,27 @@ export func list_projects(q, limit, offset) {
 }
 
 // 库里那份（含真值口令/私钥路径），只给服务端内部用。
+// 给运维脚本用的原始行（含 json 与时间列），业务代码请用 list_projects/get_project。
+export func project_rows() {
+  return sql_query(db(), "SELECT id, json, created_ts FROM projects ORDER BY id", []);
+}
+
+// 历史运行/部署里也存着当初执行过的命令行（含 `--build-arg LLM_API_KEY=...`），
+// 清洗脚本要能扫到它们；这两个只给运维脚本用。
+export func run_rows() {
+  return sql_query(db(), "SELECT id, json FROM runs ORDER BY id", []);
+}
+
+export func deployment_rows() {
+  return sql_query(db(), "SELECT id, json FROM deployments ORDER BY id", []);
+}
+
+export func put_json(table, id, text) {
+  let r = try(() => sql_write(db(), "UPDATE " + str(table) + " SET json = ? WHERE id = ?", [str(text), str(id)]));
+  if (r.err != null) { return { ok: false, err: str(r.err) }; }
+  return { ok: true, err: "" };
+}
+
 export func get_project(id) {
   let rows = sql_query(db(), "SELECT json FROM projects WHERE id = ?", [str(id)]);
   if (len(rows) == 0) { return null; }

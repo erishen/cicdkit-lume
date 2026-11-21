@@ -23,7 +23,7 @@ WORK  ?= $(HOME)/Workspace
 DATA  ?= ./.data
 RUNNER_PORT ?= 8899
 
-.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan docker docker-logs docker-down clean
+.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan sanitize sanitize-apply docker docker-logs docker-down clean
 
 vendor:
 	@bash scripts/vendor_lume.sh
@@ -73,6 +73,17 @@ test: vendor
 	@rm -rf /tmp/lume_test_store && LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
 	@$(LUME) scripts/exec_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
+
+# 清洗项目配置里明文存放的密钥（LLM_API_KEY / *_VISIT_PIN 等）。
+# 默认干跑：只列出「哪个项目的哪个字段会被改」，不打印任何明文；
+# sanitize-apply 会先备份 store.db 再写库。清洗后依赖这些参数的构建会失效。
+sanitize:
+	@LUME_DATA=$(DATA) $(LUME) scripts/sanitize_secrets.lume
+
+sanitize-apply:
+	@cp $(DATA)/store.db $(DATA)/store.db.bak.$$(date +%Y%m%d%H%M%S)
+	@LUME_DATA=$(DATA) APPLY=1 $(LUME) scripts/sanitize_secrets.lume
+	@ls -1 $(DATA)/store.db.bak.* | tail -1
 
 # 干跑：把真实项目配置翻译成 argv，先看一遍再动手。
 plan:
