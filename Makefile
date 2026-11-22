@@ -9,6 +9,7 @@
 #   make run      只启动（假定 ui 已构建）
 #   make stop     停掉本端口上的服务
 #   make smoke    对运行中的服务做一次 HTTP 冒烟
+#   make a2a-demo 读 Agent Card + 发一次 A2A 只读查询 + tasks/get
 #   make plan     对着真实数据把每个项目的 argv 计划打出来（干跑）
 #   make docker   构建镜像并起控制面 + runner（127.0.0.1:18107）
 #   make docker-logs / docker-down
@@ -26,7 +27,7 @@ RUNNER_PORT ?= 8899
 # 绝对路径，容器必须按同一路径挂进来才认。
 LEGACY ?= ../cicdkit/data-docker
 
-.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan preflight remap remap-apply sanitize sanitize-apply migrate-args migrate-args-apply secret docker docker-logs docker-down clean
+.PHONY: vendor check ui node_modules runner runner-build run dev stop smoke a2a-demo test plan preflight remap remap-apply sanitize sanitize-apply migrate-args migrate-args-apply secret docker docker-logs docker-down clean
 
 vendor:
 	@bash scripts/vendor_lume.sh
@@ -70,6 +71,9 @@ stop:
 
 smoke:
 	@bash scripts/smoke.sh http://127.0.0.1:$(PORT)
+
+a2a-demo:
+	@BASE_URL=http://127.0.0.1:18107 bash scripts/a2a_demo.sh demo
 
 # 自测：存储 / 执行计划 / 生成 / A2A / 闸门（临时实例，不碰真实上游）+ runner go test。
 runner-test:

@@ -57,14 +57,28 @@ func jlist(m, k) {
 func now_text() { return store.fmt_iso(now()); }
 
 // 同秒内连续建任务/消息要是拿到同一个 id，会互相覆盖（INSERT OR REPLACE 静默
-// 吃掉前一条）。模块级 map 可变，所以用 put() 计数。
+// 吃掉前一条）。模块级 map 在 Lume 里是请求级的，不能靠它跨请求去重，所以
+// 把调用方给的种子（JSON-RPC 请求体）也拌进摘要；任务 ID 再查库兜底。
 let g_a2a = { n: 0 };
 
-func next_id(kind) {
+func next_id(kind, seed) {
   put(g_a2a, "n", int(get(g_a2a, "n", 0)) + 1);
-  let digest = sha256(peer.name() + kind + str(now()) + ":" + str(int(get(g_a2a, "n", 0))));
+  let digest = sha256(peer.name() + kind + str(now()) + ":" + str(seed) + ":" + str(int(get(g_a2a, "n", 0))));
   if (kind == "task") { return substr(digest, 0, 24); }
   return substr(digest, 0, 20);
+}
+
+// a2a_tasks.id 是主键，save_task 用 INSERT OR REPLACE；生成后先查一次，
+// 撞了就换种子重试，避免同秒同请求体把已有任务静默覆盖。
+func unique_task_id(seed) {
+  let i = 0;
+  while (i < 20) {
+    let id = next_id("task", str(seed) + "#" + str(i));
+    let rows = sql_query(store.db(), "SELECT id FROM a2a_tasks WHERE id = ?", [id]);
+    if (len(rows) == 0) { return id; }
+    i = i + 1;
+  }
+  return next_id("task", str(seed) + "#" + str(now()));
 }
 
 // ---------- 能力表 ----------
@@ -445,18 +459,18 @@ export func active_count() {
   return int(get(rows[0], "n", 0));
 }
 
-func new_task(capability, text, ctx_id, hops) {
+func new_task(capability, text, ctx_id, hops, seed) {
   let ctx = str(ctx_id);
-  if (len(ctx) == 0) { ctx = next_id("msg"); }
+  if (len(ctx) == 0) { ctx = next_id("msg", seed); }
   let now_s = int(now());
   return {
-    id: next_id("task"),
+    id: unique_task_id(seed),
     contextId: ctx,
     kind: "task",
     status: { state: "submitted", timestamp: now_text() },
     artifacts: [],
     history: [
-      { role: "user", messageId: next_id("msg"), kind: "message", parts: [{ kind: "text", text: str(text) }] },
+      { role: "user", messageId: next_id("msg", seed), kind: "message", parts: [{ kind: "text", text: str(text) }] },
     ],
     metadata: {
       capability: str(capability),
@@ -482,7 +496,7 @@ func advance(t, state, note, result) {
   put(get(t, "metadata", {}), "trace", trace);
   if (result != null) {
     put(t, "artifacts", [
-      { artifactId: next_id("art"), parts: [{ kind: "text", text: stringify(result) }] },
+      { artifactId: next_id("art", stringify(result)), parts: [{ kind: "text", text: stringify(result) }] },
     ]);
   }
   put(t, "updated", int(now()));
@@ -535,7 +549,7 @@ func handle_send(rpc) {
       return { status: 200, body: rpc_error(id, -32005, "任务正在处理中(" + st + "), 无需补充") };
     }
     let hist = get(old, "history", []);
-    push(hist, { role: "user", messageId: next_id("msg"), kind: "message", parts: [{ kind: "text", text: text }] });
+    push(hist, { role: "user", messageId: next_id("msg", text), kind: "message", parts: [{ kind: "text", text: text }] });
     put(old, "history", hist);
     if (len(cap) == 0 or cap == "unknown") { cap = jstr(get(old, "metadata", {}), "capability"); }
     let merged = {};
@@ -551,7 +565,7 @@ func handle_send(rpc) {
     return { status: 200, body: rpc_result(id, old) };
   }
 
-  let t = new_task(cap, text, jstr(params, "contextId"), hops);
+  let t = new_task(cap, text, jstr(params, "contextId"), hops, stringify(rpc));
   put(get(t, "metadata", {}), "args", args);
   if (len(cap) == 0) {
     advance(t, "input-required", "请指定 capability: " + join(cap_names(), ", "), null);

@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 自测：store 77 + exec 73 + generate 26 + a2a 45 + 闸门 108 + runner go test（临时实例，不碰真实数据）
+make test       # 自测：store 77 + exec 73 + generate 26 + a2a 47 + 闸门 108 + runner go test（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -304,6 +304,9 @@ make secret NAME=lume_crm_llm_api_key VALUE=sk-...   # 真实值只写进 .data/
 两个面并存，与上游 cicdkit 的 `internal/a2a` 同形，能力全部**只读**：
 项目总览、最近运行、最近部署、知识库摘要、能力自述。写入原语（触发流水线、删项目、
 SSH、registry 操作）一律不进这两面——发布只能走人工审批闸门。
+
+> 可直接运行的调用示例：`make a2a-demo`（读 Agent Card、发查询、按 task id 回查），
+> 完整参数与错误码见 [`docs/A2A-USAGE.md`](docs/A2A-USAGE.md)。
 
 - **标准面**：`GET /.well-known/agent-card.json` 公开发现；`POST /a2a` 走 JSON-RPC
   （`message/send` / `tasks/get` / `tasks/cancel`）。任务落 SQLite（`a2a_tasks` 表），

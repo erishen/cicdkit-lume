@@ -90,6 +90,15 @@ let tid = str(get(task, "id", ""));
 ok("任务完成", str(get(get(task, "status", {}), "state", "")) == "completed");
 ok("任务有 artifact", len(get(task, "artifacts", [])) == 1);
 ok("任务能重新读出来", a2a.load_task(tid) != null);
+
+// 同秒 + 同请求体连发两次：ID 不能相同，两条都要还在（防 INSERT OR REPLACE 覆盖）。
+let same_body = "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"message/send\",\"params\":{\"metadata\":{\"capability\":\"cicd.overview\"},\"message\":{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"重复请求\"}]}}}";
+let dup1 = a2a.rpc({ body: same_body });
+let dup2 = a2a.rpc({ body: same_body });
+let dup_id1 = str(get(get(get(dup1, "body", {}), "result", null), "id", ""));
+let dup_id2 = str(get(get(get(dup2, "body", {}), "result", null), "id", ""));
+ok("同秒同请求体任务 ID 不重复", dup_id1 != dup_id2);
+ok("两条任务都在库", a2a.load_task(dup_id1) != null and a2a.load_task(dup_id2) != null);
 let get_rpc = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tasks/get\",\"params\":{\"id\":\"" + tid + "\"}}" });
 ok("tasks/get 命中", str(get(get(get(get_rpc, "body", {}), "result", null), "id", "")) == tid);
 let cancel_rpc = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tasks/cancel\",\"params\":{\"id\":\"" + tid + "\"}}" });
