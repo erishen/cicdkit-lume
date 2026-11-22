@@ -338,6 +338,27 @@ export const API = {
       body: JSON.stringify(body || {}),
     }),
 
+  // 归档（被 CICD_RUN_KEEP 收走的运行，可恢复）
+  listArchive: () =>
+    request<{
+      entries: {
+        id: string
+        project_id: string
+        project_name: string
+        status: string
+        image_ref: string
+        archived_ts: number
+        log_archived: boolean
+        log_bytes: number
+      }[]
+      total: number
+    }>('/api/runs/archive'),
+  restoreRun: (id: string, role?: string) =>
+    request<{ ok: boolean; restored: string; log_bytes: number }>(
+      `/api/runs/${encodeURIComponent(id)}/restore${roleQuery(role)}`,
+      { method: 'POST' },
+    ),
+
   listRuns: (opts: { project_id?: string; limit?: number } = {}) => {
     const p = new URLSearchParams()
     if (opts.project_id) p.set('project_id', opts.project_id)

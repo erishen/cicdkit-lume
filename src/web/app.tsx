@@ -1694,6 +1694,11 @@ function RunsPage({ role }: { role: string }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [openRun, setOpenRun] = useState('')
+  // 归档：被保留策略收走的运行，可以在这里恢复（服务端不删，只搬走）
+  const [archive, setArchive] = useState<
+    { id: string; project_name: string; status: string; image_ref: string; archived_ts: number; log_archived: boolean }[]
+  >([])
+  const [showArchive, setShowArchive] = useState(false)
 
   const load = useCallback(async () => {
     try {
@@ -1716,6 +1721,23 @@ function RunsPage({ role }: { role: string }) {
   useEffect(() => {
     load()
   }, [load])
+
+  useEffect(() => {
+    API.listArchive()
+      .then((a) => setArchive(a.entries || []))
+      .catch(() => setArchive([]))
+  }, [runs.length])
+
+  const restore = async (id: string) => {
+    try {
+      const r = await API.restoreRun(id, role)
+      setArchive((prev) => prev.filter((x) => x.id !== id))
+      setError(`已恢复 ${id}（日志 ${r.log_bytes} 字节）`)
+      load()
+    } catch (e: any) {
+      setError(e.message || String(e))
+    }
+  }
 
   // 有活动运行时自动刷新列表。
   useEffect(() => {
@@ -1745,10 +1767,51 @@ function RunsPage({ role }: { role: string }) {
           <button className="btn" onClick={load}>
             刷新
           </button>
+          {archive.length > 0 ? (
+            <button className="btn ghost" onClick={() => setShowArchive((v: boolean) => !v)}>
+              {showArchive ? '收起归档' : `归档 ${archive.length}`}
+            </button>
+          ) : null}
         </div>
       </div>
 
       {error && <ErrorBox error={error} onRetry={load} />}
+
+      {showArchive && archive.length > 0 ? (
+        <div className="card" style={{ marginBottom: 16 }}>
+          <p className="muted small">
+            以下运行因超过保留条数（CICD_RUN_KEEP）被归档，按「恢复」可以连日志一起回到列表。
+          </p>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>项目</th>
+                <th>状态</th>
+                <th>镜像</th>
+                <th>归档时间</th>
+                <th>日志</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {archive.map((a) => (
+                <tr key={a.id}>
+                  <td>{a.project_name || '—'}</td>
+                  <td><Badge status={a.status} /></td>
+                  <td className="mono muted">{a.image_ref || '—'}</td>
+                  <td className="muted">{fmtTime(a.archived_ts ? new Date(a.archived_ts * 1000).toISOString() : '')}</td>
+                  <td className="muted small">{a.log_archived ? '已归档' : '未归档'}</td>
+                  <td>
+                    <button className="btn ghost" onClick={() => restore(a.id)}>
+                      恢复
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
 
       {runs.length === 0 ? (
         <div className="empty">没有运行记录</div>
