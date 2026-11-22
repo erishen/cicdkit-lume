@@ -22,6 +22,9 @@ PORT  ?= 8096
 WORK  ?= $(HOME)/Workspace
 DATA  ?= ./.data
 RUNNER_PORT ?= 8899
+# 迁移过来的历史凭据目录（kubeconfig、ssh key）。项目配置里存的是它的宿主
+# 绝对路径，容器必须按同一路径挂进来才认。
+LEGACY ?= ../cicdkit/data-docker
 
 .PHONY: vendor check ui node_modules runner runner-build run dev stop smoke test plan preflight remap remap-apply sanitize sanitize-apply migrate-args migrate-args-apply secret docker docker-logs docker-down clean
 
@@ -74,6 +77,7 @@ test: vendor
 	@LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
 	@rm -rf /tmp/lume_test_exec && LUME_DATA=/tmp/lume_test_exec RUNNER_BASE=http://127.0.0.1:9 $(LUME) scripts/exec_test.lume
 	@rm -rf /tmp/lume_test_gen && LUME_DATA=/tmp/lume_test_gen $(LUME) scripts/generate_test.lume
+	@rm -rf /tmp/lume_test_a2a && mkdir -p /tmp/lume_test_a2a && LUME_DATA=/tmp/lume_test_a2a CICDKIT_PEER_SHARED=test-shared $(LUME) scripts/a2a_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 
 # 清洗项目配置里明文存放的密钥（LLM_API_KEY / *_VISIT_PIN 等）。
@@ -131,7 +135,9 @@ plan:
 
 # 容器：http://127.0.0.1:18107（控制面）+ 内网 runner（不映射端口）。
 docker:
-	@PROJECTS_ROOT=$(WORK) docker compose up -d --build
+	@PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
+	 CICD_DEFAULT_KUBECONFIG=$(abspath $(LEGACY)/kubeconfig-cicd) \
+	 docker compose up -d --build
 	@echo "▶ http://127.0.0.1:18107"
 
 docker-logs:

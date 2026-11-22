@@ -41,6 +41,7 @@ DATA="$(mktemp -d -t cicdkit-lume-test)"
 LOG="$(mktemp -t cicdkit-lume-test-log)"
 cd "$ROOT" || exit 1
 LUME_DATA="$DATA" RUNNER_BASE="$DEAD_RUNNER" CICD_DEPLOY_APPROVAL=approve CICD_HOOK_KEY=testkey \
+  CICDKIT_PEER_SHARED=gate-shared CICDKIT_PEER_NAME=cicdkit-lume \
   CICD_WORK_DIR="$DATA" CICD_FS_ROOTS="$DATA" \
   LUME_BIND=127.0.0.1 LUME_PORT="$PORT" \
   "$LUME" cicdkit_lume.lume >"$LOG" 2>&1 &
@@ -83,6 +84,23 @@ call_at() {
 
 # call <METHOD> <PATH> [BODY]
 call() { call_at "$BASE" "$@"; }
+
+# 按 peer 协议算签名 query（与 src/peer_auth.lume 同一套拼接）。
+#   sig = hmac_sha256(secret, node \n ts \n nonce \n scope)
+#   GET  scope = "GET <path>"；POST scope = "POST <path>\n<body>"
+PEER_NODE="${PEER_NODE:-cicdkit-lume}"
+sign_qs() { # <secret> <METHOD> <PATH> <BODY> <NONCE> → node=..&ts=..&nonce=..&sig=..
+  local secret="$1" method="$2" path="$3" body="$4" nonce="$5" ts scope msg
+  ts="$(date +%s)"
+  if [ -n "$body" ]; then
+    scope=$(printf '%s %s\n%s' "$method" "$path" "$body")
+  else
+    scope="$method $path"
+  fi
+  msg=$(printf '%s\n%s\n%s\n%s' "$PEER_NODE" "$ts" "$nonce" "$scope")
+  printf 'node=%s&ts=%s&nonce=%s&sig=%s' "$PEER_NODE" "$ts" "$nonce" \
+    "$(printf '%s' "$msg" | openssl dgst -sha256 -hmac "$secret" | awk '{print $NF}')"
+}
 
 expect_code() { # <期望> <说明>
   if [ "${CODE}" = "$1" ]; then ok "$2 → ${CODE}"; else ng "$2 → ${CODE}（期望 $1）：${BODY}"; fi
@@ -242,6 +260,7 @@ DATA2="$(mktemp -d -t cicdkit-lume-test2)"
 LOG2="$(mktemp -t cicdkit-lume-test2-log)"
 LUME_DATA="$DATA2" RUNNER_BASE="$DEAD_RUNNER" CICD_DEPLOY_APPROVAL=approve \
   CICD_ROLE_MAP='human_admin=hp1;agent_operator=op1' \
+  CICDKIT_PEER_ROOT=gate-root CICDKIT_PEER_PEERS=lume-a2a \
   CICD_WORK_DIR="$DATA2" CICD_FS_ROOTS="$DATA2" \
   LUME_BIND=127.0.0.1 LUME_PORT="$PORT2" \
   "$LUME" cicdkit_lume.lume >"$LOG2" 2>&1 &
@@ -266,6 +285,68 @@ expect_code 403 "口令绑定：声明的角色与口令不一致被拒"
 expect_body '不一致' "口令绑定：说明是角色不一致"
 call_at "$BASE2" POST "/api/projects/p1/deploy?pass=op1"
 expect_code 403 "口令绑定：操作员口令仍然不能 approve"
+
+# 8.6) A2A 标准面 + peer 签名面
+echo "▶ A2A 面"
+call GET "/.well-known/agent-card.json"
+expect_code 200 "A2A：agent card 公开可读"
+expect_body '"protocolVersion"' "A2A：card 带协议版本"
+expect_body 'cicd.overview' "A2A：card 声明五个能力"
+
+call GET "/a2a"
+expect_code 405 "A2A：GET /a2a 明确 405（不伪造无 Location 的 302）"
+
+call POST "/a2a" '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"contextId":"g1","metadata":{"capability":"cicd.overview","args":{}},"message":{"role":"user","parts":[{"kind":"text","text":"概览"}]}}}'
+expect_code 200 "A2A：message/send 200"
+expect_body '"state":"completed"' "A2A：只读能力正常完成"
+expect_body '"artifacts"' "A2A：结果落在 artifacts"
+
+call POST "/a2a" '{"jsonrpc":"2.0","id":2,"method":"message/send","params":{"metadata":{"capability":"cicd.delete_everything"}}}'
+expect_body '"state":"rejected"' "A2A：未知能力直接拒绝（不猜、不兜底）"
+
+call POST "/a2a" '{"jsonrpc":"2.0","id":3,"method":"tasks/nope"}'
+expect_body '-32601' "A2A：未知方法报 -32601"
+
+echo "▶ peer 签名面"
+call GET "/peer/health"
+expect_code 200 "peer：无签名仍 200"
+expect_body '"unauthorized":true' "peer：无签名说明 unauthorized"
+
+QS="$(sign_qs gate-shared GET /peer/health "" n1)"
+call GET "/peer/health?$QS"
+expect_body '"ok":true' "peer：合法签名通过"
+expect_body '"mode":"shared"' "peer：报出实际生效的凭据模式"
+
+QS="$(sign_qs wrong-secret GET /peer/health "" n2)"
+call GET "/peer/health?$QS"
+expect_body 'bad signature' "peer：错密钥被拒"
+
+QS="$(sign_qs gate-shared GET /peer/tools "" n3)"
+call GET "/peer/tools?$QS"
+expect_body '"ok":true' "peer：tools 签名通过"
+expect_body '"cicd.knowledge"' "peer：tools 列出只读能力"
+
+PBODY='{"tool":"cicd.overview","arguments":{}}'
+QS="$(sign_qs gate-shared POST /peer/invoke "$PBODY" n4)"
+call POST "/peer/invoke?$QS" "$PBODY"
+expect_body '"ok":true' "peer：invoke 只读能力成功"
+PBODY2='{"tool":"cicd.overview","arguments":{"x":1}}'
+call POST "/peer/invoke?$QS" "$PBODY2"
+expect_body 'bad signature' "peer：body 被改，签名即失效"
+
+QS="$(sign_qs gate-shared POST /peer/relay '{}' n5)"
+call POST "/peer/relay?$QS" '{}'
+expect_code 410 "peer：relay 已退役 410"
+
+echo "▶ peer 派生模式（第二实例：CICDKIT_PEER_ROOT + 节点注册表）"
+KEY="$(printf 'peer:%s' lume-a2a | openssl dgst -sha256 -hmac gate-root | awk '{print $NF}')"
+QS="$(PEER_NODE=lume-a2a sign_qs "$KEY" GET /peer/health "" d1)"
+call_at "$BASE2" GET "/peer/health?$QS"
+expect_body '"ok":true' "peer：按节点派生密钥通过"
+expect_body '"mode":"derived"' "peer：报出 derived 模式"
+QS="$(PEER_NODE=ghost sign_qs "$KEY" GET /peer/health "" d2)"
+call_at "$BASE2" GET "/peer/health?$QS"
+expect_body "unknown peer 'ghost'" "peer：未登记节点被拒（拿别人的名字签也冒充不了）"
 
 # 9) 静态站
 call GET "/"

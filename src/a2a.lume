@@ -1,0 +1,693 @@
+// src/a2a.lume — A2A 兼容面 + peer 签名面（取代 cicdkit/internal/a2a）
+//
+// 两个面并存，和上游一样：
+//   * 标准面：GET /.well-known/agent-card.json（公开发现）+ POST /a2a
+//     （JSON-RPC：message/send / tasks/get / tasks/cancel，任务落库可追溯）
+//   * 私有面：GET /peer/health + /peer/tools + POST /peer/invoke，HMAC 签名
+//     （src/peer_auth.lume，与 internal/a2a/peer.go 字节级一致）
+//
+// 五个能力全部**只读**：项目总览 / 最近运行 / 最近部署 / 知识库摘要 / 能力自述。
+// 不注册任何写入原语（触发流水线、删项目、SSH、registry 操作都不进 A2A 面）——
+// 对外暴露的口子越窄越好，发布必须走人工闸门。
+//
+// 任务存 SQLite（a2a_tasks 表）而不是上游的「一任务一文件」：Lume 没有
+// remove_file，文件方案会让任务目录只增不减；库里失败也只有一个 JSON 列要管。
+
+import "store.lume" as store;
+import "peer_auth.lume" as peer;
+
+// ---------- 任务表 ----------
+
+export func init() {
+  sql_write(store.db(), "CREATE TABLE IF NOT EXISTS a2a_tasks (id TEXT PRIMARY KEY, state TEXT, json TEXT, created_ts INTEGER, updated_ts INTEGER)");
+}
+
+// ---------- 小工具 ----------
+
+func jstr(m, k) {
+  if (m == null) { return ""; }
+  let v = get(m, k, null);
+  if (v == null) { return ""; }
+  return str(v);
+}
+
+func jint(m, k, def) {
+  if (m == null) { return def; }
+  let v = get(m, k, null);
+  if (v == null) { return def; }
+  let n = int(v);
+  if (n <= 0) { return def; }
+  return n;
+}
+
+func jmap(m, k) {
+  if (m == null) { return {}; }
+  let v = get(m, k, null);
+  if (v == null) { return {}; }
+  return v;
+}
+
+func jlist(m, k) {
+  if (m == null) { return []; }
+  let v = get(m, k, null);
+  if (v == null) { return []; }
+  return v;
+}
+
+func now_text() { return store.fmt_iso(now()); }
+
+// 同秒内连续建任务/消息要是拿到同一个 id，会互相覆盖（INSERT OR REPLACE 静默
+// 吃掉前一条）。模块级 map 可变，所以用 put() 计数。
+let g_a2a = { n: 0 };
+
+func next_id(kind) {
+  put(g_a2a, "n", int(get(g_a2a, "n", 0)) + 1);
+  let digest = sha256(peer.name() + kind + str(now()) + ":" + str(int(get(g_a2a, "n", 0))));
+  if (kind == "task") { return substr(digest, 0, 24); }
+  return substr(digest, 0, 20);
+}
+
+// ---------- 能力表 ----------
+
+export func caps() {
+  return [
+    {
+      name: "cicd.overview",
+      title: "项目总览",
+      desc: "当前有多少个受管项目、最近一次构建/部署状态、活跃 run 数",
+      tag: "status",
+      when_to_use: "问『管着几个项目』『最近发布成功没』时用。",
+      args_example: "{}",
+    },
+    {
+      name: "cicd.recent_runs",
+      title: "最近构建记录",
+      desc: "最近 N 条 pipeline run 的状态/阶段/耗时（不含原始日志）",
+      tag: "history",
+      when_to_use: "问『最近 5 次构建什么状态』『哪个阶段挂了』时用。",
+      args_example: "{\"limit\":5}",
+    },
+    {
+      name: "cicd.deployments",
+      title: "最近部署记录",
+      desc: "最近 N 条部署历史（镜像版本/目标集群/探测结果）",
+      tag: "history",
+      when_to_use: "问『最近部署到了哪个集群』『镜像版本』时用。",
+      args_example: "{\"limit\":5}",
+    },
+    {
+      name: "cicd.knowledge",
+      title: "AI 诊断知识库",
+      desc: "已采纳的 AI 故障诊断条目（错误模式 → 修复方案）",
+      tag: "diagnosis",
+      when_to_use: "问『之前遇到过类似报错』『知识库有几条采纳的诊断』时用。",
+      args_example: "{}",
+    },
+    {
+      name: "cicd.capabilities",
+      title: "能力清单",
+      desc: "本节点当前注册的所有 A2A 能力（meta 自描述）",
+      tag: "meta",
+      when_to_use: "问『这个节点能做什么』时用。",
+      args_example: "{}",
+    },
+  ];
+}
+
+export func cap_names() {
+  let all = caps();
+  let out = [];
+  let i = 0;
+  while (i < len(all)) { push(out, str(get(all[i], "name", ""))); i = i + 1; }
+  return out;
+}
+
+func cap_exists(name) {
+  let n = trim(str(name));
+  let all = caps();
+  let i = 0;
+  while (i < len(all)) {
+    if (str(get(all[i], "name", "")) == n) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// ---------- Agent Card ----------
+
+export func base_url() {
+  let u1 = env("CICDKIT_A2A_PUBLIC_URL");
+  let u2 = env("A2A_PUBLIC_URL");
+  let u = "";
+  if (u1 != null) { u = trim(str(u1)); }
+  if (len(u) == 0 and u2 != null) { u = trim(str(u2)); }
+  if (len(u) > 0) {
+    while (len(u) > 1 and substr(u, len(u) - 1, 1) == "/") { u = substr(u, 0, len(u) - 1); }
+    return u;
+  }
+  // 读不到请求头（也就读不到 Host），只能拿配置里的端口拼一个本机地址。
+  // 对外发布时务必设 CICDKIT_A2A_PUBLIC_URL，否则 card 里的 url 不可达。
+  let port = env("LUME_PORT");
+  let p = "8096";
+  if (port != null) {
+    let s = trim(str(port));
+    if (len(s) > 0) { p = s; }
+  }
+  return "http://127.0.0.1:" + p;
+}
+
+export func card() {
+  let base = base_url();
+  let skills = [];
+  let all = caps();
+  let i = 0;
+  while (i < len(all)) {
+    let c = all[i];
+    let tag = jstr(c, "tag");
+    if (len(tag) == 0) { tag = "general"; }
+    push(skills, {
+      id: jstr(c, "name"),
+      name: jstr(c, "title"),
+      description: jstr(c, "desc"),
+      tags: [tag],
+      examples: [jstr(c, "args_example")],
+    });
+    i = i + 1;
+  }
+  return {
+    name: peer.name(),
+    description: "cicdkit 能力节点：CI/CD 发布管理平台的项目/构建/部署/探测/知识库查询。只读，不提供写入。",
+    version: "1.0.0",
+    protocolVersion: "1.0",
+    supportedInterfaces: [
+      { protocolVersion: "1.0", protocolBinding: "JSONRPC", url: base + "/a2a" },
+    ],
+    url: base + "/a2a",
+    capabilities: { streaming: false, pushNotifications: false },
+    defaultInputModes: ["text/plain", "application/json"],
+    defaultOutputModes: ["text/plain", "application/json"],
+    skills: skills,
+  };
+}
+
+// ---------- 能力实现（只读） ----------
+
+func stage_brief(run) {
+  let stages = get(run, "stages", null);
+  let out = [];
+  if (stages == null) { return out; }
+  let i = 0;
+  while (i < len(stages)) {
+    let s = stages[i];
+    if (s != null) {
+      push(out, { name: jstr(s, "name"), status: jstr(s, "status") });
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 按时间倒序。Lume 的 `>` 只吃数字（字符串比较没有内建），所以排序键用
+// created_ts（运行记录里一定有；部署记录的 json 可能没有，缺了当 0）。
+// 列表最多几十条，用「每轮挑最大再标记已取」的选择排序：列表下标不能赋值，
+// 只能 push。键相同就保持原序 —— 而原序已经是 SQL 的 created_ts DESC。
+func sort_recent(list) {
+  let n = len(list);
+  let seen = {};
+  let out = [];
+  let k = 0;
+  while (k < n) {
+    let best = -1;
+    let i = 0;
+    while (i < n) {
+      if (not get(seen, str(i), false)) {
+        if (best < 0) { best = i; }
+        else if (jint(list[i], "created_ts", 0) > jint(list[best], "created_ts", 0)) { best = i; }
+      }
+      i = i + 1;
+    }
+    if (best < 0) { k = n; }
+    else {
+      push(out, list[best]);
+      put(seen, str(best), true);
+      k = k + 1;
+    }
+  }
+  return out;
+}
+
+// 取前 n 条（没有 slice 内建）
+func take_first(list, n) {
+  let out = [];
+  let i = 0;
+  while (i < len(list) and i < n) { push(out, list[i]); i = i + 1; }
+  return out;
+}
+
+func cap_overview() {
+  let page = store.list_projects("", 500, 0);
+  let ps = jlist(page, "projects");
+  let stats = { success: 0, failed: 0, running: 0, canceled: 0 };
+  let last = [];
+  let names = [];
+  let i = 0;
+  while (i < len(ps)) {
+    let p = ps[i];
+    let pid = jstr(p, "id");
+    let pname = jstr(p, "name");
+    push(names, pname);
+    let runs = jlist(store.list_runs(pid, 1, 0), "runs");
+    if (len(runs) > 0) {
+      let r = runs[0];
+      let st = jstr(r, "status");
+      if (st == "success") { put(stats, "success", int(get(stats, "success", 0)) + 1); }
+      if (st == "failed") { put(stats, "failed", int(get(stats, "failed", 0)) + 1); }
+      if (st == "running") { put(stats, "running", int(get(stats, "running", 0)) + 1); }
+      if (st == "canceled") { put(stats, "canceled", int(get(stats, "canceled", 0)) + 1); }
+      push(last, {
+        project: pname,
+        status: st,
+        image_tag: jstr(r, "image_tag"),
+        stages: stage_brief(r),
+      });
+    }
+    i = i + 1;
+  }
+  return {
+    project_count: len(ps),
+    projects: names,
+    run_status: stats,
+    last_runs: last,
+    active_tasks: active_count(),
+  };
+}
+
+func cap_recent_runs(limit) {
+  let page = store.list_projects("", 500, 0);
+  let ps = jlist(page, "projects");
+  let all = [];
+  let i = 0;
+  while (i < len(ps)) {
+    let p = ps[i];
+    let runs = jlist(store.list_runs(jstr(p, "id"), limit, 0), "runs");
+    let k = 0;
+    while (k < len(runs)) {
+      let r = runs[k];
+      push(all, {
+        id: jstr(r, "id"),
+        project: jstr(p, "name"),
+        trigger: jstr(r, "trigger"),
+        image_tag: jstr(r, "image_tag"),
+        status: jstr(r, "status"),
+        stages: stage_brief(r),
+        created_at: jstr(r, "created_at"),
+        duration_ms: duration_ms(r),
+      });
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  all = sort_recent(all);
+  all = take_first(all, limit);
+  return { count: len(all), runs: all };
+}
+
+// 耗时用库里的 started_ts / ended_ts（整数秒）；Lume 没有日期解析内建，
+// 所以不去解析 ISO 字符串 —— 拿不到就报 0，不编造一个看起来像真的耗时。
+func duration_ms(run) {
+  let a = jint(run, "started_ts", 0);
+  let b = jint(run, "ended_ts", 0);
+  if (a <= 0 or b <= 0 or b < a) { return 0; }
+  return (b - a) * 1000;
+}
+
+func cap_deployments(limit) {
+  let page = store.list_projects("", 500, 0);
+  let ps = jlist(page, "projects");
+  let all = [];
+  let i = 0;
+  while (i < len(ps)) {
+    let p = ps[i];
+    let ds = jlist(store.list_deployments(jstr(p, "id"), limit, 0), "deployments");
+    let k = 0;
+    while (k < len(ds)) {
+      let d = ds[k];
+      let probe = jmap(d, "probe");
+      push(all, {
+        id: jstr(d, "id"),
+        project: jstr(p, "name"),
+        image_ref: jstr(d, "image_ref"),
+        cluster: jstr(d, "cluster"),
+        namespace: jstr(d, "namespace"),
+        method: jstr(d, "method"),
+        target: jstr(d, "target"),
+        status: jstr(d, "status"),
+        probe_status: jstr(probe, "status"),
+        probe_url: jstr(probe, "url"),
+        created_at: jstr(d, "created_at"),
+      });
+      k = k + 1;
+    }
+    i = i + 1;
+  }
+  all = sort_recent(all);
+  all = take_first(all, limit);
+  return { count: len(all), deployments: all };
+}
+
+// 只给摘要：完整 diagnosis 和 error_excerpt 可能含 IP/路径/密钥痕迹。
+func cap_knowledge() {
+  let entries = jlist(store.list_kb("", 50), "entries");
+  let out = [];
+  let i = 0;
+  while (i < len(entries)) {
+    let e = entries[i];
+    push(out, {
+      id: jstr(e, "id"),
+      project: jstr(e, "project_name"),
+      stage: jstr(e, "stage"),
+      error_keyword: jstr(e, "error_keyword"),
+      diagnosis_len: len(jstr(e, "diagnosis")),
+      adopted_count: jint(e, "adopted_count", 0),
+      adopted_at: jstr(e, "adopted_at"),
+    });
+    i = i + 1;
+  }
+  return { count: len(out), entries: out };
+}
+
+func cap_capabilities() {
+  let all = caps();
+  let out = [];
+  let i = 0;
+  while (i < len(all)) {
+    let c = all[i];
+    push(out, {
+      name: jstr(c, "name"),
+      title: jstr(c, "title"),
+      desc: jstr(c, "desc"),
+      tag: jstr(c, "tag"),
+      when_to_use: jstr(c, "when_to_use"),
+    });
+    i = i + 1;
+  }
+  return { count: len(out), capabilities: out };
+}
+
+// 分发 → { state, note, result }。result 为 null 表示没有结构化产物。
+export func dispatch(name, args) {
+  let cap = trim(str(name));
+  if (not cap_exists(cap)) {
+    return { state: "rejected", note: "unknown capability '" + cap + "'", result: null };
+  }
+  if (cap == "cicd.overview") { return { state: "completed", note: "ok", result: cap_overview() }; }
+  if (cap == "cicd.recent_runs") {
+    let limit = jint(args, "limit", 5);
+    if (limit > 50) { limit = 50; }
+    return { state: "completed", note: "ok", result: cap_recent_runs(limit) };
+  }
+  if (cap == "cicd.deployments") {
+    let limit = jint(args, "limit", 5);
+    if (limit > 50) { limit = 50; }
+    return { state: "completed", note: "ok", result: cap_deployments(limit) };
+  }
+  if (cap == "cicd.knowledge") { return { state: "completed", note: "ok", result: cap_knowledge() }; }
+  if (cap == "cicd.capabilities") { return { state: "completed", note: "ok", result: cap_capabilities() }; }
+  return { state: "rejected", note: "unknown capability '" + cap + "'", result: null };
+}
+
+// ---------- 任务 ----------
+
+func save_task(t) {
+  let id = jstr(t, "id");
+  if (len(id) == 0) { return { ok: false, err: "empty task id" }; }
+  let st = jstr(get(t, "status", null), "state");
+  let r = try(() => sql_write(store.db(),
+    "INSERT OR REPLACE INTO a2a_tasks (id, state, json, created_ts, updated_ts) VALUES (?,?,?,?,?)",
+    [id, st, stringify(t), int(get(t, "created", 0)), int(get(t, "updated", 0))]));
+  if (r.err != null) { return { ok: false, err: str(r.err) }; }
+  return { ok: true, err: "" };
+}
+
+export func load_task(id) {
+  let s = trim(str(id));
+  if (len(s) == 0) { return null; }
+  if (len(s) > 64) { return null; }
+  let rows = sql_query(store.db(), "SELECT json FROM a2a_tasks WHERE id = ?", [s]);
+  if (len(rows) == 0) { return null; }
+  return store.parse_json(get(rows[0], "json", ""), null);
+}
+
+export func active_count() {
+  let rows = sql_query(store.db(),
+    "SELECT COUNT(*) AS n FROM a2a_tasks WHERE state IN ('submitted','working','input-required')", []);
+  if (len(rows) == 0) { return 0; }
+  return int(get(rows[0], "n", 0));
+}
+
+func new_task(capability, text, ctx_id, hops) {
+  let ctx = str(ctx_id);
+  if (len(ctx) == 0) { ctx = next_id("msg"); }
+  let now_s = int(now());
+  return {
+    id: next_id("task"),
+    contextId: ctx,
+    kind: "task",
+    status: { state: "submitted", timestamp: now_text() },
+    artifacts: [],
+    history: [
+      { role: "user", messageId: next_id("msg"), kind: "message", parts: [{ kind: "text", text: str(text) }] },
+    ],
+    metadata: {
+      capability: str(capability),
+      hops: hops,
+      trace: [{ node: peer.name(), at: now_s, cap: str(capability), note: "accepted" }],
+      args: {},
+    },
+    node: peer.name(),
+    created: now_s,
+    updated: now_s,
+  };
+}
+
+func is_terminal(state) {
+  if (state == "completed" or state == "failed" or state == "canceled" or state == "rejected") { return true; }
+  return false;
+}
+
+func advance(t, state, note, result) {
+  put(t, "status", { state: state, timestamp: now_text() });
+  let trace = get(get(t, "metadata", {}), "trace", []);
+  push(trace, { node: peer.name(), at: int(now()), note: str(note), cap: jstr(get(t, "metadata", {}), "capability") });
+  put(get(t, "metadata", {}), "trace", trace);
+  if (result != null) {
+    put(t, "artifacts", [
+      { artifactId: next_id("art"), parts: [{ kind: "text", text: stringify(result) }] },
+    ]);
+  }
+  put(t, "updated", int(now()));
+  return t;
+}
+
+func message_text(params) {
+  let msg = get(params, "message", null);
+  let parts = jlist(msg, "parts");
+  let out = [];
+  let i = 0;
+  while (i < len(parts)) {
+    let p = parts[i];
+    let kind = jstr(p, "kind");
+    if (len(kind) == 0 or kind == "text") { push(out, jstr(p, "text")); }
+    i = i + 1;
+  }
+  return join(out, "\n");
+}
+
+// ---------- JSON-RPC ----------
+
+func rpc_result(id, result) { return { jsonrpc: "2.0", id: id, result: result }; }
+func rpc_error(id, code, msg) { return { jsonrpc: "2.0", id: id, error: { code: code, message: str(msg) } }; }
+
+func handle_send(rpc) {
+  let id = get(rpc, "id", null);
+  let params = get(rpc, "params", null);
+  if (params == null) { params = {}; }
+  let msg = get(params, "message", null);
+  let text = message_text(params);
+  let resume = jstr(params, "id");
+  if (len(resume) == 0) { resume = jstr(msg, "taskId"); }
+  let metadata = get(params, "metadata", null);
+  if (metadata == null) { metadata = {}; }
+  let cap = jstr(metadata, "capability");
+  let args = get(metadata, "args", null);
+  if (args == null) { args = {}; }
+  let hops = jint(metadata, "hops", 0);
+
+  // 续跑：上游语义是「只有 input-required 才能补参数」，终结/处理中都不许。
+  if (len(resume) > 0) {
+    let old = load_task(resume);
+    if (old == null) { return { status: 200, body: rpc_error(id, -32001, "task not found: " + resume) }; }
+    let st = jstr(get(old, "status", null), "state");
+    if (is_terminal(st)) {
+      return { status: 200, body: rpc_error(id, -32004, "任务已终结(" + st + "), 不可恢复") };
+    }
+    if (st != "input-required") {
+      return { status: 200, body: rpc_error(id, -32005, "任务正在处理中(" + st + "), 无需补充") };
+    }
+    let hist = get(old, "history", []);
+    push(hist, { role: "user", messageId: next_id("msg"), kind: "message", parts: [{ kind: "text", text: text }] });
+    put(old, "history", hist);
+    if (len(cap) == 0 or cap == "unknown") { cap = jstr(get(old, "metadata", {}), "capability"); }
+    let merged = {};
+    let prev = get(get(old, "metadata", {}), "args", null);
+    if (prev != null) { merged = prev; }
+    let keys = keys(args);
+    let i = 0;
+    while (i < len(keys)) { put(merged, str(keys[i]), get(args, keys[i], null)); i = i + 1; }
+    put(get(old, "metadata", {}), "args", merged);
+    put(get(old, "metadata", {}), "capability", cap);
+    let res = dispatch(cap, merged);
+    advance(old, jstr(res, "state"), str(get(res, "note", "")), get(res, "result", null));
+    return { status: 200, body: rpc_result(id, old) };
+  }
+
+  let t = new_task(cap, text, jstr(params, "contextId"), hops);
+  put(get(t, "metadata", {}), "args", args);
+  if (len(cap) == 0) {
+    advance(t, "input-required", "请指定 capability: " + join(cap_names(), ", "), null);
+    save_task(t);
+    return { status: 200, body: rpc_result(id, t) };
+  }
+  if (not cap_exists(cap)) {
+    advance(t, "rejected", "unknown capability '" + cap + "'", null);
+    save_task(t);
+    return { status: 200, body: rpc_result(id, t) };
+  }
+  advance(t, "working", "dispatch " + cap, null);
+  save_task(t);
+  let res = dispatch(cap, args);
+  advance(t, str(get(res, "state", "completed")), str(get(res, "note", "")), get(res, "result", null));
+  save_task(t);
+  return { status: 200, body: rpc_result(id, t) };
+}
+
+export func rpc(req) {
+  let raw = get(req, "body", null);
+  let body = "";
+  if (raw != null) { body = str(raw); }
+  let parsed = store.parse_json(body, null);
+  if (parsed == null) {
+    return { status: 200, body: rpc_error(null, -32700, "parse error") };
+  }
+  let method = jstr(parsed, "method");
+  if (method == "message/send" or method == "tasks/send") { return handle_send(parsed); }
+  if (method == "tasks/get" or method == "GetTask") {
+    let params = get(parsed, "params", null);
+    let task_id = jstr(params, "id");
+    if (len(task_id) == 0) { task_id = jstr(get(params, "message", null), "taskId"); }
+    let t = load_task(task_id);
+    if (t == null) { return { status: 200, body: rpc_error(get(parsed, "id", null), -32001, "task not found: " + task_id) }; }
+    return { status: 200, body: rpc_result(get(parsed, "id", null), t) };
+  }
+  if (method == "tasks/cancel" or method == "CancelTask") {
+    let params = get(parsed, "params", null);
+    let task_id = jstr(params, "id");
+    if (len(task_id) == 0) { task_id = jstr(get(params, "message", null), "taskId"); }
+    let t = load_task(task_id);
+    if (t == null) { return { status: 200, body: rpc_error(get(parsed, "id", null), -32001, "task not found: " + task_id) }; }
+    let st = jstr(get(t, "status", null), "state");
+    if (is_terminal(st)) {
+      return { status: 200, body: rpc_error(get(parsed, "id", null), -32002, "task not cancelable (state=" + st + ")") };
+    }
+    advance(t, "canceled", "canceled", null);
+    save_task(t);
+    return { status: 200, body: rpc_result(get(parsed, "id", null), t) };
+  }
+  return { status: 200, body: rpc_error(get(parsed, "id", null), -32601, "method not found: " + method) };
+}
+
+// ---------- peer 签名面 ----------
+
+func unauthorized(v) {
+  return { status: 200, body: { ok: false, unauthorized: true, error: str(get(v, "error", "unauthorized")) } };
+}
+
+export func peer_health(req) {
+  let v = peer.verify_get(req);
+  if (not get(v, "ok", false)) { return unauthorized(v); }
+  return {
+    ok: true,
+    node: peer.name(),
+    site: "cicdkit",
+    peer: jstr(v, "node"),
+    ts: int(now()),
+    mode: peer.mode(),
+    caps: len(caps()),
+  };
+}
+
+export func peer_tools(req) {
+  let v = peer.verify_get(req);
+  if (not get(v, "ok", false)) { return unauthorized(v); }
+  let all = caps();
+  let tools = [];
+  let i = 0;
+  while (i < len(all)) {
+    let c = all[i];
+    push(tools, { name: jstr(c, "name"), desc: jstr(c, "desc"), when_to_use: jstr(c, "when_to_use") });
+    i = i + 1;
+  }
+  return {
+    ok: true,
+    node: peer.name(),
+    site: "cicdkit",
+    summary: "CI/CD 发布平台的项目/构建/部署/探测/知识库查询（只读）。问『最近发了什么』『构建挂了没』『探测通不通』用这里。",
+    tools: tools,
+  };
+}
+
+export func peer_invoke(req) {
+  let raw = get(req, "body", null);
+  let body = "";
+  if (raw != null) { body = str(raw); }
+  let v = peer.verify_post(req);
+  if (not get(v, "ok", false)) { return unauthorized(v); }
+  let parsed = store.parse_json(body, null);
+  if (parsed == null) {
+    return { status: 400, body: { ok: false, error: "body 不是合法 JSON" } };
+  }
+  let tool_name = jstr(parsed, "tool");
+  if (len(tool_name) == 0) {
+    return { status: 400, body: { ok: false, error: "缺少 tool 字段" } };
+  }
+  let args = get(parsed, "arguments", null);
+  if (args == null) { args = {}; }
+  if (not cap_exists(tool_name)) {
+    return { status: 200, body: { ok: false, "tool": tool_name, error: "unknown tool '" + tool_name + "'" } };
+  }
+  let res = dispatch(tool_name, args);
+  let state = jstr(res, "state");
+  return {
+    ok: state == "completed",
+    node: peer.name(),
+    "tool": tool_name,
+    state: state,
+    result: get(res, "result", null),
+    note: jstr(res, "note"),
+  };
+}
+
+export func peer_relay(req) {
+  let v = peer.verify_post(req);
+  if (not get(v, "ok", false)) { return unauthorized(v); }
+  return {
+    status: 410,
+    body: {
+      status: 410,
+      ok: false,
+      node: peer.name(),
+      error: "relay 已退役",
+      hint: "请改用 POST /peer/invoke 直接调用本节点的能力",
+    },
+  };
+}

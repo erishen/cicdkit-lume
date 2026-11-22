@@ -1,0 +1,158 @@
+// scripts/a2a_test.lume — A2A 面 + peer 签名面自测（不启服务器）
+//
+//   LUME_DATA=/tmp/xxx CICDKIT_PEER_SHARED=test-shared \
+//     ./vendor/lume/bin/lume scripts/a2a_test.lume
+//
+// 覆盖：能力表形状、Agent Card、五个只读能力的分发与边界（未知能力拒绝、
+// limit 上限）、任务落库往返/续跑状态机、签名校验（正确/错误/时间窗/缺参）
+// 以及六个端点的 handler 返回值。签名正确性用 openssl 之外的路子验：
+// 这里用同一个 hmac_sha256 内建按协议手算，和 /peer/health 的实现在同一条链上。
+
+import "../src/a2a.lume" as a2a;
+import "../src/peer_auth.lume" as peer;
+import "../src/store.lume" as store;
+
+let st = { fails: 0, checks: 0 };
+func ok(label, cond) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (cond) {
+    print("  ok  " + label);
+  } else {
+    print("  FAIL " + label);
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+  }
+}
+
+print("a2a: init");
+store.init();
+a2a.init();
+let p = { id: "proj-a2a", name: "a2a-demo", description: "自测",
+          build: { context: "/tmp/a2a", image_repo: "a2a-demo", tag_strategy: "timestamp" },
+          deploy: { method: "ssh" } };
+store.put_project(p, true);
+store.put_run({ id: "run-a2a-1", project_id: "proj-a2a", project_name: "a2a-demo",
+                trigger: "manual", image_tag: "t1", status: "success",
+                created_at: "2026-11-20T10:00:00Z", created_ts: 100,
+                started_ts: 100, ended_ts: 160, stages: [{ name: "build", status: "success" }] });
+store.put_run({ id: "run-a2a-2", project_id: "proj-a2a", project_name: "a2a-demo",
+                trigger: "webhook", image_tag: "t2", status: "failed",
+                created_at: "2026-11-21T10:00:00Z", created_ts: 200,
+                started_ts: 200, ended_ts: 205, stages: [{ name: "build", status: "failed" }] });
+store.put_deployment({ id: "dep-a2a-1", project_id: "proj-a2a", project_name: "a2a-demo",
+                       image_ref: "a2a-demo:t2", method: "ssh", status: "deployed",
+                       probe: { status: "ok", url: "http://127.0.0.1:1/x" },
+                       created_at: "2026-11-21T10:05:00Z" });
+store.put_kb({ id: "kb-a2a-1", project_id: "proj-a2a", project_name: "a2a-demo", stage: "build",
+              error_keyword: "no such file", diagnosis: "Dockerfile 路径写错", adopted_count: 1 });
+
+// ---- 能力表 ----
+print("a2a: capabilities");
+let names = a2a.cap_names();
+ok("五个能力", len(names) == 5);
+ok("含 cicd.overview", a2a.cap_names()[0] == "cicd.overview");
+
+// ---- Agent Card ----
+print("a2a: agent card");
+let card = a2a.card();
+ok("protocolVersion 1.0", get(card, "protocolVersion", "") == "1.0");
+ok("skills 5 条", len(get(card, "skills", [])) == 5);
+ok("url 指向 /a2a", substr(str(get(card, "url", "")), len(str(get(card, "url", ""))) - 4, 4) == "/a2a");
+ok("streaming=false", get(get(card, "capabilities", {}), "streaming", true) == false);
+
+// ---- 分发 ----
+print("a2a: dispatch");
+let ov = a2a.dispatch("cicd.overview", {});
+ok("overview completed", get(ov, "state", "") == "completed");
+ok("overview 项目数", get(get(ov, "result", {}), "project_count", 0) == 1);
+let rr = a2a.dispatch("cicd.recent_runs", { limit: 5 });
+ok("recent_runs completed", get(rr, "state", "") == "completed");
+ok("recent_runs 两条", get(get(rr, "result", {}), "count", 0) == 2);
+ok("recent_runs 按时间倒序", str(get(get(get(rr, "result", {}), "runs", [])[0], "id", "")) == "run-a2a-2");
+ok("recent_runs 耗时算出", get(get(get(rr, "result", {}), "runs", [])[1], "duration_ms", 0) == 60000);
+let dp = a2a.dispatch("cicd.deployments", {});
+ok("deployments 一条", get(get(dp, "result", {}), "count", 0) == 1);
+ok("deployments 带探测状态", str(get(get(get(dp, "result", {}), "deployments", [])[0], "probe_status", "")) == "ok");
+let kb = a2a.dispatch("cicd.knowledge", {});
+ok("knowledge 一条", get(get(kb, "result", {}), "count", 0) == 1);
+ok("knowledge 只给摘要（diagnosis_len）", get(get(get(kb, "result", {}), "entries", [])[0], "diagnosis_len", 0) > 0);
+let bad = a2a.dispatch("cicd.delete_all", {});
+ok("未知能力被拒", get(bad, "state", "") == "rejected");
+ok("未知能力不产出", get(bad, "result", null) == null);
+let caps_r = a2a.dispatch("cicd.capabilities", {});
+ok("capabilities 自述 5 条", get(get(caps_r, "result", {}), "count", 0) == 5);
+
+// ---- 任务状态机 ----
+print("a2a: tasks");
+let send = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"message/send\",\"params\":{\"contextId\":\"c1\",\"metadata\":{\"capability\":\"cicd.overview\"},\"message\":{\"role\":\"user\",\"parts\":[{\"kind\":\"text\",\"text\":\"概览\"}]}}}" });
+ok("rpc 返回 200", get(send, "status", 0) == 200);
+let task = get(get(send, "body", {}), "result", null);
+let tid = str(get(task, "id", ""));
+ok("任务完成", str(get(get(task, "status", {}), "state", "")) == "completed");
+ok("任务有 artifact", len(get(task, "artifacts", [])) == 1);
+ok("任务能重新读出来", a2a.load_task(tid) != null);
+let get_rpc = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tasks/get\",\"params\":{\"id\":\"" + tid + "\"}}" });
+ok("tasks/get 命中", str(get(get(get(get_rpc, "body", {}), "result", null), "id", "")) == tid);
+let cancel_rpc = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tasks/cancel\",\"params\":{\"id\":\"" + tid + "\"}}" });
+ok("终结任务不能取消", get(get(get(cancel_rpc, "body", {}), "error", {}), "code", 0) == -32002);
+let miss_rpc = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":12,\"method\":\"tasks/get\",\"params\":{\"id\":\"ghost\"}}" });
+ok("缺任务报 -32001", get(get(get(miss_rpc, "body", {}), "error", {}), "code", 0) == -32001);
+let no_cap = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":13,\"method\":\"message/send\",\"params\":{\"message\":{\"role\":\"user\",\"parts\":[]}}}" });
+ok("没指定能力 → input-required", str(get(get(get(get(no_cap, "body", {}), "result", null), "status", {}), "state", "")) == "input-required");
+let parse_err = a2a.rpc({ body: "{not json" });
+ok("坏 JSON 报 -32700", get(get(get(parse_err, "body", {}), "error", {}), "code", 0) == -32700);
+let unknown_m = a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"nope\"}" });
+ok("未知方法报 -32601", get(get(get(unknown_m, "body", {}), "error", {}), "code", 0) == -32601);
+
+// ---- 签名 ----
+print("a2a: peer auth");
+ok("shared 模式", peer.mode() == "shared");
+let ts = str(int(now()));
+let node = peer.name();
+let scope = "GET /peer/health";
+let sig = hmac_sha256("test-shared", peer.signing_string(node, ts, "n1", scope));
+let good = { path: "/peer/health", query_params: { node: node, ts: ts, nonce: "n1", sig: sig }, body: null };
+let v1 = peer.verify_get(good);
+ok("正确签名通过", get(v1, "ok", false) == true);
+let wrong = { path: "/peer/health", query_params: { node: node, ts: ts, nonce: "n1", sig: "deadbeef" }, body: null };
+ok("错签名被拒", get(peer.verify_get(wrong), "ok", true) == false);
+let bare = { path: "/peer/health", query_params: {}, body: null };
+let v3 = peer.verify_get(bare);
+ok("缺参数被拒", get(v3, "ok", true) == false);
+ok("缺参数说清参数名", len(str_match("node/ts/nonce/sig", str(get(v3, "error", "")))) > 0);
+let old_ts = str(int(now()) - 600);
+let old_sig = hmac_sha256("test-shared", peer.signing_string(node, old_ts, "n2", scope));
+let old = { path: "/peer/health", query_params: { node: node, ts: old_ts, nonce: "n2", sig: old_sig }, body: null };
+ok("过期 ts 被拒", get(peer.verify_get(old), "ok", true) == false);
+
+let health = a2a.peer_health(good);
+ok("peer_health ok", get(health, "ok", false) == true);
+ok("peer_health 报 shared", str(get(health, "mode", "")) == "shared");
+ok("peer_health 报能力数", get(health, "caps", 0) == 5);
+let unauth = a2a.peer_health(bare);
+ok("无签名 unauthorized", get(get(unauth, "body", {}), "unauthorized", false) == true);
+
+let tools = a2a.peer_tools(good);
+ok("peer_tools 五个", len(get(tools, "tools", [])) == 5);
+
+// POST 签名：body 参与 scope，改一个字节就该失败
+let payload = "{\"tool\":\"cicd.capabilities\",\"arguments\":{}}";
+let post_scope = "POST /peer/invoke\n" + payload;
+let psig = hmac_sha256("test-shared", peer.signing_string(node, ts, "n3", post_scope));
+let preq = { path: "/peer/invoke", query_params: { node: node, ts: ts, nonce: "n3", sig: psig }, body: payload };
+let inv = a2a.peer_invoke(preq);
+ok("peer_invoke 成功", get(inv, "ok", false) == true);
+ok("peer_invoke 返回结果", get(get(inv, "result", {}), "count", 0) == 5);
+let tampered = { path: "/peer/invoke", query_params: { node: node, ts: ts, nonce: "n3", sig: psig }, body: payload + " " };
+ok("body 被改即拒", str(get(get(a2a.peer_invoke(tampered), "body", {}), "error", "")) != "");
+let no_tool = { path: "/peer/invoke", query_params: { node: node, ts: ts, nonce: "n4", sig: hmac_sha256("test-shared", peer.signing_string(node, ts, "n4", "POST /peer/invoke\n{}")) }, body: "{}" };
+ok("缺 tool 报 400", get(a2a.peer_invoke(no_tool), "status", 0) == 400);
+let relay = a2a.peer_relay(preq);
+ok("relay 已退役 410", get(relay, "status", 0) == 410);
+
+// ---- 汇总 ----
+print("");
+print("checks=" + str(get(st, "checks", 0)) + " fails=" + str(get(st, "fails", 0)));
+if (int(get(st, "fails", 0)) > 0) {
+  print("有失败项");
+  // 没有 exit() 内建：非零退出由外层 Makefile/调用方按输出判定
+}

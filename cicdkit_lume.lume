@@ -61,10 +61,12 @@ server {
 import "src/app_api.lume" as api;
 import "src/store.lume" as store;
 import "src/guard.lume" as guard;
+import "src/a2a.lume" as a2a;
 
 // ---------- 启动期：把库建好，必要时把 cicdkit 的历史数据搬进来 ----------
 // 只搬一次：import_legacy() 用 empty() 判空，库里已有内容就跳过。
 store.init();
+a2a.init();
 let lc_imp = store.import_legacy();
 if (get(lc_imp, "imported", false)) {
   print("legacy import: " + stringify(lc_imp));
@@ -122,6 +124,34 @@ get "/api/version", (req) => {
 get "/api/overview", (req) => {
   return { status: 200, body: api.overview() };
 };
+
+// ---------- A2A 标准面 + peer 签名面 ----------
+// 六个端点与上游 cicdkit/internal/a2a 同形：card 公开发现、/a2a 走 JSON-RPC、
+// /peer/* 走 HMAC 签名（未配 CICDKIT_PEER_SHARED/ROOT 时整面 fail-closed 关闭）。
+// 能力全只读，任何写入（发布/删除/SSH）都不在这两面里。
+get "/.well-known/agent-card.json", (req) => {
+  return { status: 200, body: a2a.card() };
+};
+
+// 上游这里是 302 到 "/"，但 Lume 的路由信封只能改 status/type/cache_control，
+// 发不出 Location 头 —— 与其给一个没有 Location 的 302（客户端会当成坏响应），
+// 不如明确回 405 并说清怎么用。
+get "/a2a", (req) => {
+  return {
+    status: 405,
+    body: {
+      ok: false,
+      error: "GET /a2a 不支持：JSON-RPC 走 POST /a2a，只读发现走 GET /.well-known/agent-card.json",
+    },
+  };
+};
+
+post "/a2a", (req) => { return a2a.rpc(req); };
+
+get "/peer/health", (req) => { return a2a.peer_health(req); };
+get "/peer/tools", (req) => { return a2a.peer_tools(req); };
+post "/peer/invoke", (req) => { return a2a.peer_invoke(req); };
+post "/peer/relay", (req) => { return a2a.peer_relay(req); };
 
 // ---------- webhook（外部 CI 触发，不受角色闸门，用自己的 key 校验）----------
 post "/api/webhook/:id", (req) => {

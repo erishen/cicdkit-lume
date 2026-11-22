@@ -1,0 +1,201 @@
+// src/peer_auth.lume — 节点间签名校验（与 cicdkit 的 internal/a2a/peer.go 同协议）
+//
+// 协议细节一个字都不能改：signing_string / scope 拼接 / 密钥派生公式已经出现在
+// 在跑的所有节点之间（lume-a2a / tsm-hub / cicdkit …），任一侧改动都会让全舰队
+// 同时 401，现象像「密钥配错」，排查成本极高。
+//
+//   sig = hmac_sha256(KEY, node \n ts \n nonce \n scope)
+//   GET  的 scope = "GET "  + path_only
+//   POST 的 scope = "POST " + path_only + "\n" + body
+//   derived 模式的 KEY = hmac_sha256(PEER_ROOT, "peer:" + node)
+//
+// 变量名沿用上游的 CICDKIT_PEER_*（而不是 lume-core/lib/peer.lume 的 PEER_*），
+// 这样同一份 compose env 可以直接照搬。env() 只屏蔽 API_KEY/TOKEN/SECRET 这类
+// 词，PEER_SHARED / PEER_ROOT 都读得到。
+
+// 凭据：CICDKIT_PEER_* 优先，回落 PEER_*（lume-core/lib/peer.lume 的命名）
+let pa_shared_up = env("CICDKIT_PEER_SHARED");
+let pa_shared_lc = env("PEER_SHARED");
+let pa_root_up = env("CICDKIT_PEER_ROOT");
+let pa_root_lc = env("PEER_ROOT");
+let pa_reg_up = env("CICDKIT_PEER_REGISTRY");
+let pa_reg_lc = env("PEER_REGISTRY");
+let pa_peers = env("CICDKIT_PEER_PEERS");
+let pa_name_up = env("CICDKIT_PEER_NAME");
+let pa_name_lc = env("PEER_NAME");
+let pa_skew_up = env("CICDKIT_PEER_SKEW");
+
+func pick(a, b) {
+  let s = "";
+  if (a != null) { s = trim(str(a)); }
+  if (len(s) > 0) { return s; }
+  if (b != null) { s = trim(str(b)); }
+  return s;
+}
+
+export func shared() { return pick(pa_shared_up, pa_shared_lc); }
+export func root() { return pick(pa_root_up, pa_root_lc); }
+
+export func name() {
+  let n = pick(pa_name_up, pa_name_lc);
+  if (len(n) == 0) { return "cicdkit-lume"; }
+  return n;
+}
+
+export func skew() {
+  let s = "";
+  if (pa_skew_up != null) { s = trim(str(pa_skew_up)); }
+  if (len(s) == 0) { return 120; }
+  let n = int(s);
+  if (n <= 0) { return 120; }
+  return n;
+}
+
+// 实际生效的是哪一套：root 派生优先（能防冒充），否则共享密钥，否则关闭。
+export func mode() {
+  if (len(root()) > 0) { return "derived"; }
+  if (len(shared()) > 0) { return "shared"; }
+  return "off";
+}
+
+export func enabled() { return mode() != "off"; }
+
+// 注册表路径：默认 <data>/peers-identity.json（与 cicdkit 一致）
+export func registry_path() {
+  let p = pick(pa_reg_up, pa_reg_lc);
+  if (len(p) > 0) { return p; }
+  return "./.data/peers-identity.json";
+}
+
+// 逗号/分号切分（Lume 没有 split()）
+func split_list(s) {
+  let out = [];
+  let cur = "";
+  let i = 0;
+  while (i < len(s)) {
+    let c = substr(s, i, 1);
+    if (c == "," or c == ";") {
+      let t = trim(cur);
+      if (len(t) > 0) { push(out, t); }
+      cur = "";
+    } else {
+      cur = cur + c;
+    }
+    i = i + 1;
+  }
+  let t = trim(cur);
+  if (len(t) > 0) { push(out, t); }
+  return out;
+}
+
+// registry 文件形如 {"peers":["lume-a2a","tsm-hub"]}；读不到就退回
+// CICDKIT_PEER_PEERS（首次部署还没写注册表时用）。
+export func known(node) {
+  let n = trim(str(node));
+  if (len(n) == 0) { return false; }
+  let raw = read_file(registry_path());
+  let list = [];
+  if (raw != null) {
+    let parsed = try(() => json(str(raw)));
+    if (parsed.err == null and parsed.ok != null) {
+      list = get(parsed.ok, "peers", []);
+      if (list == null) { list = []; }
+    }
+  }
+  if (len(list) == 0 and pa_peers != null) {
+    list = split_list(str(pa_peers));
+  }
+  let i = 0;
+  while (i < len(list)) {
+    if (trim(str(list[i])) == n) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// 常量时间比较：长度不同直接 false（定长 hex 不泄漏有效信息），长度相同则
+// 逐字符累积 diff，不提前 return（避免按字节提前退出泄漏前缀）。
+export func const_eq(a, b) {
+  if (len(a) != len(b)) { return false; }
+  if (len(a) == 0) { return true; }
+  let i = 0;
+  let diff = 0;
+  while (i < len(a)) {
+    if (substr(a, i, 1) != substr(b, i, 1)) { diff = diff + 1; }
+    i = i + 1;
+  }
+  return diff == 0;
+}
+
+// 待签名串（全舰队共用，不能改）
+export func signing_string(node, ts, nonce, scope) {
+  return node + "\n" + ts + "\n" + nonce + "\n" + scope;
+}
+
+export func path_only(p) {
+  let s = str(p);
+  let i = 0;
+  while (i < len(s)) {
+    if (substr(s, i, 1) == "?") { return substr(s, 0, i); }
+    i = i + 1;
+  }
+  return s;
+}
+
+func qp(req, k) {
+  let q = get(req, "query_params", null);
+  if (q == null) { return ""; }
+  let v = get(q, k, null);
+  if (v == null) { return ""; }
+  return str(v);
+}
+
+// 入站校验 → { ok, error, node }
+export func verify(req, method, scope) {
+  let m = mode();
+  if (m == "off") {
+    return { ok: false, error: "peer disabled: CICDKIT_PEER_SHARED / CICDKIT_PEER_ROOT not set" };
+  }
+  let node = qp(req, "node");
+  let ts = qp(req, "ts");
+  let nonce = qp(req, "nonce");
+  let sig = qp(req, "sig");
+  if (len(node) == 0 or len(ts) == 0 or len(nonce) == 0 or len(sig) == 0) {
+    return { ok: false, error: "missing auth params (node/ts/nonce/sig)" };
+  }
+  let ts_i = int(ts);
+  if (ts_i <= 0) { return { ok: false, error: "bad ts" }; }
+  let drift = int(now()) - ts_i;
+  if (drift < 0) { drift = 0 - drift; }
+  if (drift > skew()) {
+    return { ok: false, error: "ts outside window (" + str(drift) + "s)" };
+  }
+  // 模式是部署期的决定，不是每请求的备选路径：derived 模式绝不回退共享密钥
+  // （否则只要构造出共享密钥能过的签名就能绕过整套派生信任）。
+  let key = "";
+  if (m == "derived") {
+    if (not known(node)) {
+      return { ok: false, error: "unknown peer '" + node + "' (not in registry)" };
+    }
+    key = hmac_sha256(root(), "peer:" + node);
+  } else {
+    key = shared();
+  }
+  let expect = hmac_sha256(key, signing_string(node, ts, nonce, scope));
+  if (not const_eq(expect, sig)) {
+    return { ok: false, error: "bad signature for peer '" + node + "'" };
+  }
+  return { ok: true, error: "", node: node };
+}
+
+export func verify_get(req) {
+  return verify(req, "GET", "GET " + path_only(get(req, "path", "")));
+}
+
+// POST 的 body 参与签名：必须是**原始字节**，不能是重新序列化过的 map。
+export func verify_post(req) {
+  let b = get(req, "body", null);
+  let body = "";
+  if (b != null) { body = str(b); }
+  return verify(req, "POST", "POST " + path_only(get(req, "path", "")) + "\n" + body);
+}

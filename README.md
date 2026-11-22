@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 三层自测：store 39 项 + exec 61 项 + 闸门 24 项（临时实例，不碰真实数据）
+make test       # 四层自测：store 66 + exec 73 + generate 26 + a2a 45 + 闸门 89（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -106,6 +106,13 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_RUN_KEEP` | `300` | 运行历史保留条数；超出的**归档**（不删除），可用 `make restore ID=...` 恢复 |
 | `CICD_ROLE_MAP` | 空 | `human_admin=口令;agent_operator=口令`：设置后角色只能由 `?pass=` 反查，`?role=` 自报作废 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
+| `CICDKIT_PEER_SHARED` | 空 | peer 面共享密钥（与上游 `CICDKIT_PEER_*` 同一套命名，可与旧节点互通）。为空且没配 ROOT 时整面 fail-closed 关闭 |
+| `CICDKIT_PEER_ROOT` | 空 | 派生密钥的根：`peer_key(node)=HMAC-SHA256(ROOT,"peer:"+node)`，**优先于** SHARED |
+| `CICDKIT_PEER_REGISTRY` | `<LUME_DATA>/peers-identity.json` | 允许的节点清单 `{"peers":[...]}`；文件缺失时回落到 `CICDKIT_PEER_PEERS` |
+| `CICDKIT_PEER_PEERS` | 空 | 逗号分隔的节点名，作为注册表兜底（首次部署还没生成注册表时用） |
+| `CICDKIT_PEER_NAME` | `cicdkit-lume` | 本节点名（出站签名用；入站时对方按这个名字查密钥） |
+| `CICDKIT_PEER_SKEW` | `120` | 时间窗（秒），超出即 401 |
+| `CICDKIT_A2A_PUBLIC_URL` | 空 | Agent Card 里对外公告的地址。**Lume 读不到请求头（也就读不到 Host）**，不配就只能拼 `http://127.0.0.1:<LUME_PORT>` |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
 
@@ -174,6 +181,10 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/kb`、`POST /api/kb`、`DELETE /api/kb/:id` | 知识库 |
 | `GET /api/fs/roots`、`GET /api/fs/list` | 目录浏览（受 `CICD_FS_ROOTS` 前缀校验） |
 | `GET /api/config/ssh-defaults` | SSH 兜底配置（前端表单预填） |
+| `GET /.well-known/agent-card.json` | A2A Agent Card（公开发现，列 5 个只读能力） |
+| `POST /a2a` | A2A JSON-RPC：`message/send`、`tasks/get`、`tasks/cancel` |
+| `GET /peer/health`、`GET /peer/tools` | peer 签名面（HMAC，`?node=&ts=&nonce=&sig=`） |
+| `POST /peer/invoke`、`POST /peer/relay` | 带参调用只读能力；relay 已退役（410） |
 
 `?role=` 只在本层做闸门判定，是**流程门禁**而不是身份认证——真正的身份边界交给
 `HTPASSWD_FILE` 或反向代理。想让角色不能随口报，就设 `CICD_ROLE_MAP`
@@ -265,6 +276,37 @@ make secret NAME=lume_crm_llm_api_key VALUE=sk-...   # 真实值只写进 .data/
   uid 10001，读不了宿主机 0600 的文件，会报「密钥文件不可读（权限或容器 uid 不匹配）」——
   此时 `chmod 0644 .data/secrets/*` 再 `chmod 0755 .data/secrets`，或改成用容器自己的卷存密钥。
 
+## A2A 与 peer 面（取代 `internal/a2a`）
+
+两个面并存，与上游 cicdkit 的 `internal/a2a` 同形，能力全部**只读**：
+项目总览、最近运行、最近部署、知识库摘要、能力自述。写入原语（触发流水线、删项目、
+SSH、registry 操作）一律不进这两面——发布只能走人工审批闸门。
+
+- **标准面**：`GET /.well-known/agent-card.json` 公开发现；`POST /a2a` 走 JSON-RPC
+  （`message/send` / `tasks/get` / `tasks/cancel`）。任务落 SQLite（`a2a_tasks` 表），
+  状态机沿用规范取值（`completed` / `rejected` / `input-required` …）；续跑只允许
+  对 `input-required` 的任务补参数，终结态给 `-32004`，处理中给 `-32005`。
+  Card 里的 url 来自 `CICDKIT_A2A_PUBLIC_URL`（读不到 Host 头，见环境变量表）。
+- **peer 面**：`GET /peer/health` + `GET /peer/tools` + `POST /peer/invoke`
+  （`POST /peer/relay` 保留但回 410，上游同样退役）。签名协议与
+  `internal/a2a/peer.go` 字节级一致，可直接和 lume-a2a / tsm-hub 互通：
+
+  ```
+  sig   = HMAC-SHA256(KEY, node \n ts \n nonce \n scope)
+  GET   scope = "GET "  + path_only
+  POST  scope = "POST " + path_only + "\n" + body
+  derived: KEY = HMAC-SHA256(CICDKIT_PEER_ROOT, "peer:" + node)
+  ```
+
+  入站一律走 query（`?node=&ts=&nonce=&sig=`），因为 Lume 的 route handler 读不到
+  请求头。时间窗默认 ±120s，签名常量时间比较。**derived 模式不再回退共享密钥**：
+  配了 ROOT 就只认派生密钥（否则拿共享密钥签一个能过的串就能绕过整套信任）。
+
+  未配凭据时整面 fail-closed 关闭（返回 200 + `unauthorized:true` + 原因，与上游一致）。
+
+与上游的一处有意差异：`GET /a2a` 上游是 302 到 `/`，Lume 的路由信封发不出 `Location`
+头，与其给一个没有 Location 的 302，不如明确回 **405** 并说明「JSON-RPC 走 POST」。
+
 ## 外部 CI 触发（webhook）
 
 给 GitLab/Jenkins/CNB 这类外部 CI 留的入口：它们没有飞书身份、也拿不到角色，所以不走角色闸门，靠共享密钥自证。
@@ -318,6 +360,14 @@ make docker-down
 - `./.data` 挂成**可写**（SQLite + 日志），`./.data/logs` 同时挂给 runner——
   两者必须指向同一个卷，否则前端永远看到空日志（增量读按字节偏移）。
 - 项目目录必须**以相同绝对路径**挂进两个容器，否则 docker daemon 解析 `build.context` 会失败。
+  所以 compose 里的 `PROJECTS_ROOT`（宿主项目根，绝对路径）**必填**，`make docker` 会自动带上
+  `PROJECTS_ROOT=$(WORK)`；直接 `docker compose up` 会明确报「required variable 缺失」而不是
+  悄悄映射到 `/projects`。
+- `LEGACY_DATA`（默认 `../cicdkit/data-docker`）按宿主原路径只读挂入：项目配置里的
+  `ssh_key_path` / `kubeconfig` 存的就是那个绝对路径，映射到别的目录只会让 SSH 找不到私钥。
+  `make docker` 同时把 `CICD_DEFAULT_KUBECONFIG` 指到 `<LEGACY_DATA>/kubeconfig-cicd`。
+- `./.data/secrets/*`（`make secret` 写、0600）在 Docker Desktop 下对容器 uid 10001
+  仍然可读（宿主 uid 被映射成容器用户），不需要为了容器放宽到 0644。
 - lume 二进制从既有镜像取（`LUME_BIN_IMAGE`，默认 `lume-bin:0.14.2`）：
   lume 是静态 C 单二进制，release 包在本机网络下不可达。
 
@@ -342,6 +392,11 @@ make docker-down
 - **SQLite 不能建索引**：DDL 护栏只允许 `CREATE TABLE`，`CREATE INDEX` 被拒。当前 200 来条记录无所谓，
   记录量上百倍增长后列表查询会变慢，到那时得换存储层而不是硬扛。
 - **runner 的任务表只在内存里**：重启即丢，控制面会把还在跑的运行标成 `interrupted`（不会再标成 running 干等）。
+- **A2A 任务表不会自动清理**（和 `runs` 不同，它没有保留策略）：每次 `message/send` 都落一条。
+  只读问答量大了要手动清，或将来接上 `CICDKIT_A2A_KEEP`。任务记录里只有能力名/参数/结果摘要，
+  不含日志原文。
+- **peer 面不加密**：签名保证不可伪造/篡改，但明文传输；不要经此通道传密码、密钥、证件号。
+  防重放只是时间窗级别（同一 nonce 在窗口内重放仍会过）。
 
 ## 还没做 / 已知取舍
 

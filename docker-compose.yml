@@ -33,18 +33,31 @@ services:
       # Lume 的 env() 屏蔽，所以这里叫 RUNNER_AUTH。
       RUNNER_AUTH: ${RUNNER_AUTH:-change-me-runner}
       CICD_DEPLOY_APPROVAL: ${CICD_DEPLOY_APPROVAL:-off}
-      # build.context 的允许根目录：容器里看到的项目根。
-      CICD_WORK_DIR: ${CICD_WORK_DIR:-/projects}
-      CICD_FS_ROOTS: ${CICD_FS_ROOTS:-/projects}
+      # 项目配置里存的是**宿主绝对路径**，runner 又是按宿主路径解析 context 的，
+      # 所以控制面必须也挂同一批路径、用同一个值做允许根 —— 再映射到 /projects
+      # 只会让同一份配置在两边指向不同目录，validation 过、构建找不到文件。
+      CICD_WORK_DIR: ${PROJECTS_ROOT:?先设置 PROJECTS_ROOT（宿主项目根绝对路径）}
+      CICD_FS_ROOTS: ${PROJECTS_ROOT:?}
+      # local-k3s / kubectl 用的 kubeconfig：路径必须两边都看得见。
       CICD_DEFAULT_KUBECONFIG: ${CICD_DEFAULT_KUBECONFIG:-}
+      # 角色口令绑定（可选）：配了之后 ?role= 不再作数，只能 ?pass=
+      CICD_ROLE_MAP: ${CICD_ROLE_MAP:-}
+      # A2A / peer 签名面（可选）：不配则整面 fail-closed 关闭
+      CICDKIT_PEER_SHARED: ${CICDKIT_PEER_SHARED:-}
+      CICDKIT_PEER_ROOT: ${CICDKIT_PEER_ROOT:-}
+      CICDKIT_PEER_NAME: ${CICDKIT_PEER_NAME:-cicdkit-lume}
+      CICDKIT_PEERS: ${CICDKIT_PEERS:-}
       CICD_SSH_USER: ${CICD_SSH_USER:-}
       CICD_SSH_PORT: ${CICD_SSH_PORT:-}
       CICD_SSH_KEY_PATH: ${CICD_SSH_KEY_PATH:-}
     volumes:
-      # 可写：SQLite（store.db）+ 运行日志。原来是 :ro，接管存储后必须放开。
+      # 可写：SQLite（store.db）+ secrets/ + 运行日志（runner 追加写、这里读）。
       - ./.data:/app/.data
-      # 项目目录按「相同绝对路径」挂给两个容器，docker daemon 才能解析路径。
-      - ${PROJECTS_ROOT:-.}:/projects
+      # 项目目录按「相同绝对路径」挂进来：控制面只读它做校验/浏览，
+      # 但路径必须和 runner 侧完全一致，否则 docker build 的 context 解析不到。
+      - ${PROJECTS_ROOT:?}:${PROJECTS_ROOT:?}
+      # 历史凭据（kubeconfig、ssh key）也按宿主原路径挂，配置里存的就是这个路径。
+      - ${LEGACY_DATA:-./.data/legacy}:${LEGACY_DATA:-/legacy}:ro
     depends_on:
       runner:
         condition: service_healthy
@@ -70,7 +83,7 @@ services:
       # 宿主 docker daemon：runner 不跑自己的 docker-in-docker。
       - /var/run/docker.sock:/var/run/docker.sock
       # 项目目录：必须与宿主相同路径，否则 docker build 的 context 解析不到。
-      - ${PROJECTS_ROOT:-.}:${PROJECTS_ROOT:-/projects}
-      # SSH 私钥与 kubeconfig 按需挂入（没有就注释掉）。
-      - ${SSH_KEYS_DIR:-./.data/keys}:/keys:ro
+      - ${PROJECTS_ROOT:?}:${PROJECTS_ROOT:?}
+      # SSH 私钥 / kubeconfig：项目配置里写的是宿主绝对路径，原路径挂进来才认。
+      - ${LEGACY_DATA:-./.data/legacy}:${LEGACY_DATA:-/legacy}:ro
     restart: unless-stopped
