@@ -115,7 +115,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICDKIT_PEER_SKEW` | `120` | 时间窗（秒），超出即 401 |
 | `CICDKIT_A2A_PUBLIC_URL` | 空 | Agent Card 里对外公告的地址。**Lume 读不到请求头（也就读不到 Host）**，不配就只能拼 `http://127.0.0.1:<LUME_PORT>` |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
-| `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须）。注意它会同时保护 `/metrics/cicdkit`：启用后 Prometheus 必须配 `basic_auth`，否则抓取 401 |
+| `HTPASSWD_FILE` | compose 固定 `/auth/htpasswd` | Basic Auth 凭据；`make auth` 生成在 `~/.config/cicdkit-lume`，不进仓库。它会同时保护 `/api/*` 与 `/metrics/cicdkit`：Prometheus 必须配 `basic_auth`（本仓的 tsm-hub 侧已配好） |
 
 ### runner
 
@@ -201,6 +201,10 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 
 逐条对照表（含有意差异与原因）在 [`docs/PARITY.md`](docs/PARITY.md)。最需要记住的三条：
 
+- **Basic Auth 已默认启用**：`make docker` 会先跑 `scripts/auth.sh`，凭据在
+  `~/.config/cicdkit-lume`（用户 `cicd`，明文口令在 `prometheus.pass`）。浏览器首次访问会弹
+  Basic 认证框；curl/脚本要带 `-u cicd:<prometheus.pass 内容>`。容器健康检查与 Prometheus
+  抓取都用同一份凭据，换口令用 `FORCE=1 make auth` 后重建两个栈。
 - 指标在 `/metrics/cicdkit`：`/metrics` 被 lume 的 agent-httpd 硬编码占用，脚本层改不了。
 - 直方图只统计改版后跑过的运行：runner 新加了 `started_ts`/`ended_ts`，旧记录没有。
 - 身份边界是 `HTPASSWD_FILE` + 角色口令：Lume 读不到请求头，实现不了上游的 `X-API-Token`。
@@ -366,6 +370,7 @@ make test     # store 39 + exec 61 + gate 24
 
 ```bash
 make docker        # 控制面 + runner 双服务 → http://127.0.0.1:18107
+make auth       # 生成 Basic Auth 凭据到 ~/.config/cicdkit-lume（已存在则不动）
 make backup     # SQLite 在线备份到 .data/backups/store-<ts>.db，保留 BACKUP_KEEP（默认 14）份
 make docker-logs
 make docker-down

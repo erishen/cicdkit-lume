@@ -138,8 +138,9 @@ tsmhub-lume 取代时，要么前者支持 Bearer、要么 cicdkit-lume 换用 `
   并加全局每分钟 3 次的模型调用限额；同一 run 命中缓存时不计数。
 - **runner 令牌必填**：compose 里 `RUNNER_AUTH` 不再是 `change-me-runner` 弱默认，
   `make docker` 会生成 `.data/runner.token`（0600）并注入；默认白名单去掉 `sudo`。
-- **Prometheus 认证**：`HTPASSWD_FILE` 会同时保护 `/metrics/cicdkit`。启用 Basic Auth
-  后必须给 Prometheus job 配 `basic_auth`（用户名/密码文件），否则抓取 401。
+- **Prometheus 认证**：`HTPASSWD_FILE` 会同时保护 `/metrics/cicdkit`。现在 compose
+  默认启用（`make auth` 生成凭据到 `~/.config/cicdkit-lume`），tsm-hub 的 job 已配
+  `basic_auth`，容器健康检查也带同一份凭据；否则抓取 401、容器一直 unhealthy。
 
 ## 第二批优化（2026-11）
 

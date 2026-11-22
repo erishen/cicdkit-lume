@@ -141,7 +141,16 @@ plan:
 .data/runner.token:
 	@mkdir -p .data && umask 077 && openssl rand -hex 24 > $@
 
+AUTH_DIR ?= $(HOME)/.config/cicdkit-lume
+
+$(AUTH_DIR)/htpasswd:
+	@bash scripts/auth.sh
+
+auth:
+	@bash scripts/auth.sh
+
 docker: .data/runner.token
+	@bash scripts/auth.sh
 	@RUNNER_AUTH=$$(cat .data/runner.token) PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
 	 CICD_DEFAULT_KUBECONFIG=$(abspath $(LEGACY)/kubeconfig-cicd) \
 	 docker compose up -d --build

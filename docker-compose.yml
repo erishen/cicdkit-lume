@@ -53,6 +53,8 @@ services:
       CICD_SSH_KEY_PATH: ${CICD_SSH_KEY_PATH:-}
       # 归档保留条数（默认 1000）；留空即用代码默认。
       CICD_ARCHIVE_KEEP: ${CICD_ARCHIVE_KEEP:-}
+      # Basic Auth：凭据由 `make auth` 生成在 ~/.config/cicdkit-lume，不进仓库。
+      HTPASSWD_FILE: /auth/htpasswd
     volumes:
       # 可写：SQLite（store.db）+ secrets/ + 运行日志（runner 追加写、这里读）。
       - ./.data:/app/.data
@@ -61,6 +63,16 @@ services:
       - ${PROJECTS_ROOT:?}:${PROJECTS_ROOT:?}
       # 历史凭据（kubeconfig、ssh key）也按宿主原路径挂，配置里存的就是这个路径。
       - ${LEGACY_DATA:-./.data/legacy}:${LEGACY_DATA:-/legacy}:ro
+      # 只读挂两份凭据：htpasswd 给 Lume，health-header 给容器健康检查。
+      - ${HOME}/.config/cicdkit-lume/htpasswd:/auth/htpasswd:ro
+      - ${HOME}/.config/cicdkit-lume/health-header:/auth/health-header:ro
+    # 开了 Basic Auth 后 /api/health 也要认证，健康检查必须带同一份凭据；
+    # 这里覆盖 Dockerfile 里的匿名探针，否则容器会一直 unhealthy。
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --header=\"Authorization: Basic $$(cat /auth/health-header)\" http://127.0.0.1:18107/api/health >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     depends_on:
       runner:
         condition: service_healthy
