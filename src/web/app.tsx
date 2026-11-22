@@ -2272,7 +2272,7 @@ function App() {
 
           <span className="health" title={health?.upstream || meta?.upstream || ''}>
             <span className={health?.ok ? 'dot ok' : 'dot err'} />
-            {health ? (health.ok ? '上游在线' : '上游离线') : '检测中…'}
+            {health ? (health.ok ? '执行器在线' : '执行器离线') : '检测中…'}
           </span>
         </div>
       </header>
