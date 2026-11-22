@@ -1416,7 +1416,7 @@ function DiagnosePanel({ runId, onClose }: { runId: string; onClose: () => void 
 
   useEffect(() => {
     let alive = true
-    API.diagnoseRun(runId)
+    API.diagnoseRun(runId, readRole())
       .then((d: Diagnosis) => {
         if (!alive) return
         setState({

@@ -71,7 +71,10 @@ stop:
 smoke:
 	@bash scripts/smoke.sh http://127.0.0.1:$(PORT)
 
-# 三层自测：存储 34 项、执行计划 61 项、闸门/降级（临时实例，不碰真实上游）。
+# 自测：存储 / 执行计划 / 生成 / A2A / 闸门（临时实例，不碰真实上游）+ runner go test。
+runner-test:
+	@cd runner && CGO_ENABLED=0 GOWORK=off go test ./... && echo "✓ runner go test 通过"
+
 test: vendor
 	@rm -rf /tmp/lume_test_store && mkdir -p /tmp/lume_test_store/logs && dd if=/dev/zero of=/tmp/lume_test_store/logs/run-big.log bs=1048576 count=17 2>/dev/null
 	@LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
@@ -79,6 +82,7 @@ test: vendor
 	@rm -rf /tmp/lume_test_gen && LUME_DATA=/tmp/lume_test_gen $(LUME) scripts/generate_test.lume
 	@rm -rf /tmp/lume_test_a2a && mkdir -p /tmp/lume_test_a2a && LUME_DATA=/tmp/lume_test_a2a CICDKIT_PEER_SHARED=test-shared $(LUME) scripts/a2a_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
+	@$(MAKE) runner-test
 
 # 清洗项目配置里明文存放的密钥（LLM_API_KEY / *_VISIT_PIN 等）。
 # 默认干跑：只列出「哪个项目的哪个字段会被改」，不打印任何明文；
@@ -134,17 +138,22 @@ plan:
 	@LUME_DATA=$(DATA) $(LUME) scripts/plan_dump.lume
 
 # 容器：http://127.0.0.1:18107（控制面）+ 内网 runner（不映射端口）。
-docker:
-	@PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
+.data/runner.token:
+	@mkdir -p .data && umask 077 && openssl rand -hex 24 > $@
+
+docker: .data/runner.token
+	@RUNNER_AUTH=$$(cat .data/runner.token) PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
 	 CICD_DEFAULT_KUBECONFIG=$(abspath $(LEGACY)/kubeconfig-cicd) \
 	 docker compose up -d --build
 	@echo "▶ http://127.0.0.1:18107"
 
-docker-logs:
-	@docker compose logs -f --tail=100
+docker-logs: .data/runner.token
+	@RUNNER_AUTH=$$(cat .data/runner.token) PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
+	 docker compose logs -f --tail=100
 
-docker-down:
-	@docker compose down
+docker-down: .data/runner.token
+	@RUNNER_AUTH=$$(cat .data/runner.token) PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
+	 docker compose down
 
 clean:
 	@rm -f www/app.js bin/cicd-runner

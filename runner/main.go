@@ -42,10 +42,13 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -153,7 +156,7 @@ type server struct {
 func main() {
 	bind := envOr("RUNNER_BIND", "127.0.0.1:8899")
 	logDir := envOr("RUNNER_LOG_DIR", "./logs")
-	allow := envOr("RUNNER_ALLOW", "docker,kubectl,ssh,helm,git,scp,sudo")
+	allow := envOr("RUNNER_ALLOW", "docker,kubectl,ssh,helm,git,scp")
 	// 默认 16 MiB - 8 KiB：控制面的 read_file 上限是 16 MiB，留出写封顶标记的余量。
 	logMaxBytes, _ := strconv.ParseInt(envOr("RUNNER_LOG_MAX_BYTES", "16769024"), 10, 64)
 	if logMaxBytes <= 0 {
@@ -200,8 +203,49 @@ func main() {
 	mux.HandleFunc("/healthz", s.auth(s.handleHealth))
 	mux.HandleFunc("/jobs", s.auth(s.handleJobs))
 	mux.HandleFunc("/jobs/", s.auth(s.handleJob))
-	if err := http.ListenAndServe(bind, mux); err != nil {
+	mux.HandleFunc("/fs/list", s.auth(s.handleFsList))
+
+	srv := &http.Server{
+		Addr:              bind,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+
+	// 容器 stop 时先取消在跑的 job（exec.CommandContext 会杀掉子进程），
+	// 再给在途请求 10s 收尾；否则 docker stop 要等到 SIGKILL 才退出。
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		<-sig
+		log.Printf("shutdown: canceling jobs")
+		s.cancelAll()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("listen %s: %v", bind, err)
+	}
+}
+
+func (s *server) cancelAll() {
+	s.mu.Lock()
+	jobs := make([]*Job, 0, len(s.jobs))
+	for _, j := range s.jobs {
+		jobs = append(jobs, j)
+	}
+	s.mu.Unlock()
+	for _, j := range jobs {
+		j.mu.Lock()
+		c := j.cancel
+		j.mu.Unlock()
+		if c != nil {
+			c()
+		}
 	}
 }
 
@@ -262,6 +306,8 @@ func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "只接受 POST /jobs"})
 		return
 	}
+	// 一次提交的 argv/env 不该超过几 MB；上限挡住超大 JSON 把内存吃满。
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<20)
 	var req submitReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "请求体解析失败: " + err.Error()})
@@ -669,8 +715,10 @@ func (s *server) handleLog(w http.ResponseWriter, r *http.Request, job *Job) {
 
 	from, _ := strconv.ParseInt(r.URL.Query().Get("from"), 10, 64)
 	maxBytes, _ := strconv.ParseInt(r.URL.Query().Get("max"), 10, 64)
-	if maxBytes <= 0 {
-		maxBytes = 262144
+	// max 是「本次最多返回多少字节」，必须真的按它截断：否则 from>0 时
+	// 会把剩余十几 MB 一次性读进内存再序列化，一个轮询就能把 runner 打满。
+	if maxBytes <= 0 || maxBytes > maxLogChunk {
+		maxBytes = maxLogChunk
 	}
 
 	f, err := os.Open(path)
@@ -698,7 +746,11 @@ func (s *server) handleLog(w http.ResponseWriter, r *http.Request, job *Job) {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
 		return
 	}
-	buf := make([]byte, total-from)
+	avail := total - from
+	if avail > maxBytes {
+		avail = maxBytes
+	}
+	buf := make([]byte, avail)
 	if _, err := f.Read(buf); err != nil && !errors.Is(err, io.EOF) {
 		// 读多少算多少：尾部被并发追加属于正常情况
 	}
@@ -712,12 +764,126 @@ func (s *server) handleLog(w http.ResponseWriter, r *http.Request, job *Job) {
 	status := job.Status
 	job.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"log":     string(buf),
-		"log_len": total,
-		"from":    from,
-		"status":  status,
-		"reset":   reset,
+		"log":       string(buf),
+		"log_len":   total,
+		"from":      from,
+		"status":    status,
+		"reset":     reset,
+		"truncated": from+int64(len(buf)) < total,
 	})
+}
+
+const maxLogChunk = 262144
+
+// ---------- 目录浏览 ----------
+// 控制面只做「路径在允许根下」的字符串校验，挡不住软链接（root/link -> /etc）。
+// 目录枚举放到这里：EvalSymlinks 之后再用真实路径比根，越界的条目直接不返回。
+
+type fsListReq struct {
+	Dir   string   `json:"dir"`
+	Roots []string `json:"roots"`
+}
+
+type fsEntry struct {
+	Name  string `json:"name"`
+	IsDir bool   `json:"is_dir"`
+	Size  int64  `json:"size"`
+}
+
+func (s *server) handleFsList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"ok": false, "error": "只接受 POST /fs/list"})
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<20)
+	var req fsListReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "请求体解析失败: " + err.Error()})
+		return
+	}
+	if len(req.Roots) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "roots 不能为空"})
+		return
+	}
+	roots := make([]string, 0, len(req.Roots))
+	for _, root := range req.Roots {
+		root = strings.TrimSpace(root)
+		if root == "" || !filepath.IsAbs(root) {
+			continue
+		}
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			root = resolved
+		}
+		roots = append(roots, filepath.Clean(root))
+	}
+	if len(roots) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "roots 里没有绝对路径"})
+		return
+	}
+	dir := strings.TrimSpace(req.Dir)
+	if dir == "" {
+		dir = roots[0]
+	}
+	if !filepath.IsAbs(dir) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "dir 必须是绝对路径"})
+		return
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Clean(dir))
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "目录不存在或不可读: " + err.Error()})
+		return
+	}
+	if !withinAnyRoot(resolved, roots) {
+		writeJSON(w, http.StatusForbidden, map[string]any{"ok": false, "error": "目录不在允许范围内: " + resolved})
+		return
+	}
+	items, err := os.ReadDir(resolved)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	entries := make([]fsEntry, 0, len(items))
+	for _, item := range items {
+		name := item.Name()
+		full := filepath.Join(resolved, name)
+		isDir := item.IsDir()
+		var size int64
+		if item.Type()&os.ModeSymlink != 0 {
+			// 软链接先解析，再判根：指向根外的条目直接隐藏，不给浏览器留口子。
+			target, err := filepath.EvalSymlinks(full)
+			if err != nil || !withinAnyRoot(target, roots) {
+				continue
+			}
+			info, err := os.Stat(target)
+			if err != nil {
+				continue
+			}
+			isDir = info.IsDir()
+			if !isDir {
+				size = info.Size()
+			}
+		} else if info, err := item.Info(); err == nil && !isDir {
+			size = info.Size()
+		}
+		entries = append(entries, fsEntry{Name: name, IsDir: isDir, Size: size})
+	}
+	// 目录在前、文件在后，与控制面原来的展示顺序一致。
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].IsDir != entries[j].IsDir {
+			return entries[i].IsDir
+		}
+		return entries[i].Name < entries[j].Name
+	})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "dir": resolved, "entries": entries})
+}
+
+func withinAnyRoot(p string, roots []string) bool {
+	for _, root := range roots {
+		if p == root || strings.HasPrefix(p, root+string(os.PathSeparator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func utf8Start(b byte) bool { return b&0xC0 != 0x80 }

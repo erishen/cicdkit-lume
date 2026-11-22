@@ -331,6 +331,8 @@ post "/api/runs/:id/cancel", (req) => {
 };
 
 post "/api/runs/:id/diagnose", (req) => {
+  let gate = guard.role_any(req, "AI 诊断");
+  if (not get(gate, "allowed", false)) { return denied(gate, "AI 诊断"); }
   return api.run_diagnose(str(get(req.params, "id", "")));
 };
 
@@ -353,6 +355,8 @@ get "/api/deployments/:id", (req) => {
 };
 
 post "/api/deployments/:id/diagnose", (req) => {
+  let gate = guard.role_any(req, "AI 诊断");
+  if (not get(gate, "allowed", false)) { return denied(gate, "AI 诊断"); }
   return api.deployment_diagnose(str(get(req.params, "id", "")));
 };
 

@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 四层自测：store 66 + exec 73 + generate 26 + a2a 45 + 闸门 107（临时实例，不碰真实数据）
+make test       # 自测：store 66 + exec 73 + generate 26 + a2a 45 + 闸门 108 + runner go test（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -95,7 +95,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | --- | --- | --- |
 | `LUME_DATA` | `./.data` | 数据目录：`store.db` + `logs/` + `logs-archive/`（归档的运行日志） |
 | `RUNNER_BASE` | `http://127.0.0.1:8899` | runner 地址 |
-| `RUNNER_AUTH` | 空 | runner 令牌；**不能**叫 `RUNNER_TOKEN`（Lume `env()` 屏蔽含 TOKEN 的名字） |
+| `RUNNER_AUTH` | 空 | runner 令牌，compose 里是**必填**（`make docker` 自动生成 `.data/runner.token`）；**不能**叫 `RUNNER_TOKEN`（Lume `env()` 屏蔽含 TOKEN 的名字） |
 | `RUNNER_AUTH_FILE` | 空 | 从文件读令牌，优先于 `RUNNER_AUTH` |
 | `CICD_WORK_DIR` | `$PWD` | 运行的工作目录（也是 `build.context` 的基准）。runner 只接受绝对路径，没配时回落到进程的 `$PWD` |
 | `CICD_FS_ROOTS` | 空 | 目录浏览允许根（冒号分隔），越界 403 |
@@ -114,7 +114,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICDKIT_PEER_SKEW` | `120` | 时间窗（秒），超出即 401 |
 | `CICDKIT_A2A_PUBLIC_URL` | 空 | Agent Card 里对外公告的地址。**Lume 读不到请求头（也就读不到 Host）**，不配就只能拼 `http://127.0.0.1:<LUME_PORT>` |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
-| `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
+| `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须）。注意它会同时保护 `/metrics/cicdkit`：启用后 Prometheus 必须配 `basic_auth`，否则抓取 401 |
 
 ### runner
 
@@ -181,9 +181,9 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/deployments/:id` | 单条部署记录（含 `run_id`、`probe` 结果） |
 | `POST /api/deployments/:id/diagnose` | 对该部署对应的运行做 AI 诊断（运行已裁掉 → 404） |
 | `GET /api/config/llm`、`PUT`、`POST /api/config/llm/test` | LLM 配置（掩码）/ 保存 / 连通性测试 |
-| `POST /api/runs/:id/diagnose`、`POST /api/runs/:id/diagnosis/adopt` | AI 诊断 / 采纳入知识库 |
+| `POST /api/runs/:id/diagnose`、`POST /api/runs/:id/diagnosis/adopt` | AI 诊断（需任意合法角色，全局每分钟最多 3 次；同 run 命中缓存不计费）/ 采纳入知识库 |
 | `GET /api/kb`、`POST /api/kb`、`DELETE /api/kb/:id` | 知识库 |
-| `GET /api/fs/roots`、`GET /api/fs/list` | 目录浏览（受 `CICD_FS_ROOTS` 前缀校验） |
+| `GET /api/fs/roots`、`GET /api/fs/list` | 目录浏览（控制面先做前缀校验，再由 runner `EvalSymlinks` 后比根，软链接逃逸会被隐藏） |
 | `GET /api/config/ssh-defaults` | SSH 兜底配置（前端表单预填） |
 | `GET /.well-known/agent-card.json` | A2A Agent Card（公开发现，列 5 个只读能力） |
 | `POST /a2a` | A2A JSON-RPC：`message/send`、`tasks/get`、`tasks/cancel` |
@@ -394,6 +394,7 @@ make docker-down
   只能叫 `CICD_ROLE_MAP`（叫 `CICD_ROLE_TOKENS` 会永远读不到值，看起来像"口令全没生效"）。
 - **`patch_run` 是读-改-写，没有事务**（Lume 的 SQL 护栏不开放事务，也没有进程内互斥）。
   已做的是「阶段没变化就不写库」把触发次数压到最低；单人多标签页同时盯同一运行仍有极窄的覆盖窗口。
+- **日志读取走 runner 区间接口**：`GET /jobs/:id/log?from=…&max=…` 每次最多回 256 KiB，控制面优先用它；runner 重启丢了 job 或老运行没有 `job_id` 时，才回落到共享日志目录按整个文件读。
 - **日志超过 16 MiB 有双层兜底**：runner 把文件封顶在 `RUNNER_LOG_MAX_BYTES`（默认 16 MiB − 8 KiB）并追加一行封顶标记；
   控制面的 `read_file` 对超限文件是**抛错而非截断**，所以接口侧再用 `try()` 兜住——遇到老 runner 或人为塞进来的超大日志也返回 200，
   带 `truncated` / `log_note`，前端顶部提示，完整日志去看控制面的 `<LUME_DATA>/logs/<run_id>.log`。

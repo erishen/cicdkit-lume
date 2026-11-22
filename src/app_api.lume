@@ -647,33 +647,22 @@ func in_root(dir) {
 }
 
 export func fs_list(dir) {
+  let roots = get(fs_roots(), "roots", []);
   let d = trim(s(dir, ""));
-  if (len(d) == 0) {
-    let roots = get(fs_roots(), "roots", []);
-    d = str(get(roots, 0, "."));
-  }
+  if (len(d) == 0) { d = str(get(roots, 0, ".")); }
+  // 第一道仍是字符串校验：`..` 直接拒，不用往 runner 跑一趟。
   if (not in_root(d)) {
     return { status: 403, body: { ok: false, error: "目录不在允许范围内: " + d + "（用 CICD_FS_ROOTS 放行）" } };
   }
-  let entries = files(d);
-  let dirs = [];
-  let fls = [];
-  let i = 0;
-  while (i < len(entries)) {
-    let name = str(entries[i]);
-    if (len(name) > 0 and substr(name, len(name) - 1) == "/") {
-      push(dirs, { name: substr(name, 0, len(name) - 1), is_dir: true, size: 0 });
-    } else {
-      push(fls, { name: name, is_dir: false, size: 0 });
-    }
-    i = i + 1;
+  // 第二道在 runner 里做：EvalSymlinks 后用真实路径比根，挡软链接逃逸。
+  let r = exec.fs_list(d, roots);
+  if (not get(r, "ok", false)) {
+    let code = int(get(r, "status", 0));
+    if (code == 403) { return { status: 403, body: { ok: false, error: str(get(r, "err", "目录不在允许范围内")) } }; }
+    if (code == 404) { return { status: 404, body: { ok: false, error: str(get(r, "err", "目录不存在")) } }; }
+    return { status: 503, body: { ok: false, error: "目录服务不可用（runner 未就绪）：" + str(get(r, "err", "")) } };
   }
-  let all = [];
-  i = 0;
-  while (i < len(dirs)) { push(all, dirs[i]); i = i + 1; }
-  i = 0;
-  while (i < len(fls)) { push(all, fls[i]); i = i + 1; }
-  return { status: 200, body: { dir: d, entries: all } };
+  return { status: 200, body: { dir: str(get(r, "dir", d)), entries: get(r, "entries", []) } };
 }
 
 // ---------- 线上访客统计（结构照上游 handleProjectVisits） ----------
@@ -921,6 +910,25 @@ func last_stage(run) {
   return str(get(get(st, i, {}), "name", ""));
 }
 
+// 诊断是唯一会把日志发到外部模型、并且同步阻塞 worker 的动作：
+// 每人每分钟最多 3 次（同一 run 的重复诊断命中缓存，不计入）。计数器放
+// settings 里，重启后最坏多放行 3 次，不值得为此建表。
+func diag_rate_ok() {
+  let ts = now();
+  let raw = store.get_setting("diag_rate");
+  let prev = "";
+  if (raw != null) { prev = str(raw); }
+  let keep = [];
+  for (part in split(prev, ",")) {
+    let t = int(trim(str(part)));
+    if (t > 0 and t > ts - 60) { push(keep, t); }
+  }
+  if (len(keep) >= 3) { return false; }
+  push(keep, ts);
+  store.put_setting("diag_rate", join(keep, ","));
+  return true;
+}
+
 export func run_diagnose(id) {
   let r = jobs.sync(id);
   if (r == null) { return { status: 404, body: { ok: false, error: "运行不存在: " + str(id) } }; }
@@ -930,6 +938,9 @@ export func run_diagnose(id) {
     if (len(s(get(old, "analysis", ""), "")) > 0) {
       return { status: 200, body: { analysis: str(get(old, "analysis", "")), run_id: str(id), cached: true } };
     }
+  }
+  if (not diag_rate_ok()) {
+    return { status: 429, body: { ok: false, error: "AI 诊断触发过于频繁（每分钟最多 3 次），请稍后再试" } };
   }
   let cfg = llm_raw();
   if (not bool(get(cfg, "enabled", false))) {

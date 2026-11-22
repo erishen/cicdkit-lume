@@ -429,8 +429,8 @@ export const API = {
       body: JSON.stringify(cfg),
     }),
   // 上游做知识库匹配 + 日志脱敏 + 模型调用，结果缓存在运行记录上。
-  diagnoseRun: (id: string) =>
-    request<Diagnosis>(`/api/runs/${encodeURIComponent(id)}/diagnose`, {
+  diagnoseRun: (id: string, role?: string) =>
+    request<Diagnosis>(`/api/runs/${encodeURIComponent(id)}/diagnose${roleQuery(role)}`, {
       method: 'POST',
       body: '{}',
     }),
@@ -461,8 +461,8 @@ export const API = {
 
   deployment: (id: string) => request<Deployment>(`/api/deployments/${encodeURIComponent(id)}`),
 
-  diagnoseDeployment: (id: string) =>
-    request<Diagnosis>(`/api/deployments/${encodeURIComponent(id)}/diagnose`, { method: 'POST' }),
+  diagnoseDeployment: (id: string, role?: string) =>
+    request<Diagnosis>(`/api/deployments/${encodeURIComponent(id)}/diagnose${roleQuery(role)}`, { method: 'POST' }),
 
   listDeployments: (opts: { project_id?: string; limit?: number } = {}) => {
     const p = new URLSearchParams()

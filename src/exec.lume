@@ -74,6 +74,50 @@ func runner_json(method, path, body, secs) {
   return { ok: code >= 200 and code < 300, status: code, data: data, err: str(get(r, "err", "")) };
 }
 
+// 日志按字节区间读：runner 只回本次窗口（默认 256 KiB），不再让控制面
+// 每次轮询 read_file 整个日志。from=0 表示取尾部窗口。
+// → { ok, status, log, log_len, from, reset, truncated, err }
+export func log_range(job_id, from, max) {
+  if (len(str(job_id)) == 0) { return { ok: false, status: 0, log: "", log_len: 0, from: 0, reset: false, truncated: false, err: "job_id 为空" }; }
+  let m = int(max);
+  if (m <= 0) { m = 262144; }
+  let path = "/jobs/" + str(job_id) + "/log?from=" + str(int(from)) + "&max=" + str(m);
+  let r = runner_json("GET", path, null, 8);
+  let d = get(r, "data", null);
+  if (not get(r, "ok", false) or d == null) {
+    return { ok: false, status: int(get(r, "status", 0)), log: "", log_len: 0, from: 0, reset: false, truncated: false, err: str(get(r, "err", "runner 不可达")) };
+  }
+  return {
+    ok: true,
+    status: int(get(r, "status", 200)),
+    log: str(get(d, "log", "")),
+    log_len: int(get(d, "log_len", 0)),
+    from: int(get(d, "from", 0)),
+    reset: bool(get(d, "reset", false)),
+    truncated: bool(get(d, "truncated", false)),
+    err: "",
+  };
+}
+
+// 目录浏览走 runner：EvalSymlinks 之后再比允许根，软链接逃逸在执行面就被挡掉。
+export func fs_list(dir, roots) {
+  let body = { dir: str(dir), roots: roots };
+  let r = runner_json("POST", "/fs/list", stringify(body), 8);
+  let d = get(r, "data", null);
+  if (not get(r, "ok", false) or d == null) {
+    return { ok: false, status: int(get(r, "status", 0)), dir: "", entries: [], err: str(get(r, "err", "runner 不可达")) };
+  }
+  let out = [];
+  let items = get(d, "entries", []);
+  let i = 0;
+  while (i < len(items)) {
+    let e = get(items, i, {});
+    push(out, { name: str(get(e, "name", "")), is_dir: bool(get(e, "is_dir", false)), size: int(get(e, "size", 0)) });
+    i = i + 1;
+  }
+  return { ok: true, status: 200, dir: str(get(d, "dir", "")), entries: out, err: "" };
+}
+
 export func alive() {
   let r = runner_json("GET", "/healthz", null, 2);
   return get(r, "ok", false);

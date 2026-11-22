@@ -31,7 +31,8 @@ services:
       RUNNER_BASE: http://runner:8899
       # runner 的令牌与 cicdkit 的 CICD_AUTH 同一个坑：env 名含 TOKEN 会被
       # Lume 的 env() 屏蔽，所以这里叫 RUNNER_AUTH。
-      RUNNER_AUTH: ${RUNNER_AUTH:-change-me-runner}
+      # 必须显式注入：make docker 会自动生成 .data/runner.token 并传进来。
+      RUNNER_AUTH: ${RUNNER_AUTH:?先设置 RUNNER_AUTH（make docker 会自动生成）}
       CICD_DEPLOY_APPROVAL: ${CICD_DEPLOY_APPROVAL:-off}
       # 项目配置里存的是**宿主绝对路径**，runner 又是按宿主路径解析 context 的，
       # 所以控制面必须也挂同一批路径、用同一个值做允许根 —— 再映射到 /projects
@@ -79,8 +80,11 @@ services:
     environment:
       RUNNER_BIND: 0.0.0.0:8899
       RUNNER_LOG_DIR: /logs
-      RUNNER_AUTH: ${RUNNER_AUTH:-change-me-runner}
-      RUNNER_ALLOW: ${RUNNER_ALLOW:-docker,kubectl,helm,ssh,scp,git,sudo}
+      # 必须显式注入：make docker 会自动生成 .data/runner.token 并传进来。
+      RUNNER_AUTH: ${RUNNER_AUTH:?先设置 RUNNER_AUTH（make docker 会自动生成）}
+      # 不再默认放行 sudo：runner 本身是 root，sudo 没有语义，只是多一条
+      # 可被白名单放行的命令。
+      RUNNER_ALLOW: ${RUNNER_ALLOW:-docker,kubectl,helm,ssh,scp,git}
       RUNNER_MAX_JOBS: ${RUNNER_MAX_JOBS:-4}
     volumes:
       # 与控制面共享日志目录（字节偏移增量读的前提）。

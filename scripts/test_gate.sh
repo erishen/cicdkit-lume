@@ -278,7 +278,9 @@ expect_code 404 "访客统计：项目不存在 → 404"
 call GET "/api/deployments/nope"
 expect_code 404 "部署详情：不存在 → 404"
 call POST "/api/deployments/nope/diagnose"
-expect_code 404 "部署诊断：不存在 → 404"
+expect_code 403 "部署诊断：未声明角色被拦 → 403"
+call POST "/api/deployments/nope/diagnose?role=agent_operator"
+expect_code 404 "部署诊断：角色合法但记录不存在 → 404"
 
 # 8.5) 角色口令绑定：另起一个实例，CICD_ROLE_MAP 一设，?role= 自报就不作数了
 echo "▶ 角色口令绑定（CICD_ROLE_MAP）"

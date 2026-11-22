@@ -125,3 +125,18 @@ tsmhub-lume 取代时，要么前者支持 Bearer、要么 cicdkit-lume 换用 `
 迁移时修掉一个 `chat_url` 的偏移 bug：原来用 `len(base)-4` 比 `"/v1"`，
 比的是「含前一字符的 4 位尾巴」，永远不相等，导致 base 已带 `/v1` 时又拼成
 `/v1/v1/chat/completions`（网关 404）。现在按字面量长度比较。
+
+## 执行面加固（2026-11）
+
+- **日志区间读**：控制面优先走 runner `GET /jobs/:id/log?from=…&max=…`（单次 ≤256 KiB），
+  不再每 1.5s 把整份日志 `read_file` 进 DSL；runner 重启丢 job 或老运行没有 `job_id`
+  时回落到共享日志目录。
+- **目录浏览 realpath**：`/api/fs/list` 先做字符串前缀校验（拒 `..`），再由 runner
+  `EvalSymlinks` 后用真实路径比根；指向根外的软链接条目直接不返回。纯字符串校验
+  挡不住 `root/link -> /etc`，这是原来的一处越权读。
+- **诊断门禁**：两个 `diagnose` 端点要求任意已知角色（role-map 模式下仍需口令），
+  并加全局每分钟 3 次的模型调用限额；同一 run 命中缓存时不计数。
+- **runner 令牌必填**：compose 里 `RUNNER_AUTH` 不再是 `change-me-runner` 弱默认，
+  `make docker` 会生成 `.data/runner.token`（0600）并注入；默认白名单去掉 `sudo`。
+- **Prometheus 认证**：`HTPASSWD_FILE` 会同时保护 `/metrics/cicdkit`。启用 Basic Auth
+  后必须给 Prometheus job 配 `basic_auth`（用户名/密码文件），否则抓取 401。

@@ -162,6 +162,19 @@ export func role_allowed(req, role, label) {
   return { allowed: true, role: got, action: role, reason: "", auth: str(get(who, "via", "")) };
 }
 
+// 只要角色能解析出来（任一已知角色）就放行：用于「读日志/诊断」这类
+// 不写状态、但要防止匿名滥用的动作。role-map 模式下仍然必须带对口令。
+export func role_any(req, label) {
+  let who = resolve_role(req);
+  if (not bool(get(who, "ok", false))) {
+    return {
+      allowed: false, role: str(get(who, "role", "")), action: "any", auth: str(get(who, "via", "")),
+      reason: label + "被拒：" + str(get(who, "reason", "角色不明")),
+    };
+  }
+  return { allowed: true, role: str(get(who, "role", "")), action: "any", reason: "", auth: str(get(who, "via", "")) };
+}
+
 // GET /api/meta 用：让前端知道闸门当前模式与默认审批链。
 export func policy() {
   return {

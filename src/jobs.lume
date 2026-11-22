@@ -342,6 +342,24 @@ export func cancel(run_id) {
 export func tail(run_id, from) {
   let r = sync(run_id);
   if (r == null) { return null; }
+  // 优先走 runner 的区间读：只回 256 KiB 窗口，不再每次轮询 read_file 整个
+  // 日志（16 MiB 的日志 + 1.5s 轮询会把控制面 CPU 吃满）。
+  // runner 重启会丢 job，老运行/归档运行也可能没有 job_id，这时回落到共享
+  // 日志目录按原逻辑读整个文件。
+  let jid = str(get(r, "job_id", ""));
+  if (len(jid) > 0) {
+    let g = exec.log_range(jid, from, 262144);
+    if (get(g, "ok", false)) {
+      return {
+        run: r,
+        log: str(get(g, "log", "")),
+        log_len: int(get(g, "log_len", 0)),
+        reset: bool(get(g, "reset", false)),
+        truncated: bool(get(g, "truncated", false)),
+        err: "",
+      };
+    }
+  }
   let t = store.read_log_tail(run_id, from, 262144);
   return {
     run: r,
