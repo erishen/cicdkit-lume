@@ -115,6 +115,13 @@ tsm-hub 里新增了一个并行 job：
 model 选 `chat`（网关把它映射到 `fastpath:codegen`，实测 4s 内返回；
 `auto`/`deepseek-v4-flash` 在该网关排队常超 60s，做诊断不划算）。
 
+注意这是 **tsm-hub 网关**（宿主 19070 → 容器 9070），不是 `tsmhub-lume`。
+`tsmhub-lume`（18108）虽然也透传 `/v1/*`，但要求客户端用 `X-Api-Key` 传
+`sk-tr-…`（Lume 脚本层读不到 `Authorization`），而 cicdkit-lume 的客户端发的是
+`Authorization: Bearer`，直指过去只会得到 `missing_key`。等 tsm-hub 真正被
+tsmhub-lume 取代时，要么前者支持 Bearer、要么 cicdkit-lume 换用 `X-Api-Key`，
+再改 base_url 即可。
+
 迁移时修掉一个 `chat_url` 的偏移 bug：原来用 `len(base)-4` 比 `"/v1"`，
 比的是「含前一字符的 4 位尾巴」，永远不相等，导致 base 已带 `/v1` 时又拼成
 `/v1/v1/chat/completions`（网关 404）。现在按字面量长度比较。
