@@ -51,6 +51,8 @@ services:
       CICD_SSH_USER: ${CICD_SSH_USER:-}
       CICD_SSH_PORT: ${CICD_SSH_PORT:-}
       CICD_SSH_KEY_PATH: ${CICD_SSH_KEY_PATH:-}
+      # 归档保留条数（默认 1000）；留空即用代码默认。
+      CICD_ARCHIVE_KEEP: ${CICD_ARCHIVE_KEEP:-}
     volumes:
       # 可写：SQLite（store.db）+ secrets/ + 运行日志（runner 追加写、这里读）。
       - ./.data:/app/.data

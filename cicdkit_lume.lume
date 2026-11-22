@@ -86,6 +86,14 @@ func qint(req, key, def) {
   return n;
 }
 
+// 列表接口的 limit 上限：不设上限时 ?limit=1000000 会原样拼进 SQL，
+// 把结果全查出来再序列化，一次请求就能把 worker 和内存顶满。
+func qlimit(req, key, def) {
+  let n = qint(req, key, def);
+  if (n > 500) { return 500; }
+  return n;
+}
+
 func qstr(req, key, def) {
   let qp = get(req, "query_params", null);
   if (qp == null) { return def; }
@@ -178,7 +186,7 @@ post "/api/webhook/:id", (req) => {
 // ---------- 项目 ----------
 
 get "/api/projects", (req) => {
-  let page = api.project_list(qstr(req, "q", ""), qint(req, "limit", 200), qint(req, "offset", 0));
+  let page = api.project_list(qstr(req, "q", ""), qlimit(req, "limit", 200), qint(req, "offset", 0));
   return { status: 200, body: page };
 };
 
@@ -301,7 +309,7 @@ get "/api/fs/list", (req) => {
 // ---------- 运行 ----------
 
 get "/api/runs", (req) => {
-  return { status: 200, body: api.run_list(qstr(req, "project_id", ""), qint(req, "limit", 100), qint(req, "offset", 0)) };
+  return { status: 200, body: api.run_list(qstr(req, "project_id", ""), qlimit(req, "limit", 100), qint(req, "offset", 0)) };
 };
 
 delete "/api/runs", (req) => {
@@ -312,7 +320,7 @@ delete "/api/runs", (req) => {
 
 // 归档列表必须排在 /api/runs/:id 之前，否则 "archive" 会被当成一个 run id。
 get "/api/runs/archive", (req) => {
-  return api.run_archive(qint(req, "limit", 200));
+  return api.run_archive(qlimit(req, "limit", 200));
 };
 
 post "/api/runs/:id/restore", (req) => {
@@ -347,7 +355,7 @@ get "/api/runs/:id", (req) => {
 // ---------- 部署历史 ----------
 
 get "/api/deployments", (req) => {
-  return { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qint(req, "limit", 100), qint(req, "offset", 0)) };
+  return { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qlimit(req, "limit", 100), qint(req, "offset", 0)) };
 };
 
 get "/api/deployments/:id", (req) => {
@@ -369,7 +377,7 @@ delete "/api/deployments", (req) => {
 // ---------- 知识库 ----------
 
 get "/api/kb", (req) => {
-  return { status: 200, body: api.kb_list(qstr(req, "q", ""), qint(req, "limit", 200)) };
+  return { status: 200, body: api.kb_list(qstr(req, "q", ""), qlimit(req, "limit", 200)) };
 };
 
 post "/api/kb", (req) => {

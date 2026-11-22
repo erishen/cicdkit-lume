@@ -9,6 +9,7 @@
 //（unix 整秒，见 runner/main.go 的 StepState），控制面这里直接相减。
 
 import "store.lume" as store;
+import "exec.lume" as exec;
 
 // 与上游 durationBuckets 一致（秒）。
 let BUCKETS = [10, 30, 60, 120, 300, 600, 1800, 3600];
@@ -122,13 +123,25 @@ export func text() {
   }
 
   let active = int(get(counts, "queued", 0)) + int(get(counts, "running", 0));
+  let queued = int(get(counts, "queued", 0));
+  let runner_up = 0;
+  if (exec.alive()) { runner_up = 1; }
   let b = "";
   b = b + "# HELP cicdkit_active_runs Runs currently queued or running.\n";
   b = b + "# TYPE cicdkit_active_runs gauge\n";
   b = b + "cicdkit_active_runs " + str(active) + "\n";
+  b = b + "# HELP cicdkit_queued_runs Runs waiting for a runner slot.\n";
+  b = b + "# TYPE cicdkit_queued_runs gauge\n";
+  b = b + "cicdkit_queued_runs " + str(queued) + "\n";
   b = b + "# HELP cicdkit_max_concurrent Runner concurrency limit.\n";
   b = b + "# TYPE cicdkit_max_concurrent gauge\n";
   b = b + "cicdkit_max_concurrent " + str(max_jobs()) + "\n";
+  b = b + "# HELP cicdkit_runner_up Whether the runner answers /healthz (1/0).\n";
+  b = b + "# TYPE cicdkit_runner_up gauge\n";
+  b = b + "cicdkit_runner_up " + str(runner_up) + "\n";
+  b = b + "# HELP cicdkit_archive_runs Runs moved to the archive (retention window).\n";
+  b = b + "# TYPE cicdkit_archive_runs gauge\n";
+  b = b + "cicdkit_archive_runs " + str(store.count_archive()) + "\n";
 
   b = b + "# HELP cicdkit_runs_total Retained runs by terminal/transient status.\n";
   b = b + "# TYPE cicdkit_runs_total gauge\n";

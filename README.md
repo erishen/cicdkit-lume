@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 自测：store 66 + exec 73 + generate 26 + a2a 45 + 闸门 108 + runner go test（临时实例，不碰真实数据）
+make test       # 自测：store 77 + exec 73 + generate 26 + a2a 45 + 闸门 108 + runner go test（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -104,6 +104,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_DEPLOY_APPROVAL` | `off` | `off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
 | `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
 | `CICD_RUN_KEEP` | `300` | 运行历史保留条数；超出的**归档**（不删除），可用 `make restore ID=...` 恢复 |
+| `CICD_ARCHIVE_KEEP` | `1000` | 归档保留条数；超出的最老归档连日志一起清掉（每次归档后裁剪） |
 | `CICD_ROLE_MAP` | 空 | `human_admin=口令;agent_operator=口令`：设置后角色只能由 `?pass=` 反查，`?role=` 自报作废 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `CICDKIT_PEER_SHARED` | 空 | peer 面共享密钥（与上游 `CICDKIT_PEER_*` 同一套命名，可与旧节点互通）。为空且没配 ROOT 时整面 fail-closed 关闭 |
@@ -365,6 +366,7 @@ make test     # store 39 + exec 61 + gate 24
 
 ```bash
 make docker        # 控制面 + runner 双服务 → http://127.0.0.1:18107
+make backup     # SQLite 在线备份到 .data/backups/store-<ts>.db，保留 BACKUP_KEEP（默认 14）份
 make docker-logs
 make docker-down
 ```
@@ -400,8 +402,8 @@ make docker-down
   带 `truncated` / `log_note`，前端顶部提示，完整日志去看控制面的 `<LUME_DATA>/logs/<run_id>.log`。
 - **`write_file` 也有 16 MiB 上限**：控制面侧无法用 DSL 自己生成超大文件（自测里的 17 MiB 日志样本由 Makefile 用 dd 预置）。
   runner 是 Go 写的，写日志不受这条限制，但控制面读回来时仍受 16 MiB 读取上限约束，所以才有上面的封顶。
-- **归档不会自动清理**：`runs_archive` + `logs-archive/` 是"防误删"的缓冲，不参与 `CICD_RUN_KEEP`。
-  归档量大了需要手动处理（归档的日志内容进 `logs-archive/`，恢复后又被截成 0 字节，占用很小）。
+- **归档按条数保留**：`runs_archive` + `logs-archive/` 受 `CICD_ARCHIVE_KEEP`（默认 1000）约束，
+  每次归档后裁剪最老的；`CICD_RUN_KEEP` 管的是活跃运行，两者独立。
   超过 16 MiB 的日志归档不了，`log_archived=false` 且原文件保留在 `logs/` 里。
 - **SQLite 不能建索引**：DDL 护栏只允许 `CREATE TABLE`，`CREATE INDEX` 被拒。当前 200 来条记录无所谓，
   记录量上百倍增长后列表查询会变慢，到那时得换存储层而不是硬扛。

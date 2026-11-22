@@ -140,3 +140,24 @@ tsmhub-lume 取代时，要么前者支持 Bearer、要么 cicdkit-lume 换用 `
   `make docker` 会生成 `.data/runner.token`（0600）并注入；默认白名单去掉 `sudo`。
 - **Prometheus 认证**：`HTPASSWD_FILE` 会同时保护 `/metrics/cicdkit`。启用 Basic Auth
   后必须给 Prometheus job 配 `basic_auth`（用户名/密码文件），否则抓取 401。
+
+## 第二批优化（2026-11）
+
+- **归档保留上限**：新增 `CICD_ARCHIVE_KEEP`（默认 1000）。原来归档是「只进不出」的
+  防误删缓冲，长期跑会在 `runs_archive` 和 `logs-archive/` 里无限增长；现在每次归档后
+  按 `archived_ts ASC` 裁掉最老的，裁之前把归档日志截成 0 字节再删行。
+- **删除项目级联**：`DELETE /api/projects/:id` 原来只删 `projects` 行，运行、归档、
+  部署、知识库全部成为孤儿；现在统一走 `delete_project_cascade`，一并截断日志并删除，
+  响应里带 `cascade: {runs, archive, deployments, kb}` 统计。
+- **列表 limit 上限**：所有列表接口的 `limit` 统一经 `qlimit` 截到 500，避免
+  `?limit=1000000` 把整库查出来再序列化。
+- **指标补齐**：新增 `cicdkit_queued_runs`、`cicdkit_runner_up`（runner `/healthz` 探活
+  1/0）、`cicdkit_archive_runs`；tsm-hub 侧对应新增 `CicdkitLumeRunnerDown` 与
+  `CicdkitLumeQueueStuck` 两条告警。
+- **日志脱敏扩指纹**：除 `sk-`、`Bearer`、`*_KEY/SECRET/TOKEN` 外，新增 GitHub
+  （`ghp_/gho_/ghu_/ghs_/ghr_`）、GitLab（`glpat-`）、Slack（`xoxb-/xoxp-/xoxa-/xoxr-/xoxs-`）
+  与 AWS（`AKIA/ASIA`）的 token 形态，只保留前缀。
+- **备份**：`make backup` 用 `sqlite3 .backup` 在线备份到 `.data/backups/store-<ts>.db`
+  （0600，目录 700），保留 `BACKUP_KEEP`（默认 14）份。
+- **镜像对齐**：`Dockerfile` 的 UI 构建阶段默认 `node:24-alpine`，Lume 二进制阶段默认
+  与 compose 一致的 `lume-bin:0.14.2`。

@@ -171,6 +171,33 @@ export func delete_project(id) {
   return int(n);
 }
 
+// 删除项目时把它的运行/部署/知识库一起清掉：只删 projects 行会留下一堆
+// 孤儿记录和日志文件，列表里仍然看得到「已删项目」的历史。
+// 日志与归档日志都用截断代替删除（DSL 没有 remove_file）。
+export func delete_project_cascade(id) {
+  let pid = str(id);
+  let run_ids = [];
+  for (row in sql_query(db(), "SELECT id FROM runs WHERE project_id = ?", [pid])) {
+    push(run_ids, str(get(row, "id", "")));
+  }
+  for (rid in run_ids) {
+    write_file(run_log_path(rid), "");
+    sql_write(db(), "DELETE FROM runs WHERE id = ?", [rid]);
+  }
+  let arc_ids = [];
+  for (row in sql_query(db(), "SELECT id FROM runs_archive WHERE project_id = ?", [pid])) {
+    push(arc_ids, str(get(row, "id", "")));
+  }
+  for (rid in arc_ids) {
+    write_file(archive_dir() + "/" + str(rid) + ".log", "");
+    sql_write(db(), "DELETE FROM runs_archive WHERE id = ?", [rid]);
+  }
+  let dep_count = int(sql_write(db(), "DELETE FROM deployments WHERE project_id = ?", [pid]));
+  let kb_count = int(sql_write(db(), "DELETE FROM kb WHERE project_id = ?", [pid]));
+  let prj = int(sql_write(db(), "DELETE FROM projects WHERE id = ?", [pid]));
+  return { project: prj, runs: len(run_ids), archive: len(arc_ids), deployments: dep_count, kb: kb_count };
+}
+
 // ---------- 运行 ----------
 
 export func list_runs(project_id, limit, offset) {
@@ -294,6 +321,40 @@ export func archive_runs(keep) {
 
 // 兼容旧名字（jobs.start 之前调的是 trim_runs）。
 export func trim_runs(keep) { return archive_runs(keep); }
+
+// 归档保留条数（CICD_ARCHIVE_KEEP，默认 1000）。归档只进不出的话，磁盘会
+// 被 logs-archive/ 慢慢吃满，所以按时间顺序清最老的那批。
+export func archive_keep() {
+  let d = env("CICD_ARCHIVE_KEEP");
+  if (d == null) { return 1000; }
+  let k = int(d);
+  if (k <= 0) { return 1000; }
+  return k;
+}
+
+// 清掉超出 keep 的最老归档：先清空归档日志文件（DSL 没有 remove_file），
+// 再删 runs_archive 行。返回清掉的条数。
+export func prune_archive(keep) {
+  let k = int(keep);
+  if (k < 1) { k = 1; }
+  let rows = sql_query(db(),
+    "SELECT id FROM runs_archive ORDER BY archived_ts ASC, id ASC LIMIT -1 OFFSET " + str(k), []);
+  let n = 0;
+  for (row in rows) {
+    let rid = str(get(row, "id", ""));
+    if (len(rid) == 0) { continue; }
+    write_file(archive_dir() + "/" + rid + ".log", "");
+    sql_write(db(), "DELETE FROM runs_archive WHERE id = ?", [rid]);
+    n = n + 1;
+  }
+  return n;
+}
+
+export func count_archive() {
+  let rows = sql_query(db(), "SELECT COUNT(*) AS n FROM runs_archive", []);
+  if (len(rows) == 0) { return 0; }
+  return int(get(rows[0], "n", 0));
+}
 
 export func list_archive(limit) {
   let rows = sql_query(db(),

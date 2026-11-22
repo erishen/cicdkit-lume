@@ -150,6 +150,15 @@ for (e in alist2) { if (str(get(e, "id", "")) == "run-arc-0") { still = true; } 
 ok("恢复后归档里不再留这条", not still);
 ok("恢复不存在的归档会报错", bool(get(store.restore_run("no-such-run"), "ok", true)) == false);
 ok("CICD_RUN_KEEP 默认 300", int(store.run_keep()) == 300);
+// 归档保留上限：只留最新 1 条，其余归档行清掉（日志文件截成 0）。
+// 上面的恢复已经把归档降到 1 条，这里直接塞两条更老的来验证真正的裁剪。
+sql_write(store.db(), "INSERT OR REPLACE INTO runs_archive (id, project_id, json, archived_ts, log_archived, log_bytes) VALUES (?, ?, ?, 1, 0, 0)", ["arc-old-1", "proj-t1", "{}"]);
+sql_write(store.db(), "INSERT OR REPLACE INTO runs_archive (id, project_id, json, archived_ts, log_archived, log_bytes) VALUES (?, ?, ?, 2, 0, 0)", ["arc-old-2", "proj-t1", "{}"]);
+let before_pr = store.count_archive();
+let pr = store.prune_archive(1);
+ok("归档裁剪掉超出上限的行", int(pr) > 0 and store.count_archive() <= 1);
+ok("裁剪条数等于超出部分", int(before_pr) - int(pr) == store.count_archive());
+ok("CICD_ARCHIVE_KEEP 默认 1000", int(store.archive_keep()) == 1000);
 
 // ---- 部署 / 知识库 ----
 print("store: deployments + kb");
@@ -218,6 +227,12 @@ ok("字符串内嵌密钥被替换", len(str_match("DEMO_VISIT_PIN=", stringify(
 ok("非密钥参数保持原样", len(str_match("DEMO_READONLY=1", stringify(cleaned))) > 0);
 ok("命中计数与路径", int(get(acc, "n", 0)) == 2 and len(get(acc, "items", [])) == 2);
 
+// 代码托管 / IM / 云厂商的 token 也要打码（日志里并不只有 sk- 一种）。
+let leaky = redact.mask_log("git push https://ghp_abcdefghijklmnop123456@x AKIAABCDEFGHIJKLMNOP xoxb-123456789012-abc");
+ok("GitHub token 打码", len(str_match("ghp_abcdefghijklmnop", leaky)) == 0);
+ok("AWS key 打码", len(str_match("AKIAABCDEFGHIJKLMNOP", leaky)) == 0);
+ok("Slack token 打码", len(str_match("xoxb-123456789012", leaky)) == 0);
+
 // ---- 清空 ----
 print("store: clear");
 // 上面的保留策略留下 3 条、恢复回来 1 条，清空必须把它们全删掉。
@@ -227,6 +242,21 @@ ok("运行已空", int(get(store.list_runs("", 10, 0), "total", 0)) == 0);
 ok("清空部署", int(store.clear_deployments()) == 5);
 ok("删除项目", int(store.delete_project("proj-t1")) == 1);
 ok("项目已删", store.get_project("proj-t1") == null);
+
+// ---- 级联删除 ----
+print("store: cascade");
+store.put_project({ id: "proj-del", name: "del", description: "", repository: "", branch: "main" }, true);
+store.put_run({ id: "run-del", project_id: "proj-del", project_name: "del", trigger: "manual",
+  status: "success", image_ref: "del:1", created_ts: now() });
+store.write_log("run-del", "some log\n");
+store.put_deployment({ id: "dep-del", project_id: "proj-del", project_name: "del", method: "ssh", status: "success" });
+store.put_kb({ id: "kb-del", project_id: "proj-del", project_name: "del", stage: "build", signature: "x", error_keyword: "y" });
+let cas = store.delete_project_cascade("proj-del");
+ok("级联删掉项目", int(get(cas, "project", 0)) == 1 and store.get_project("proj-del") == null);
+ok("级联删掉运行", int(get(cas, "runs", 0)) == 1 and int(get(store.list_runs("proj-del", 10, 0), "total", 0)) == 0);
+ok("级联删掉部署", int(get(cas, "deployments", 0)) == 1);
+ok("级联删掉知识库", int(get(cas, "kb", 0)) == 1);
+ok("级联清空运行日志", len(read_file(store.run_log_path("run-del"))) == 0);
 
 print("");
 let nc = int(get(st, "checks", 0));

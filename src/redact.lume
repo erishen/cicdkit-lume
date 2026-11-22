@@ -205,6 +205,9 @@ export func merge_secrets(incoming, stored) {
 
 let SECRET_RE = "([A-Za-z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_PIN)=)([^ \t\r\n'\"&]+)";
 let KEY_RE = "(sk-)[A-Za-z0-9_-]{12,}";
+// 常见代码托管/IM/云厂商的 token 形态：只保留前缀，后面整段打码。
+let PROVIDER_RE = "(ghp_|gho_|ghu_|ghs_|ghr_|glpat-|xoxb-|xoxp-|xoxa-|xoxr-|xoxs-)([A-Za-z0-9_-]{10,})";
+let AWS_RE = "(AKIA|ASIA)([A-Z0-9]{12,})";
 let BEARER_RE = "(Bearer[ \t]+)([A-Za-z0-9._-]{16,})";
 
 // 保留 group 1（键名/前缀），把后面那截值换成掩码。
@@ -295,6 +298,8 @@ export func mask_log(text) {
   if (len(s) == 0) { return ""; }
   s = mask_after_prefix(s, SECRET_RE);
   s = mask_after_prefix(s, KEY_RE);
+  s = mask_after_prefix(s, PROVIDER_RE);
+  s = mask_after_prefix(s, AWS_RE);
   s = mask_after_prefix(s, BEARER_RE);
   return s;
 }

@@ -147,6 +147,10 @@ docker: .data/runner.token
 	 docker compose up -d --build
 	@echo "▶ http://127.0.0.1:18107"
 
+# SQLite 在线备份，默认留 14 份（BACKUP_KEEP 可覆盖）。
+backup:
+	@bash scripts/backup.sh
+
 docker-logs: .data/runner.token
 	@RUNNER_AUTH=$$(cat .data/runner.token) PROJECTS_ROOT=$(WORK) LEGACY_DATA=$(abspath $(LEGACY)) \
 	 docker compose logs -f --tail=100

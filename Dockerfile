@@ -10,8 +10,8 @@
 # lume 是静态链接的 C 单二进制。默认从已有的 lume 镜像里取（离线可用），
 # 想换成自编版本：--build-arg LUME_BIN_IMAGE=<含 /usr/local/bin/lume 的镜像>。
 
-ARG NODE_IMAGE=node:20-alpine
-ARG LUME_BIN_IMAGE=windgl-china-lume:latest
+ARG NODE_IMAGE=node:24-alpine
+ARG LUME_BIN_IMAGE=lume-bin:0.14.2
 ARG RUNTIME_IMAGE=alpine:3.20
 
 # ---------- 阶段 1：React 控制台 ----------

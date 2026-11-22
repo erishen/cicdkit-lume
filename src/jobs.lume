@@ -172,6 +172,7 @@ export func start(project, kind, opts) {
   });
   // 新运行已经落库、提交成功，这里顺手把超龄历史归档（不是删除，可恢复；失败不影响本次运行）。
   try(() => store.archive_runs(store.run_keep()));
+  try(() => store.prune_archive(store.archive_keep()));
   return { ok: true, run_id: rid, err: "", image_ref: image, target: target };
 }
 

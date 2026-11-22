@@ -193,8 +193,8 @@ export func project_create(raw) {
 
 export func project_delete(id) {
   if (not store.project_exists(id)) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
-  store.delete_project(id);
-  return { status: 200, body: { ok: true, deleted: str(id) } };
+  let c = store.delete_project_cascade(id);
+  return { status: 200, body: { ok: true, deleted: str(id), cascade: c } };
 }
 
 // 扫描：把工作目录下「像项目」的目录列出来，用它们的 Dockerfile / manifest 预填表单。
