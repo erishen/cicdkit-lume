@@ -116,6 +116,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICDKIT_A2A_PUBLIC_URL` | 空 | Agent Card 里对外公告的地址。**Lume 读不到请求头（也就读不到 Host）**，不配就只能拼 `http://127.0.0.1:<LUME_PORT>` |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `CICDKIT_BASIC_USER` / `CICDKIT_BASIC_PASS` | `cicd` / 空 | Basic Auth 的用户名与口令（写在 `.env`，`make auth` 读取并生成派生文件）。它会同时保护 `/api/*` 与 `/metrics/cicdkit`：Prometheus 必须配 `basic_auth`（tsm-hub 侧已配好） |
+| `CICD_DEFAULT_ROLE` | `agent_operator` | 顶栏默认业务角色；`human_admin` 可让单人 `cicd` 账号首次打开就具备生成脚手架/改配置权限。只影响默认值，用户仍可在顶栏切换 |
 
 ### runner
 
@@ -206,6 +207,9 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
   `~/.config/cicdkit-lume`（`htpasswd`、`username`、`prometheus.pass`、`health-header`）。
   浏览器首次访问会弹 Basic 认证框；curl/脚本要带 `-u "<用户名>:<口令>"`。容器健康检查与
   Prometheus 抓取都用同一份派生文件，改 `.env` 后重跑 `make docker` 即可。
+- **Basic Auth 账号 ≠ 业务角色**：`cicd` 只证明通过了身份认证；`?role=` 决定能做什么。
+  单人本地用 `cicd` 登录时把 `.env` 的 `CICD_DEFAULT_ROLE` 设成 `human_admin`，前端首次加载
+  会把顶栏切到「终审」，之后仍可手动切回操作员。
 - 指标在 `/metrics/cicdkit`：`/metrics` 被 lume 的 agent-httpd 硬编码占用，脚本层改不了。
 - 直方图只统计改版后跑过的运行：runner 新加了 `started_ts`/`ended_ts`，旧记录没有。
 - 身份边界是 `HTPASSWD_FILE` + 角色口令：Lume 读不到请求头，实现不了上游的 `X-API-Token`。

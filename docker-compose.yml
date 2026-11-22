@@ -55,6 +55,8 @@ services:
       CICD_ARCHIVE_KEEP: ${CICD_ARCHIVE_KEEP:-}
       # Basic Auth：凭据由 `make auth` 生成在 ~/.config/cicdkit-lume，不进仓库。
       HTPASSWD_FILE: /auth/htpasswd
+      # 顶栏默认角色；单人用 cicd 账号时设为 human_admin，省去每次手切。
+      CICD_DEFAULT_ROLE: ${CICD_DEFAULT_ROLE:-agent_operator}
     volumes:
       # 可写：SQLite（store.db）+ secrets/ + 运行日志（runner 追加写、这里读）。
       - ./.data:/app/.data

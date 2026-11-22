@@ -142,7 +142,7 @@ export interface LLMStatus {
 export interface Meta {
   service: string
   upstream: string
-  approval: { mode: string; chain: string[]; roles: string[]; auth?: string }
+  approval: { mode: string; chain: string[]; roles: string[]; auth?: string; default_role?: string }
   llm?: LLMStatus
 }
 

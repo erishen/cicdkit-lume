@@ -177,10 +177,14 @@ export func role_any(req, label) {
 
 // GET /api/meta 用：让前端知道闸门当前模式与默认审批链。
 export func policy() {
+  let def = env("CICD_DEFAULT_ROLE");
+  let role_default = "agent_operator";
+  if (def != null and approval.known_role(str(def))) { role_default = str(def); }
   return {
     mode: mode(),
     chain: approval.chain_for("medium"),
     roles: ["agent_operator", "agent_reviewer", "agent_reviewer_second", "human_admin"],
     auth: auth_mode(),
+    default_role: role_default,
   };
 }

@@ -64,6 +64,8 @@ const PROBE_LABEL: Record<string, string> = {
 
 const ROLE_KEY = 'cicdkit_lume_role'
 const ROLE_PASS_KEY = 'cicdkit_lume_role_pass'
+// 服务端下发默认角色时只应用一次，之后用户在顶栏切换的选择继续生效。
+const ROLE_DEFAULT_MARK = 'cicdkit_lume_role_default_applied'
 
 function readRole(): string {
   try {
@@ -2183,6 +2185,21 @@ function App() {
     setRolePass(next)
     writeRolePass(next)
   }
+
+  // 默认角色（CICD_DEFAULT_ROLE）只在第一次见到时套用：单人用 cicd 账号登录时
+  // 不必每次手动把顶栏从「操作员」切到「终审」；之后用户自己切换仍会被记住。
+  useEffect(() => {
+    const def = meta?.approval.default_role
+    if (!def || !Object.keys(ROLE_LABEL).includes(def)) return
+    try {
+      if (localStorage.getItem(ROLE_DEFAULT_MARK) === def) return
+      changeRole(def)
+      localStorage.setItem(ROLE_DEFAULT_MARK, def)
+    } catch {
+      /* 隐私模式：不记忆，但本次仍切过去 */
+      changeRole(def)
+    }
+  }, [meta])
 
   const approvalMode = meta?.approval.mode || 'off'
 
