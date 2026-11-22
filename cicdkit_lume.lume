@@ -170,6 +170,16 @@ post "/api/projects/:id/targets/:target/deploy", (req) => {
   return api.project_deploy(id, "{\"target\":\"" + target + "\"}");
 };
 
+// 回滚上一版：和 deploy 一样属于"对外发布"，所以走同一个审批闸门。
+post "/api/projects/:id/rollback", (req) => {
+  let id = str(get(req.params, "id", ""));
+  let gate = guard.deploy_allowed(req);
+  if (not get(gate, "allowed", false)) {
+    return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
+  }
+  return api.project_rollback(id, body_of(req));
+};
+
 // 脚手架生成：必须在 :action 之前注册，否则会被当成未知动作。
 post "/api/projects/:id/generate", (req) => {
   let id = str(get(req.params, "id", ""));

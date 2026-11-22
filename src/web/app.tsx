@@ -339,6 +339,37 @@ function ProjectsPage({ role }: { role: string }) {
     }
   }
 
+  // 回滚上一版：后端自己找「同目标的上一个成功镜像」，前端只负责确认与展示
+  const rollback = async (p: Project) => {
+    const cur = p.last_deploy
+    if (
+      !window.confirm(
+        `确认把「${p.name}」回滚到上一版？\n当前镜像：${cur?.image_ref || '未知'}\n目标：${
+          cur?.target || '默认'
+        }\n角色：${ROLE_LABEL[role] || role}`,
+      )
+    ) {
+      return
+    }
+    setBusy(p.id + ':rollback')
+    setNotice(null)
+    try {
+      const res = await API.rollback(p.id, role, { target: cur?.target || '' })
+      setNotice({
+        id: p.id,
+        kind: 'ok',
+        text: `回滚已触发：${res.image_ref || ''}（原 ${res.rolled_back_from || '—'}）${
+          res.run_id ? '，运行 ' + res.run_id : ''
+        }`,
+      })
+      load()
+    } catch (e: any) {
+      setNotice({ id: p.id, kind: 'err', text: e.message || String(e) })
+    } finally {
+      setBusy('')
+    }
+  }
+
   // 补脚手架：先预览，确认后才落盘（已有文件永不覆盖，所以可以放心点）
   const scaffold = async (p: Project) => {
     setBusy(p.id + ':generate')
@@ -468,6 +499,16 @@ function ProjectsPage({ role }: { role: string }) {
                   >
                     {busy === p.id + ':deploy' ? '发布中…' : '发布'}
                   </button>
+                  {p.last_deploy ? (
+                    <button
+                      className="btn ghost"
+                      disabled={busy !== ''}
+                      onClick={() => rollback(p)}
+                      title="回滚到同一目标的上一个成功发布"
+                    >
+                      {busy === p.id + ':rollback' ? '回滚中…' : '回滚上一版'}
+                    </button>
+                  ) : null}
                   <button
                     className="btn"
                     disabled={busy !== ''}

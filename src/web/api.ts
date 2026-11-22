@@ -316,6 +316,20 @@ export const API = {
       body: JSON.stringify(body || {}),
     }),
 
+  // 回滚上一版：后端按发布历史取同目标的上一个成功镜像再发一次
+  rollback: (id: string, role: string, body?: unknown) =>
+    request<{
+      ok: boolean
+      run_id?: string
+      image_ref?: string
+      target?: string
+      rolled_back_from?: string
+      error?: string
+    }>(`/api/projects/${encodeURIComponent(id)}/rollback${roleQuery(role)}`, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
+
   listRuns: (opts: { project_id?: string; limit?: number } = {}) => {
     const p = new URLSearchParams()
     if (opts.project_id) p.set('project_id', opts.project_id)

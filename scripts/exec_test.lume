@@ -5,9 +5,11 @@
 
 import "../src/exec.lume" as exec;
 import "../src/store.lume" as store;
+import "../src/jobs.lume" as jobs;
 
 // 注意：LUME 的标量赋值在函数内只改副本，全局计数必须放 map 里共享。
 let st = { checks: 0, fails: 0 };
+
 
 func eq(name, got, want) {
   put(st, "checks", int(get(st, "checks", 0)) + 1);
@@ -24,6 +26,9 @@ func has(name, hay, needle) {
     print("FAIL " + name + "\n  missing " + str(needle) + "\n  in " + str(hay));
   }
 }
+
+// runner 只接受绝对 cwd：没配 CICD_WORK_DIR 时不能回落到 "."，否则纯发布也提交不出去
+eq("未配 CICD_WORK_DIR 时工作目录仍是绝对路径", substr(jobs.work_dir(), 0, 1), "/");
 
 func no(name, hay, needle) {
   put(st, "checks", int(get(st, "checks", 0)) + 1);

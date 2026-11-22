@@ -14,7 +14,10 @@
 // created_at/updated_at 仍放在 json 里（导入的历史记录原样保留 cicdkit 的
 // RFC3339 字符串，新建的记录用 fmt_iso 生成）。
 
-let g_seq = 0;
+// 自增序号必须放在 map 里：函数内对标量的赋值只改副本（写不回模块作用域），
+// 直接用 `g_seq = g_seq + 1` 会让同一秒内的所有 new_id 返回同一个 id ——
+// 同秒建两个项目/两条运行就会互相覆盖（INSERT OR REPLACE 静默吃掉前一条）。
+let g_seq = { n: 0 };
 
 // ---------- 路径 ----------
 
@@ -59,8 +62,8 @@ export func init() {
 // 恰好落到同一秒」的情形，create_* 里再查一次库做兜底。
 
 func new_id(prefix) {
-  g_seq = g_seq + 1;
-  return str(prefix) + "-" + str(now()) + "-" + str(g_seq);
+  put(g_seq, "n", int(get(g_seq, "n", 0)) + 1);
+  return str(prefix) + "-" + str(now()) + "-" + str(int(get(g_seq, "n", 0)));
 }
 
 func id_free(table, prefix) {
@@ -404,6 +407,29 @@ export func list_deployments(project_id, limit, offset) {
     i = i + 1;
   }
   return { deployments: out, total: total };
+}
+
+// 回滚用：找同一个发布目标上、上上次成功发布的镜像。
+// deployments 只记成功（失败不写库），所以这里再按 status 过一道只是兜底。
+// 同一镜像连着发两次算一次（跳过与"当前这版"相同的记录）。
+export func prev_deploy(project_id, want_target) {
+  let tgt = trim(str(want_target));
+  let rows = sql_query(db(),
+    "SELECT json, image_ref, status FROM deployments WHERE project_id = ? ORDER BY created_ts DESC, id DESC LIMIT 500",
+    [str(project_id)]);
+  let cur = "";
+  let cur_tgt = "";
+  for (row in rows) {
+    if (str(get(row, "status", "")) != "success") { continue; }
+    let img = trim(str(get(row, "image_ref", "")));
+    if (len(img) == 0) { continue; }
+    let d = parse_json(str(get(row, "json", "")), {});
+    let t = str(get(d, "target", ""));
+    if (len(tgt) > 0 and t != tgt) { continue; }
+    if (len(cur) == 0) { cur = img; cur_tgt = t; continue; }
+    if (img != cur) { return { ok: true, image_ref: img, target: t, current_image: cur, err: "" }; }
+  }
+  return { ok: false, image_ref: "", target: cur_tgt, current_image: cur, err: "没有更早的成功发布可以回滚" };
 }
 
 export func put_deployment(d) {

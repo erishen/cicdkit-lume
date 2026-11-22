@@ -360,6 +360,41 @@ export func project_deploy(id, raw) {
   };
 }
 
+// 回滚发布：取同目标上上一个成功发布的镜像，重新下发一次。
+// 走和 deploy 一样的路径（jobs.start），所以审批闸门、argv 拼装、日志、知识库全都复用。
+export func project_rollback(id, raw) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let prev = store.prev_deploy(id, str(get(body, "target", "")));
+  if (not bool(get(prev, "ok", false))) {
+    return { status: 400, body: { ok: false, error: str(get(prev, "err", "没有可回滚的发布")) } };
+  }
+  // 没有 targets 的项目，resolve_deploy 会把默认目标命名为 "deploy"；
+  // 这个字面名字不能当 targets 里的成员再查一次（会 400「未找到发布目标」），
+  // 所以回滚时把它还原成"走默认 deploy 配置"。
+  let rtarget = str(get(prev, "target", ""));
+  if (rtarget == "deploy") { rtarget = ""; }
+  let r = jobs.start(p, "deploy", {
+    trigger: "rollback",
+    target: rtarget,
+    method: "",
+    image_ref: str(get(prev, "image_ref", "")),
+  });
+  if (not get(r, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(r, "err", "")) } }; }
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      run_id: str(get(r, "run_id", "")),
+      image_ref: str(get(r, "image_ref", "")),
+      target: str(get(r, "target", "")),
+      rolled_back_from: str(get(prev, "current_image", "")),
+    },
+  };
+}
+
 // 探测：控制面直接发 HTTP，不经 runner（runner 不装 curl，也不需要）。
 // 支持 probe.url 或 body.urls（多地址时逐个试，返回 results）。
 func probe_run(p, body) {

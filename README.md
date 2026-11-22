@@ -97,7 +97,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `RUNNER_BASE` | `http://127.0.0.1:8899` | runner 地址 |
 | `RUNNER_AUTH` | 空 | runner 令牌；**不能**叫 `RUNNER_TOKEN`（Lume `env()` 屏蔽含 TOKEN 的名字） |
 | `RUNNER_AUTH_FILE` | 空 | 从文件读令牌，优先于 `RUNNER_AUTH` |
-| `CICD_WORK_DIR` | `.` | 运行的工作目录（也是 `build.context` 的基准） |
+| `CICD_WORK_DIR` | `$PWD` | 运行的工作目录（也是 `build.context` 的基准）。runner 只接受绝对路径，没配时回落到进程的 `$PWD` |
 | `CICD_FS_ROOTS` | 空 | 目录浏览允许根（冒号分隔），越界 403 |
 | `CICD_DEFAULT_KUBECONFIG` | 空 | kubectl/helm 部署的兜底 kubeconfig |
 | `CICD_SSH_USER/PORT/KEY_PATH/CONTAINER/CONTAINER_PORT/PROBE_PORT/RUN_ARGS/COMMAND` | 空 | 部署字段的兜底值 |
@@ -158,6 +158,7 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `POST /api/projects/:id/generate` | 补 `Dockerfile` / k8s 清单；`?apply=1` 才落盘（需 `?role=human_admin`） |
 | `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe` |
 | `POST /api/webhook/:id` | 外部 CI 触发流水线；`?secret=` 对 `CICD_HOOK_KEY`，不受角色闸门 |
+| `POST /api/projects/:id/rollback` | 回滚上一版：取同一发布目标的上一个成功镜像再发一次（受发布闸门保护，`trigger=rollback`） |
 | `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护 |
 | `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
 | `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |

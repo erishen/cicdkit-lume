@@ -111,6 +111,13 @@ expect_code 404 "发布：放行后按本地库判定（项目不存在）"
 expect_body '项目不存在' "发布：404 说明来源"
 expect_absent 'cicdkit 上游' "发布：没有残留的上游代理错误"
 
+# 2.1) 回滚：和发布同一个审批闸门，没有历史时明确 400 而不是 500
+call POST "/api/projects/p1/rollback"
+expect_code 403 "回滚：未声明 role 被拦"
+call POST "/api/projects/nope/rollback?role=human_admin"
+expect_code 404 "回滚：项目不存在 → 404"
+# 具体项目的"没有历史"分支放在 gate-hook 建好之后（p1 并不存在）
+
 # 3) 门禁一致性
 call GET "/api/fs/roots"
 expect_code 403 "目录浏览：未声明 role 被拦"
@@ -161,6 +168,10 @@ call POST "/api/projects?role=human_admin" '{"id":"gate-hook","name":"gate hook"
 expect_code 200 "重建临时项目：human_admin 放行 → 200"
 
 # 7.1) webhook：机器调用，不参与角色闸门，只认自己的 key
+call POST "/api/projects/gate-hook/rollback?role=human_admin"
+expect_code 400 "回滚：没有发布历史 → 400 而不是 500"
+expect_body '回滚' "回滚：错误说明指向回滚"
+
 call POST "/api/webhook/gate-hook"
 expect_code 401 "webhook：缺 secret 被拒"
 call POST "/api/webhook/gate-hook?secret=wrong"

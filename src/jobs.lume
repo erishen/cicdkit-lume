@@ -15,6 +15,10 @@ import "exec.lume" as exec;
 export func work_dir() {
   let w = env("CICD_WORK_DIR");
   if (w != null and len(trim(str(w))) > 0) { return trim(str(w)); }
+  // "." 会被 runner 直接拒掉（"cwd 必须是绝对路径"），于是没配 CICD_WORK_DIR
+  // 时连纯发布（不需要构建上下文）也提交不出去。回落到进程自己的绝对路径。
+  let pwd = env("PWD");
+  if (pwd != null and len(trim(str(pwd))) > 0) { return trim(str(pwd)); }
   return ".";
 }
 

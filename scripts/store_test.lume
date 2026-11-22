@@ -158,6 +158,27 @@ store.put_deployment({ project_id: "proj-t1", project_name: "demo-app", method: 
 let deps = store.list_deployments("", 10, 0);
 ok("部署记录写入", int(get(deps, "total", 0)) == 1);
 
+// ---- 回滚：找"上上个"成功发布的镜像（同一目标、跳过连续重复）----
+ok("没有发布历史时不能回滚", bool(get(store.prev_deploy("proj-rb", ""), "ok", true)) == false);
+store.put_deployment({ project_id: "proj-rb", project_name: "rb-app", method: "ssh",
+  status: "success", image_ref: "rb:v1", target: "prod", created_ts: 1000 });
+ok("只有一次发布时不能回滚", bool(get(store.prev_deploy("proj-rb", ""), "ok", true)) == false);
+store.put_deployment({ project_id: "proj-rb", project_name: "rb-app", method: "ssh",
+  status: "success", image_ref: "rb:v2", target: "prod", created_ts: 2000 });
+let rb = store.prev_deploy("proj-rb", "");
+ok("两次发布后回滚到 v1", str(get(rb, "image_ref", "")) == "rb:v1");
+ok("回滚带上当前镜像", str(get(rb, "current_image", "")) == "rb:v2");
+ok("回滚沿用同一目标", str(get(rb, "target", "")) == "prod");
+// 连续发两次同一镜像，回滚仍应回到上一个"不同"的镜像
+store.put_deployment({ project_id: "proj-rb", project_name: "rb-app", method: "ssh",
+  status: "success", image_ref: "rb:v2", target: "prod", created_ts: 3000 });
+ok("重复镜像不算新版本", str(get(store.prev_deploy("proj-rb", ""), "current_image", "")) == "rb:v2");
+// 目标过滤：另一个目标的历史不参与这条目标链
+store.put_deployment({ project_id: "proj-rb", project_name: "rb-app", method: "ssh",
+  status: "success", image_ref: "rb:staging-9", target: "staging", created_ts: 4000 });
+ok("指定目标只在该目标链里回滚", str(get(store.prev_deploy("proj-rb", "prod"), "image_ref", "")) == "rb:v1");
+ok("新目标只有一次发布时不能回滚", bool(get(store.prev_deploy("proj-rb", "staging"), "ok", true)) == false);
+
 store.put_kb({ project_id: "proj-t1", project_name: "demo-app", stage: "build",
   signature: "proj-t1|build|exit status 1", error_keyword: "exit status 1",
   diagnosis: "换个 base image" });
@@ -196,7 +217,8 @@ print("store: clear");
 // 上面的保留策略留下 3 条、恢复回来 1 条，清空必须把它们全删掉。
 ok("清空运行", int(store.clear_runs()) == 4);
 ok("运行已空", int(get(store.list_runs("", 10, 0), "total", 0)) == 0);
-ok("清空部署", int(store.clear_deployments()) == 1);
+// 1 条基础部署 + 4 条回滚用例，清空要一次全删。
+ok("清空部署", int(store.clear_deployments()) == 5);
 ok("删除项目", int(store.delete_project("proj-t1")) == 1);
 ok("项目已删", store.get_project("proj-t1") == null);
 
