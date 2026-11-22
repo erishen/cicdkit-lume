@@ -51,7 +51,12 @@ cleanup() {
   kill -9 "$LUME_PID" 2>/dev/null
   wait "$LUME_PID" 2>/dev/null || true
   for pid in $(lsof -ti tcp:"$PORT" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
-  rm -rf "$DATA" "$LOG"
+  if [ -n "${LUME2_PID:-}" ]; then
+    kill -9 "$LUME2_PID" 2>/dev/null
+    wait "$LUME2_PID" 2>/dev/null
+  fi
+  [ -n "${PORT2:-}" ] && for pid in $(lsof -ti tcp:"$PORT2" 2>/dev/null); do kill -9 "$pid" 2>/dev/null; done
+  rm -rf "$DATA" "$LOG" "${DATA2:-}" "${LOG2:-}"
 }
 trap cleanup EXIT
 
@@ -64,17 +69,20 @@ done
 
 CODE=""
 BODY=""
-# call <METHOD> <PATH> [BODY]
-call() {
-  local method="$1" path="$2" body="${3:-}" out
+# call_at <BASE> <METHOD> <PATH> [BODY]
+call_at() {
+  local base="$1" method="$2" path="$3" body="${4:-}" out
   if [ -n "$body" ]; then
-    out="$(curl -s -m 10 -X "$method" -H 'Content-Type: application/json' -d "$body" -w '\n%{http_code}' "$BASE$path" 2>/dev/null)"
+    out="$(curl -s -m 10 -X "$method" -H 'Content-Type: application/json' -d "$body" -w '\n%{http_code}' "$base$path" 2>/dev/null)"
   else
-    out="$(curl -s -m 10 -X "$method" -w '\n%{http_code}' "$BASE$path" 2>/dev/null)"
+    out="$(curl -s -m 10 -X "$method" -w '\n%{http_code}' "$base$path" 2>/dev/null)"
   fi
   CODE="${out##*$'\n'}"
   BODY="${out%$'\n'*}"
 }
+
+# call <METHOD> <PATH> [BODY]
+call() { call_at "$BASE" "$@"; }
 
 expect_code() { # <期望> <说明>
   if [ "${CODE}" = "$1" ]; then ok "$2 → ${CODE}"; else ng "$2 → ${CODE}（期望 $1）：${BODY}"; fi
@@ -221,6 +229,43 @@ call GET "/api/fs/list?dir=${DATA}/../etc"
 expect_code 403 "目录浏览：.. 逃逸被拒"
 call GET "/api/fs/list?dir=${DATA}x"
 expect_code 403 "目录浏览：同前缀兄弟目录被拒"
+
+# 8.5) 角色口令绑定：另起一个实例，CICD_ROLE_MAP 一设，?role= 自报就不作数了
+echo "▶ 角色口令绑定（CICD_ROLE_MAP）"
+PORT2=""
+for p in $(seq $((PORT + 1)) 18180); do
+  if ! lsof -nP -iTCP:"$p" -sTCP:LISTEN -t >/dev/null 2>&1; then PORT2="$p"; break; fi
+done
+[ -n "$PORT2" ] || { echo "✗ 找不到第二个空闲端口" >&2; exit 1; }
+BASE2="http://127.0.0.1:$PORT2"
+DATA2="$(mktemp -d -t cicdkit-lume-test2)"
+LOG2="$(mktemp -t cicdkit-lume-test2-log)"
+LUME_DATA="$DATA2" RUNNER_BASE="$DEAD_RUNNER" CICD_DEPLOY_APPROVAL=approve \
+  CICD_ROLE_MAP='human_admin=hp1;agent_operator=op1' \
+  CICD_WORK_DIR="$DATA2" CICD_FS_ROOTS="$DATA2" \
+  LUME_BIND=127.0.0.1 LUME_PORT="$PORT2" \
+  "$LUME" cicdkit_lume.lume >"$LOG2" 2>&1 &
+LUME2_PID=$!
+for _ in $(seq 1 40); do
+  if curl -s -m 2 -o /dev/null "$BASE2/"; then break; fi
+  sleep 0.25
+done
+call_at "$BASE2" GET "/api/meta"
+expect_body '"auth":"role-map"' "口令绑定：meta 标出 auth 模式"
+call_at "$BASE2" DELETE "/api/runs"
+expect_code 403 "口令绑定：只写 ?role= 不够"
+call_at "$BASE2" DELETE "/api/runs?role=human_admin"
+expect_code 403 "口令绑定：没有口令不放行"
+expect_body 'pass' "口令绑定：拒绝理由提示 ?pass="
+call_at "$BASE2" DELETE "/api/runs?role=human_admin&pass=wrong"
+expect_code 403 "口令绑定：错口令被拒"
+call_at "$BASE2" DELETE "/api/runs?pass=hp1"
+expect_code 200 "口令绑定：只给对口令即可（角色由口令反查）"
+call_at "$BASE2" DELETE "/api/runs?role=agent_operator&pass=hp1"
+expect_code 403 "口令绑定：声明的角色与口令不一致被拒"
+expect_body '不一致' "口令绑定：说明是角色不一致"
+call_at "$BASE2" POST "/api/projects/p1/deploy?pass=op1"
+expect_code 403 "口令绑定：操作员口令仍然不能 approve"
 
 # 9) 静态站
 call GET "/"

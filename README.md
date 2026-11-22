@@ -104,6 +104,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_DEPLOY_APPROVAL` | `off` | `off` / `approve`（需 `human_admin`）/ `execute`（需 `agent_operator`） |
 | `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
 | `CICD_RUN_KEEP` | `300` | 运行历史保留条数；超出的**归档**（不删除），可用 `make restore ID=...` 恢复 |
+| `CICD_ROLE_MAP` | 空 | `human_admin=口令;agent_operator=口令`：设置后角色只能由 `?pass=` 反查，`?role=` 自报作废 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `HTPASSWD_FILE` | 空 | 启用 Basic Auth（对外暴露时必须） |
@@ -175,7 +176,10 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/config/ssh-defaults` | SSH 兜底配置（前端表单预填） |
 
 `?role=` 只在本层做闸门判定，是**流程门禁**而不是身份认证——真正的身份边界交给
-`HTPASSWD_FILE` 或反向代理。
+`HTPASSWD_FILE` 或反向代理。想让角色不能随口报，就设 `CICD_ROLE_MAP`
+（`human_admin=hp1;agent_operator=op1`）：之后请求必须带 `?pass=<口令>`，角色由口令
+反查，`?role=` 单独出现不再作数；声明角色与口令不符也拒（拿操作员口令冒充终审会被挡）。
+口令走 query 是因为 Lume 的请求对象读不到请求头；前端顶栏有「口令」输入框，存在 localStorage。
 
 ## 发布审批闸门
 
@@ -319,8 +323,12 @@ make docker-down
 
 ## 已知限制与运维提醒
 
-- **角色是自报的（`?role=`），不是身份认证**：`CICD_DEPLOY_APPROVAL` 挡住的是「没自报角色的手滑调用」，
-  挡不住知道 URL 的人。对外暴露必须加 `HTPASSWD_FILE` 或前置反代，把 `?role=` 当成流程标签而不是凭证。
+- **角色默认是自报的（`?role=`），不是身份认证**：不配 `CICD_ROLE_MAP` 时，`CICD_DEPLOY_APPROVAL` 挡住的
+  只是「没自报角色的手滑调用」，挡不住知道 URL 的人。配了口令后角色由 `?pass=` 反查，但口令本身仍在
+  query 里（会进访问日志），且比较是普通字符串相等——它是"防误操作"而不是"抗攻击"。对外暴露仍必须加
+  `HTPASSWD_FILE` 或前置反代。
+  另一个坑：`env()` 会把名字里含 `TOKEN`/`SECRET`/`PASSWORD` 的变量对脚本层脱敏成 `null`，所以这个变量
+  只能叫 `CICD_ROLE_MAP`（叫 `CICD_ROLE_TOKENS` 会永远读不到值，看起来像"口令全没生效"）。
 - **`patch_run` 是读-改-写，没有事务**（Lume 的 SQL 护栏不开放事务，也没有进程内互斥）。
   已做的是「阶段没变化就不写库」把触发次数压到最低；单人多标签页同时盯同一运行仍有极窄的覆盖窗口。
 - **日志超过 16 MiB 有双层兜底**：runner 把文件封顶在 `RUNNER_LOG_MAX_BYTES`（默认 16 MiB − 8 KiB）并追加一行封顶标记；

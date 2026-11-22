@@ -142,7 +142,7 @@ export interface LLMStatus {
 export interface Meta {
   service: string
   upstream: string
-  approval: { mode: string; chain: string[]; roles: string[] }
+  approval: { mode: string; chain: string[]; roles: string[]; auth?: string }
   llm?: LLMStatus
 }
 
@@ -237,7 +237,39 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return data as T
 }
 
-const roleQuery = (role?: string) => (role ? `?role=${encodeURIComponent(role)}` : '')
+const ROLE_PASS_KEY = 'cicdkit_lume_role_pass'
+
+// 控制面配了 CICD_ROLE_MAP 时，角色只能由口令反查，?role= 自报不再作数。
+// 口令存在 localStorage，只在 query 里带 pass=（Lume 请求对象读不到请求头）。
+export function readRolePass(): string {
+  try {
+    return localStorage.getItem(ROLE_PASS_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+export function writeRolePass(pass: string) {
+  try {
+    if (pass) localStorage.setItem(ROLE_PASS_KEY, pass)
+    else localStorage.removeItem(ROLE_PASS_KEY)
+  } catch {
+    /* 隐私模式忽略 */
+  }
+}
+
+const passPair = () => {
+  const p = readRolePass()
+  return p ? `pass=${encodeURIComponent(p)}` : ''
+}
+
+const roleQuery = (role?: string) => {
+  const parts: string[] = []
+  if (role) parts.push(`role=${encodeURIComponent(role)}`)
+  const pass = passPair()
+  if (pass) parts.push(pass)
+  return parts.length ? `?${parts.join('&')}` : ''
+}
 
 export const API = {
   health: () => request<Health>('/api/health'),
@@ -305,8 +337,8 @@ export const API = {
       manifest?: { path: string; content: string } | null
       config_updates?: Record<string, string>
     }>(
-      `/api/projects/${encodeURIComponent(id)}/generate${apply ? '?apply=1' : ''}${
-        role ? (apply ? '&' : '?') + 'role=' + encodeURIComponent(role) : ''
+      `/api/projects/${encodeURIComponent(id)}/generate${
+        apply ? '?apply=1' + roleQuery(role).replace('?', '&') : roleQuery(role)
       }`,
       { method: 'POST' },
     ),
@@ -410,7 +442,7 @@ export const API = {
   fsRoots: (role?: string) => request<{ roots: string[] }>(`/api/fs/roots${roleQuery(role)}`),
   fsList: (dir: string, role?: string) =>
     request<FsListing>(
-      `/api/fs/list?dir=${encodeURIComponent(dir)}${role ? `&role=${encodeURIComponent(role)}` : ''}`,
+      `/api/fs/list?dir=${encodeURIComponent(dir)}${roleQuery(role).replace('?', '&')}`,
     ),
 
   listDeployments: (opts: { project_id?: string; limit?: number } = {}) => {

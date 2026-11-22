@@ -10,12 +10,94 @@
 //   CICD_DEPLOY_APPROVAL=approve  发布需 human_admin（对外/生产）
 //   CICD_DEPLOY_APPROVAL=execute  发布需 agent_operator（团队内信任圈）
 //
-// 角色由前端在 ?role= 里声明（Lume 的 req 不暴露请求头，所以不用 X- 头）。
-// 这是**流程门禁**，不是身份认证：真正的身份边界由 LUME 的 htpasswd /
-// 反向代理提供；闸门只保证「点发布的人自报了哪个角色」，供单人/小团队用。
+// 角色默认由前端在 ?role= 里自报（Lume 的 req 不暴露请求头，所以不用 X- 头）。
+// 想知道"点发布的人到底是谁"就得把角色绑到口令上：
+//   CICD_ROLE_MAP="human_admin=hp1;agent_operator=op1"
+// 设置后 ?role= 不再作数，角色只能由 ?pass= 反查出来；声明的角色与口令
+// 对应的角色不一致时也会被拒（避免"拿操作员口令冒充终审"）。
+// 变量名刻意不含 TOKEN/SECRET/PASSWORD 等词——env() 会把那类命名对脚本层
+// 脱敏成 null，写成 CICD_ROLE_TOKENS 反而永远读不到。
+// 注意这是口令而不是身份体系：真正的身份边界仍应由 LUME 的 htpasswd /
+// 反向代理提供，这里只防"随手写个 ?role=human_admin 就过闸"。
 
 // import 路径相对于本文件目录：src/ → ../vendor/lume-core/lib/
 import "../vendor/lume-core/lib/approval.lume" as approval;
+
+// 按 ";" 切分（LUME 没有 split，只能手扫）。
+func split_semi(text) {
+  let out = [];
+  let cur = "";
+  let i = 0;
+  while (i < len(text)) {
+    let ch = substr(text, i, 1);
+    if (ch == ";" or ch == ",") { push(out, cur); cur = ""; } else { cur = cur + ch; }
+    i = i + 1;
+  }
+  push(out, cur);
+  return out;
+}
+
+// "role=口令" → {role: 口令}；未知角色、空口令的条目直接忽略。
+export func role_map() {
+  let out = {};
+  let raw = env("CICD_ROLE_MAP");
+  if (raw == null) { return out; }
+  for (item in split_semi(str(raw))) {
+    let it = trim(item);
+    if (len(it) == 0) { continue; }
+    let eq = -1;
+    let i = 0;
+    while (i < len(it)) {
+      if (substr(it, i, 1) == "=") { eq = i; break; }
+      i = i + 1;
+    }
+    if (eq <= 0) { continue; }
+    let role = trim(substr(it, 0, eq));
+    let pass = trim(substr(it, eq + 1, len(it) - eq - 1));
+    if (len(pass) == 0 or not approval.known_role(role)) { continue; }
+    put(out, role, pass);
+  }
+  return out;
+}
+
+export func auth_mode() {
+  if (len(keys(role_map())) > 0) { return "role-map"; }
+  return "self-reported";
+}
+
+// 解析请求里的角色：{ok, role, via, declared, reason}
+func resolve_role(req) {
+  let declared = "";
+  let pass = "";
+  let qp = get(req, "query_params", null);
+  if (qp != null) {
+    declared = trim(str(get(qp, "role", "")));
+    pass = str(get(qp, "pass", ""));
+  }
+  let m = role_map();
+  if (len(keys(m)) == 0) {
+    if (len(declared) == 0) { return { ok: false, role: "", via: "self-reported", declared: declared, reason: "需要 ?role=" }; }
+    if (not approval.known_role(declared)) {
+      return { ok: false, role: "", via: "self-reported", declared: declared, reason: "未知角色 " + declared };
+    }
+    return { ok: true, role: declared, via: "self-reported", declared: declared, reason: "" };
+  }
+  if (len(pass) == 0) {
+    return { ok: false, role: "", via: "role-map", declared: declared, reason: "需要 ?pass=（角色口令）" };
+  }
+  let found = "";
+  for (r in keys(m)) {
+    if (str(get(m, r, "")) == pass) { found = r; }
+  }
+  if (len(found) == 0) {
+    return { ok: false, role: "", via: "role-map", declared: declared, reason: "角色口令无效" };
+  }
+  if (len(declared) > 0 and declared != found) {
+    return { ok: false, role: found, via: "role-map", declared: declared,
+      reason: "口令对应 " + found + "，与声明的 " + declared + " 不一致" };
+  }
+  return { ok: true, role: found, via: "role-map", declared: declared, reason: "" };
+}
 
 func mode() {
   let m = env("CICD_DEPLOY_APPROVAL");
@@ -34,23 +116,17 @@ export func deploy_allowed(req) {
       chain: [], reason: "",
     };
   }
-  let role = "";
-  let qp = get(req, "query_params", null);
-  if (qp != null) { role = str(get(qp, "role", "")); }
   let action = "approve";
   if (m == "execute") { action = "execute"; }
   let chain = approval.chain_for("medium");
+  let who = resolve_role(req);
+  let role = str(get(who, "role", ""));
 
-  if (len(role) == 0) {
+  if (not bool(get(who, "ok", false))) {
     return {
       allowed: false, mode: m, role: role, action: action, chain: chain,
-      reason: "发布已被审批闸门拦截：请在 ?role= 声明角色（本动作需要 " + action + "）",
-    };
-  }
-  if (not approval.known_role(role)) {
-    return {
-      allowed: false, mode: m, role: role, action: action, chain: chain,
-      reason: "未知角色 " + role + "（known: agent_operator / agent_reviewer / agent_reviewer_second / human_admin）",
+      reason: "发布已被审批闸门拦截：" + str(get(who, "reason", "角色不明")) + "（本动作需要 " + action + "）",
+      auth: str(get(who, "via", "")),
     };
   }
   if (not approval.can(role, action)) {
@@ -61,6 +137,7 @@ export func deploy_allowed(req) {
   }
   return {
     allowed: true, mode: m, role: role, action: action, chain: chain, reason: "",
+    auth: str(get(who, "via", "")),
   };
 }
 
@@ -68,28 +145,21 @@ export func deploy_allowed(req) {
 // 与发布不同、但同样不该让任意角色顺手做的事（例如写 LLM 配置）。
 // 返回结构刻意与 deploy_allowed 一致，前端只认 allowed / reason。
 export func role_allowed(req, role, label) {
-  let got = "";
-  let qp = get(req, "query_params", null);
-  if (qp != null) { got = str(get(qp, "role", "")); }
-  if (len(got) == 0) {
+  let who = resolve_role(req);
+  let got = str(get(who, "role", ""));
+  if (not bool(get(who, "ok", false))) {
     return {
-      allowed: false, role: got, action: role,
-      reason: label + "需要 ?role=" + role,
-    };
-  }
-  if (not approval.known_role(got)) {
-    return {
-      allowed: false, role: got, action: role,
-      reason: "未知角色 " + got + "（known: agent_operator / agent_reviewer / agent_reviewer_second / human_admin）",
+      allowed: false, role: got, action: role, auth: str(get(who, "via", "")),
+      reason: label + "被拒：" + str(get(who, "reason", "角色不明")) + "（需要 " + role + "）",
     };
   }
   if (got != role) {
     return {
-      allowed: false, role: got, action: role,
-      reason: label + "需要 " + role + "，当前声明的是 " + got,
+      allowed: false, role: got, action: role, auth: str(get(who, "via", "")),
+      reason: label + "需要 " + role + "，当前是 " + got,
     };
   }
-  return { allowed: true, role: got, action: role, reason: "" };
+  return { allowed: true, role: got, action: role, reason: "", auth: str(get(who, "via", "")) };
 }
 
 // GET /api/meta 用：让前端知道闸门当前模式与默认审批链。
@@ -98,5 +168,6 @@ export func policy() {
     mode: mode(),
     chain: approval.chain_for("medium"),
     roles: ["agent_operator", "agent_reviewer", "agent_reviewer_second", "human_admin"],
+    auth: auth_mode(),
   };
 }

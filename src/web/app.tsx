@@ -63,6 +63,7 @@ const PROBE_LABEL: Record<string, string> = {
 }
 
 const ROLE_KEY = 'cicdkit_lume_role'
+const ROLE_PASS_KEY = 'cicdkit_lume_role_pass'
 
 function readRole(): string {
   try {
@@ -72,6 +73,23 @@ function readRole(): string {
       : 'agent_operator'
   } catch {
     return 'agent_operator'
+  }
+}
+
+function readRolePass(): string {
+  try {
+    return localStorage.getItem(ROLE_PASS_KEY) || ''
+  } catch {
+    return ''
+  }
+}
+
+function writeRolePass(pass: string) {
+  try {
+    if (pass) localStorage.setItem(ROLE_PASS_KEY, pass)
+    else localStorage.removeItem(ROLE_PASS_KEY)
+  } catch {
+    /* 隐私模式忽略 */
   }
 }
 
@@ -2093,6 +2111,7 @@ function App() {
   const [health, setHealth] = useState<Health | null>(null)
   const [meta, setMeta] = useState<Meta | null>(null)
   const [role, setRole] = useState<string>(readRole())
+  const [rolePass, setRolePass] = useState<string>(readRolePass())
   const [showLLM, setShowLLM] = useState(false)
 
   const navigate = (next: Route) => {
@@ -2133,6 +2152,11 @@ function App() {
     writeRole(next)
   }
 
+  const changePass = (next: string) => {
+    setRolePass(next)
+    writeRolePass(next)
+  }
+
   const approvalMode = meta?.approval.mode || 'off'
 
   return (
@@ -2170,9 +2194,25 @@ function App() {
             </select>
           </label>
 
+          <label className="role" title="控制面配了 CICD_ROLE_MAP 时，角色由口令反查（?pass=）；没配就留空">
+            <span className="muted small">口令</span>
+            <input
+              className="input small"
+              style={{ width: 104 }}
+              placeholder="可选"
+              value={rolePass}
+              onChange={(e) => changePass(e.target.value)}
+            />
+          </label>
+
           <span className={approvalMode === 'off' ? 'chip' : 'chip warn'} title="发布审批闸门（CICD_DEPLOY_APPROVAL）">
             闸门 {approvalMode}
           </span>
+          {meta?.approval.auth === 'role-map' && (
+            <span className="chip" title="CICD_ROLE_MAP 已启用：角色只能由口令反查">
+              口令绑定
+            </span>
+          )}
 
           <button
             className={meta?.llm?.enabled ? 'chip' : 'chip warn'}
