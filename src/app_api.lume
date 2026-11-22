@@ -367,9 +367,30 @@ export func project_rollback(id, raw) {
   if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
   let body = parse_body(raw);
   if (body == null) { body = {}; }
-  let prev = store.prev_deploy(id, str(get(body, "target", "")));
-  if (not bool(get(prev, "ok", false))) {
-    return { status: 400, body: { ok: false, error: str(get(prev, "err", "没有可回滚的发布")) } };
+  let want_target = str(get(body, "target", ""));
+  let want_image = trim(str(get(body, "image_ref", "")));
+  let prev = {};
+  if (len(want_image) > 0) {
+    // 指定版本时只认这个项目发布历史里真实出现过的镜像：
+    // 回滚不该变成"随便发一个镜像"的旁路。
+    let versions = store.deploy_versions(id, want_target, 200);
+    let found = false;
+    let seen_target = "";
+    for (v in versions) {
+      if (str(get(v, "image_ref", "")) == want_image) { found = true; seen_target = str(get(v, "target", "")); }
+    }
+    if (not found) {
+      return { status: 400, body: { ok: false, error: "镜像不在该项目的发布历史里: " + want_image } };
+    }
+    // "当前这版"取历史里最新的那条：last_deploy 可能为空（例如库是导入/手写的）
+    let cur_img = "";
+    if (len(versions) > 0) { cur_img = str(get(versions[0], "image_ref", "")); }
+    prev = { ok: true, image_ref: want_image, target: seen_target, current_image: cur_img };
+  } else {
+    prev = store.prev_deploy(id, want_target);
+    if (not bool(get(prev, "ok", false))) {
+      return { status: 400, body: { ok: false, error: str(get(prev, "err", "没有可回滚的发布")) } };
+    }
   }
   // 没有 targets 的项目，resolve_deploy 会把默认目标命名为 "deploy"；
   // 这个字面名字不能当 targets 里的成员再查一次（会 400「未找到发布目标」），
@@ -486,6 +507,14 @@ export func run_restore(id) {
     return { status: 404, body: { ok: false, error: str(get(r, "err", "归档里没有这个运行")) } };
   }
   return { status: 200, body: { ok: true, restored: str(id), log_bytes: int(get(r, "log_bytes", 0)) } };
+}
+
+// 发布版本列表：前端"回滚到任意一版"用（去重后的历史镜像）。
+export func deploy_versions(id, target) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let entries = store.deploy_versions(id, target, 100);
+  return { status: 200, body: { ok: true, entries: entries, total: len(entries) } };
 }
 
 export func run_cancel(id) {

@@ -178,6 +178,12 @@ store.put_deployment({ project_id: "proj-rb", project_name: "rb-app", method: "s
   status: "success", image_ref: "rb:staging-9", target: "staging", created_ts: 4000 });
 ok("指定目标只在该目标链里回滚", str(get(store.prev_deploy("proj-rb", "prod"), "image_ref", "")) == "rb:v1");
 ok("新目标只有一次发布时不能回滚", bool(get(store.prev_deploy("proj-rb", "staging"), "ok", true)) == false);
+// 任意版本回滚用的列表：去重、按时间倒序
+let vs = store.deploy_versions("proj-rb", "", 100);
+ok("版本列表已去重", len(vs) == 3);
+ok("版本列表按时间倒序", str(get(vs[0], "image_ref", "")) == "rb:staging-9");
+ok("版本列表按目标过滤", len(store.deploy_versions("proj-rb", "prod", 100)) == 2);
+ok("版本列表带发布时间", int(get(vs[0], "created_ts", 0)) == 4000);
 
 store.put_kb({ project_id: "proj-t1", project_name: "demo-app", stage: "build",
   signature: "proj-t1|build|exit status 1", error_keyword: "exit status 1",

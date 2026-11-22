@@ -170,7 +170,13 @@ post "/api/projects/:id/targets/:target/deploy", (req) => {
   return api.project_deploy(id, "{\"target\":\"" + target + "\"}");
 };
 
+// 发布版本列表（只读）：给回滚下拉用。
+get "/api/projects/:id/deploy-versions", (req) => {
+  return api.deploy_versions(str(get(req.params, "id", "")), qstr(req, "target", ""));
+};
+
 // 回滚上一版：和 deploy 一样属于"对外发布"，所以走同一个审批闸门。
+// body 里可以带 image_ref / target，指定任意历史版本；不带就是"上一版"。
 post "/api/projects/:id/rollback", (req) => {
   let id = str(get(req.params, "id", ""));
   let gate = guard.deploy_allowed(req);

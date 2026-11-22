@@ -339,22 +339,45 @@ function ProjectsPage({ role }: { role: string }) {
     }
   }
 
-  // 回滚上一版：后端自己找「同目标的上一个成功镜像」，前端只负责确认与展示
+  // 回滚：先拉版本列表让用户选；直接确定 = 上一版，填序号 = 指定历史版本
   const rollback = async (p: Project) => {
     const cur = p.last_deploy
-    if (
-      !window.confirm(
-        `确认把「${p.name}」回滚到上一版？\n当前镜像：${cur?.image_ref || '未知'}\n目标：${
-          cur?.target || '默认'
-        }\n角色：${ROLE_LABEL[role] || role}`,
-      )
-    ) {
-      return
-    }
     setBusy(p.id + ':rollback')
     setNotice(null)
     try {
-      const res = await API.rollback(p.id, role, { target: cur?.target || '' })
+      const list = await API.deployVersions(p.id, cur?.target || '')
+      const versions = list.entries || []
+      if (versions.length === 0) {
+        setNotice({ id: p.id, kind: 'err', text: '还没有成功发布记录，没有可回滚的版本' })
+        return
+      }
+      const lines = versions
+        .map((v, i) => `${i + 1}. ${v.image_ref}${v.image_ref === cur?.image_ref ? '（当前）' : ''}`)
+        .join('\n')
+      const pick = window.prompt(
+        `回滚「${p.name}」到哪一版？\n直接确定 = 上一版，输入序号 = 指定历史版本\n\n${lines}\n\n目标：${
+          cur?.target || '默认'
+        }`,
+        '',
+      )
+      if (pick === null) return
+      const raw = pick.trim()
+      let image = ''
+      if (raw !== '') {
+        const idx = Number(raw)
+        const chosen = Number.isFinite(idx) ? versions[idx - 1] : undefined
+        if (!chosen) {
+          setNotice({ id: p.id, kind: 'err', text: `序号 ${raw} 不在版本列表里` })
+          return
+        }
+        image = chosen.image_ref
+      }
+      if (!window.confirm(`确认回滚「${p.name}」？\n回滚到：${image || '上一版'}\n角色：${
+        ROLE_LABEL[role] || role
+      }`)) {
+        return
+      }
+      const res = await API.rollback(p.id, role, { target: cur?.target || '', image_ref: image })
       setNotice({
         id: p.id,
         kind: 'ok',
@@ -504,9 +527,9 @@ function ProjectsPage({ role }: { role: string }) {
                       className="btn ghost"
                       disabled={busy !== ''}
                       onClick={() => rollback(p)}
-                      title="回滚到同一目标的上一个成功发布"
+                      title="选一版发布回滚（默认上一版）"
                     >
-                      {busy === p.id + ':rollback' ? '回滚中…' : '回滚上一版'}
+                      {busy === p.id + ':rollback' ? '回滚中…' : '回滚…'}
                     </button>
                   ) : null}
                   <button

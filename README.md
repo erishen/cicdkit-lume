@@ -158,7 +158,8 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `POST /api/projects/:id/generate` | 补 `Dockerfile` / k8s 清单；`?apply=1` 才落盘（需 `?role=human_admin`） |
 | `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe` |
 | `POST /api/webhook/:id` | 外部 CI 触发流水线；`?secret=` 对 `CICD_HOOK_KEY`，不受角色闸门 |
-| `POST /api/projects/:id/rollback` | 回滚上一版：取同一发布目标的上一个成功镜像再发一次（受发布闸门保护，`trigger=rollback`） |
+| `GET /api/projects/:id/deploy-versions` | 发布版本列表（同目标去重、时间倒序），给回滚下拉用 |
+| `POST /api/projects/:id/rollback` | 回滚：不传 body = 上一版；带 `image_ref` = 回滚到指定历史版本（只认该项目发布过的镜像）。受发布闸门保护，`trigger=rollback` |
 | `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护 |
 | `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
 | `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |

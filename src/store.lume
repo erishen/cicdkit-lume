@@ -432,6 +432,35 @@ export func prev_deploy(project_id, want_target) {
   return { ok: false, image_ref: "", target: cur_tgt, current_image: cur, err: "没有更早的成功发布可以回滚" };
 }
 
+// 发布版本列表（同一目标上去重、按时间倒序），给"回滚到任意一版"下拉用。
+export func deploy_versions(project_id, want_target, limit) {
+  let tgt = trim(str(want_target));
+  let rows = sql_query(db(),
+    "SELECT json, image_ref, status, created_ts FROM deployments WHERE project_id = ? ORDER BY created_ts DESC, id DESC LIMIT 500",
+    [str(project_id)]);
+  let out = [];
+  let seen = {};
+  for (row in rows) {
+    if (str(get(row, "status", "")) != "success") { continue; }
+    let img = trim(str(get(row, "image_ref", "")));
+    if (len(img) == 0) { continue; }
+    let d = parse_json(str(get(row, "json", "")), {});
+    let t = str(get(d, "target", ""));
+    if (len(tgt) > 0 and t != tgt) { continue; }
+    if (get(seen, img, "") != "") { continue; }
+    put(seen, img, "1");
+    push(out, {
+      image_ref: img,
+      target: t,
+      created_ts: int(get(row, "created_ts", 0)),
+      created_at: str(get(d, "created_at", "")),
+      deploy_id: str(get(d, "id", "")),
+    });
+    if (len(out) >= int(limit)) { break; }
+  }
+  return out;
+}
+
 export func put_deployment(d) {
   let id = str(get(d, "id", ""));
   if (len(id) == 0) { id = id_free("deployments", "dep"); put(d, "id", id); }

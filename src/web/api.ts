@@ -316,7 +316,15 @@ export const API = {
       body: JSON.stringify(body || {}),
     }),
 
-  // 回滚上一版：后端按发布历史取同目标的上一个成功镜像再发一次
+  // 回滚用的版本列表（同一目标、去重、按时间倒序）
+  deployVersions: (id: string, target?: string) =>
+    request<{
+      ok: boolean
+      entries: { image_ref: string; target: string; created_ts: number; created_at?: string }[]
+      total: number
+    }>(`/api/projects/${encodeURIComponent(id)}/deploy-versions${target ? '?target=' + encodeURIComponent(target) : ''}`),
+
+  // 回滚：不传 image_ref 就是"上一版"，传了就是指定历史版本
   rollback: (id: string, role: string, body?: unknown) =>
     request<{
       ok: boolean
