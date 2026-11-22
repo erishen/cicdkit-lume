@@ -88,3 +88,33 @@ shared/derived 两种凭据模式、`unknown peer` 拒绝、过期 `ts` 拒绝�
   自动化/脚本直接调用。
 - 访客统计目前只有 API，没有面板：本仓没有「项目详情页」，项目列表页塞一列
   访客数会很吵。需要时再加独立详情页，接口已经就绪（三种返回形态都实现并实测）。
+
+## 监控接入（与上游并行期）
+
+lume 的控制面容器已挂到 tsm-hub Prometheus 的共享网络 `cicd-monitor`，
+tsm-hub 里新增了一个并行 job：
+
+```yaml
+- job_name: cicdkit-lume
+  metrics_path: /metrics/cicdkit
+  targets: ["cicdkit-lume:18107"]
+```
+
+上游 job `cicdkit`（`cicdkit:8080/metrics`）保持不动，两边同时抓。Grafana 新增
+面板 `cicdkit-lume CI/CD 监控（并行期）`（uid `cicdkit-lume`），所有查询都按
+`job="cicdkit-lume"` 过滤，所以两套同名指标不会混在一起。
+
+**正式切换时**：把 job `cicdkit` 的 target 改成 `cicdkit-lume:18107`、路径改成
+`/metrics/cicdkit`，删掉并行 job，并把面板的 job 过滤改回去（或直接沿用
+`cicdkit-lume` 面板）；告警 `CicdkitDown` 随之自动盯上 lume。
+
+## LLM 诊断
+
+上游 `llm.json` 的配置已搬到 lume 的 settings（同一个网关
+`http://host.docker.internal:19070/v1`、同一把 key、同一段 system 提示词），
+model 选 `chat`（网关把它映射到 `fastpath:codegen`，实测 4s 内返回；
+`auto`/`deepseek-v4-flash` 在该网关排队常超 60s，做诊断不划算）。
+
+迁移时修掉一个 `chat_url` 的偏移 bug：原来用 `len(base)-4` 比 `"/v1"`，
+比的是「含前一字符的 4 位尾巴」，永远不相等，导致 base 已带 `/v1` 时又拼成
+`/v1/v1/chat/completions`（网关 404）。现在按字面量长度比较。

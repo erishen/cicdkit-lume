@@ -832,9 +832,12 @@ export func llm_put(raw) {
 
 func chat_url(cfg) {
   let base = s(get(cfg, "base_url", "https://api.deepseek.com"), "");
-  if (substr(base, len(base) - 1) == "/") { base = substr(base, 0, len(base) - 1); }
-  if (substr(base, len(base) - 9) == "/chat/completions") { return base; }
-  if (substr(base, len(base) - 4) == "/v1") { return base + "/chat/completions"; }
+  if (len(base) > 1 and substr(base, len(base) - 1) == "/") { base = substr(base, 0, len(base) - 1); }
+  // 末段比较的长度必须等于字面量的字符数：之前这里写 len-9 / len-4，
+  // 拿的是「含前一字符的 9/4 位尾巴」，永远不相等，于是 base 已经带 /v1
+  // 时又拼了一次 /v1 → 网关收到 /v1/v1/chat/completions 回 404。
+  if (len(base) >= 17 and substr(base, len(base) - 17) == "/chat/completions") { return base; }
+  if (len(base) >= 3 and substr(base, len(base) - 3) == "/v1") { return base + "/chat/completions"; }
   return base + "/v1/chat/completions";
 }
 
@@ -887,7 +890,9 @@ export func llm_test(raw) {
   if (len(b) > 0) { put(cfg, "base_url", b); }
   let m = s(get(body, "model", ""), "");
   if (len(m) > 0) { put(cfg, "model", m); }
-  let r = chat(cfg, "", "回复两个字：可用", 30);
+  // 60s：网关对部分模型的排队/冷启动会超过 30s，30s 时客户端先超时，
+  // 只能看到一个没有意义的 HTTP 0（上游其实已经 200 了）。
+  let r = chat(cfg, "", "回复两个字：可用", 60);
   if (not get(r, "ok", false)) { return { status: 200, body: { ok: false, error: str(get(r, "err", "")) } }; }
   return { status: 200, body: { ok: true, reply: str(get(r, "text", "")) } };
 }

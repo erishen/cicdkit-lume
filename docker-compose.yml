@@ -62,6 +62,11 @@ services:
       runner:
         condition: service_healthy
     restart: unless-stopped
+    # 并行期同时挂在 tsm-hub Prometheus 的共享网络上，Prometheus 才能按
+    # 容器 DNS 名 cicdkit-lume:18107 抓 /metrics/cicdkit（不走宿主端口）。
+    networks:
+      - default
+      - cicd-monitor
 
   runner:
     build:
@@ -87,3 +92,9 @@ services:
       # SSH 私钥 / kubeconfig：项目配置里写的是宿主绝对路径，原路径挂进来才认。
       - ${LEGACY_DATA:-./.data/legacy}:${LEGACY_DATA:-/legacy}:ro
     restart: unless-stopped
+
+networks:
+  default: {}
+  cicd-monitor:
+    external: true
+    name: cicd-monitor

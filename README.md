@@ -203,6 +203,7 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 - 指标在 `/metrics/cicdkit`：`/metrics` 被 lume 的 agent-httpd 硬编码占用，脚本层改不了。
 - 直方图只统计改版后跑过的运行：runner 新加了 `started_ts`/`ended_ts`，旧记录没有。
 - 身份边界是 `HTPASSWD_FILE` + 角色口令：Lume 读不到请求头，实现不了上游的 `X-API-Token`。
+- 并行期监控：`cicdkit-lume` 已加入 tsm-hub 的 `cicd-monitor` 网络，Prometheus 里有独立 job `cicdkit-lume` 抓 `/metrics/cicdkit`；正式切换步骤见 `docs/PARITY.md` 的「监控接入」。
 
 ## 发布审批闸门
 
