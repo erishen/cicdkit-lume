@@ -1869,12 +1869,14 @@ function RunsPage({ role }: { role: string }) {
 
 // ---------- 部署 ----------
 
-function DeploymentsPage() {
+function DeploymentsPage({ role }: { role: string }) {
   const [items, setItems] = useState<Deployment[]>([])
   const [projects, setProjects] = useState<Project[]>([])
   const [projectId, setProjectId] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
+  // 部署记录本身不带日志，点行打开那次运行（RunDrawer 里能看日志、跑 AI 诊断）。
+  const [openRun, setOpenRun] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -1936,21 +1938,46 @@ function DeploymentsPage() {
               <th>镜像</th>
               <th>状态</th>
               <th>时间</th>
+              <th>运行</th>
             </tr>
           </thead>
           <tbody>
             {items.map((d) => (
-              <tr key={d.id}>
+              <tr
+                key={d.id}
+                onClick={() => d.run_id && setOpenRun(d.run_id)}
+                style={d.run_id ? { cursor: 'pointer' } : undefined}
+              >
                 <td>{d.project_name || d.project_id}</td>
                 <td className="muted">{METHOD_LABEL[d.method || ''] || d.method || '—'}</td>
                 <td className="muted">{d.target || d.namespace || d.cluster || '—'}</td>
                 <td className="mono muted small">{d.image_ref || '—'}</td>
                 <td><Badge status={d.status} /></td>
                 <td className="muted">{fmtTime(d.created_at)}</td>
+                <td>
+                  {d.run_id ? (
+                    <button
+                      className="btn ghost"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        setOpenRun(d.run_id || '')
+                      }}
+                      title="打开这次运行：看日志 / AI 诊断"
+                    >
+                      查看 / 诊断
+                    </button>
+                  ) : (
+                    <span className="muted">—</span>
+                  )}
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+      )}
+
+      {openRun && (
+        <RunDrawer runId={openRun} role={role} onClose={() => setOpenRun('')} onChanged={load} />
       )}
     </div>
   )
@@ -2237,7 +2264,7 @@ function App() {
         {route === 'overview' && <OverviewPage role={role} />}
         {route === 'projects' && <ProjectsPage role={role} />}
         {route === 'runs' && <RunsPage role={role} />}
-        {route === 'deployments' && <DeploymentsPage />}
+        {route === 'deployments' && <DeploymentsPage role={role} />}
         {route === 'kb' && <KBPage />}
       </main>
 

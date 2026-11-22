@@ -70,6 +70,10 @@ type StepState struct {
 	Exit    int      `json:"exit"`
 	Started string   `json:"started,omitempty"`
 	Ended   string   `json:"ended,omitempty"`
+	// StartedTS / EndedTS 是 unix 秒（整秒），给控制面算 /metrics 直方图用：
+	// ISO 字符串在 Lume DSL 里没法解析成时长，数值可以直接相减。
+	StartedTS int64 `json:"started_ts,omitempty"`
+	EndedTS   int64 `json:"ended_ts,omitempty"`
 }
 
 type Job struct {
@@ -590,6 +594,12 @@ func (j *Job) setStep(i int, status string, exit int, ended string) {
 	}
 	j.Steps[i].Status = status
 	j.Steps[i].Exit = exit
+	now := time.Now().Unix()
+	if status == "running" {
+		j.Steps[i].StartedTS = now
+	} else if j.Steps[i].StartedTS != 0 {
+		j.Steps[i].EndedTS = now
+	}
 	if ended != "" {
 		j.Steps[i].Ended = ended
 	}

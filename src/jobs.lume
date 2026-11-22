@@ -188,6 +188,8 @@ func set_stages(run, job) {
       name: str(get(s, "label", "step")),
       status: str(get(s, "status", "pending")),
       exit: int(get(s, "exit", 0)),
+      started_ts: int(get(s, "started_ts", 0)),
+      ended_ts: int(get(s, "ended_ts", 0)),
     });
     i = i + 1;
   }

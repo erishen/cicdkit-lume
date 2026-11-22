@@ -535,6 +535,24 @@ export func deployment_list(project_id, limit, offset) {
   return { deployments: get(page, "deployments", []), total: int(get(page, "total", 0)) };
 }
 
+export func deployment_get(id) {
+  let d = store.get_deployment(id);
+  if (d == null) { return { status: 404, body: { ok: false, error: "部署记录不存在" } }; }
+  return { status: 200, body: d };
+}
+
+// 部署记录本身不带日志，但它记了 run_id：诊断直接转给那次运行的 diagnose，
+// 与上游 /api/deployments/:id/diagnose 语义一致。
+export func deployment_diagnose(id) {
+  let d = store.get_deployment(id);
+  if (d == null) { return { status: 404, body: { ok: false, error: "部署记录不存在" } }; }
+  let rid = str(get(d, "run_id", ""));
+  if (len(rid) == 0 or store.get_run(rid) == null) {
+    return { status: 404, body: { ok: false, error: "找不到该部署对应的运行记录（无法读取日志）" } };
+  }
+  return run_diagnose(rid);
+}
+
 export func deployment_clear() {
   let n = store.clear_deployments();
   return { status: 200, body: { ok: true, deleted: int(n) } };
@@ -656,6 +674,111 @@ export func fs_list(dir) {
   i = 0;
   while (i < len(fls)) { push(all, fls[i]); i = i + 1; }
   return { status: 200, body: { dir: d, entries: all } };
+}
+
+// ---------- 线上访客统计（结构照上游 handleProjectVisits） ----------
+//
+// 上游从「部署目标的 note」里抓公网域名、从 run_args 里抓 <APP>_VISIT_PIN，
+// 然后去应用自己的 /api/visits?pin= 取数据。这套约定是项目配置里写死的，
+// 换后端不改协议，所以这里逐字照搬（含 8s 超时与三种返回形态）：
+//   configured:false                     未配置 → 前端静默隐藏
+//   configured:true, online:false, error 上游不可达 / 非 2xx / 业务错误 → 断线提示
+//   configured:true, online:true + 数据   正常
+// PIN 是访问凭据：只往 URL 里拼，绝不回显到响应或日志里。
+
+let VISIT_PIN_RE = "([A-Z][A-Z0-9_]*_VISIT_PIN)=([^ \t\r\n]+)";
+let VISIT_DOMAIN_RE = "公网域名[ \t]+([^ \t;；,，]+)";
+
+func first_group(text, re, idx) {
+  let hits = str_match(re, text);
+  if (len(hits) == 0) { return ""; }
+  let gs = get(hits[0], "groups", []);
+  if (len(gs) <= idx) { return ""; }
+  return str(get(gs, idx, ""));
+}
+
+func visits_endpoint(p) {
+  let url = "";
+  let targets = get(p, "targets", []);
+  if (targets != null) {
+    let i = 0;
+    while (i < len(targets)) {
+      let note = str(get(targets[i], "note", ""));
+      if (len(url) == 0) {
+        let dom = first_group(note, VISIT_DOMAIN_RE, 0);
+        if (len(dom) > 0) {
+          if (substr(dom, 0, 4) == "http") { url = dom; } else { url = "https://" + dom; }
+        }
+      }
+      i = i + 1;
+    }
+  }
+  let pin = "";
+  let specs = [get(p, "deploy", {})];
+  if (targets != null) {
+    let i = 0;
+    while (i < len(targets)) {
+      push(specs, get(targets[i], "deploy", {}));
+      i = i + 1;
+    }
+  }
+  let j = 0;
+  while (j < len(specs)) {
+    if (len(pin) == 0) { pin = first_group(str(get(specs[j], "ssh_run_args", "")), VISIT_PIN_RE, 1); }
+    j = j + 1;
+  }
+  return { url: url, pin: pin };
+}
+
+export func project_visits(id) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在" } }; }
+  let ep = visits_endpoint(p);
+  let url = str(get(ep, "url", ""));
+  let pin = str(get(ep, "pin", ""));
+  if (len(url) == 0 or len(pin) == 0) { return { status: 200, body: { configured: false } }; }
+
+  let full = url + "/api/visits?pin=" + pin;
+  let r = http_get(full, { timeout: 8, allow_private: true, max_bytes: 262144 });
+  if (not bool(get(r, "ok", false))) {
+    return {
+      status: 200,
+      body: { configured: true, online: false, url: url, error: "上游不可达: " + str(get(r, "err", "")) },
+    };
+  }
+  let code = int(get(r, "status", 0));
+  if (code < 200 or code >= 300) {
+    let snip = trim(str(get(r, "body", "")));
+    if (len(snip) > 200) { snip = substr(snip, 0, 200) + "…"; }
+    return {
+      status: 200,
+      body: {
+        configured: true, online: false, url: url,
+        error: "上游 HTTP " + str(code) + "（服务未就绪或 nginx 反代故障）: " + snip,
+      },
+    };
+  }
+  let out = store.parse_json(str(get(r, "body", "")), null);
+  if (out == null) {
+    return {
+      status: 200,
+      body: { configured: true, online: false, url: url, error: "上游响应解析失败" },
+    };
+  }
+  // lume-core 的 standalone server 对自定义路由固定回 200，PIN 拒绝只能写在
+  // 响应体的 status/error 里；别把它当在线数据（否则前端会显示 0）。
+  let biz = int(get(out, "status", 0));
+  let emsg = trim(str(get(out, "error", "")));
+  if (biz >= 400 or len(emsg) > 0) {
+    if (len(emsg) == 0) { emsg = "status " + str(biz); }
+    return {
+      status: 200,
+      body: { configured: true, online: false, url: url, error: "上游返回业务错误: " + emsg },
+    };
+  }
+  put(out, "configured", true);
+  put(out, "online", true);
+  return { status: 200, body: out };
 }
 
 // ---------- LLM 配置与诊断 ----------

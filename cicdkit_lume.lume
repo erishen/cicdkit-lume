@@ -5,6 +5,7 @@
 // argv 计划并投递 job，日志按字节偏移从共享目录增量读取。
 // cicdkit 本体（13k 行 Go 服务 + 232MB 镜像）不再需要运行。
 //
+//   GET  /metrics/cicdkit      Prometheus 文本指标（不鉴权；/metrics 被框架占用）
 //   GET  /api/health            本服务 + runner + 存储健康
 //   GET  /api/meta              runner 地址、审批闸门策略、LLM 状态
 //   GET  /api/version           版本信息（前端顶栏）
@@ -17,6 +18,8 @@
 //   DEL  /api/projects/:id      删除项目（需 ?role=human_admin）
 //   POST /api/projects/:id/deploy      发布（受审批闸门保护）
 //   POST /api/projects/:id/:action     build / pipeline / validate / probe
+//   GET  /api/projects/:id/generate    脚手架方案预览（POST 同路径 = 落盘）
+//   GET  /api/projects/:id/visits      线上访客统计（代理到应用自己的 /api/visits）
 //   GET  /api/projects/:id/targets/:target/deploy  指定目标发布
 //   GET  /api/runs              运行列表；DELETE /api/runs 清空
 //   GET  /api/runs/:id          运行详情
@@ -62,6 +65,7 @@ import "src/app_api.lume" as api;
 import "src/store.lume" as store;
 import "src/guard.lume" as guard;
 import "src/a2a.lume" as a2a;
+import "src/metrics.lume" as metrics;
 
 // ---------- 启动期：把库建好，必要时把 cicdkit 的历史数据搬进来 ----------
 // 只搬一次：import_legacy() 用 empty() 判空，库里已有内容就跳过。
@@ -106,6 +110,19 @@ func denied(gate, label) {
 }
 
 // ---------- 健康 / 元信息 ----------
+
+// Prometheus 抓取点。注意路径不是 /metrics：lume 的 agent-httpd 在自定义
+// 路由之前就把 /metrics 吃掉了（返回框架自己的 agenthttpd_* 计数），这是框架
+// 的硬编码行为，脚本层改不了。所以控制面指标挂在 /metrics/cicdkit 上
+//（同时给一个 /api/metrics 别名），Prometheus 的 scrape path 要相应指过来。
+// 与上游一样不鉴权，只暴露有限枚举标签的计数。
+get "/metrics/cicdkit", (req) => {
+  return metrics.text();
+};
+
+get "/api/metrics", (req) => {
+  return metrics.text();
+};
 
 get "/api/health", (req) => {
   return { status: 200, body: api.health() };
@@ -217,11 +234,32 @@ post "/api/projects/:id/rollback", (req) => {
 };
 
 // 脚手架生成：必须在 :action 之前注册，否则会被当成未知动作。
+get "/api/projects/:id/generate", (req) => {
+  let id = str(get(req.params, "id", ""));
+  let gate = guard.role_allowed(req, "human_admin", "生成项目脚手架");
+  if (not get(gate, "allowed", false)) { return denied(gate, "生成项目脚手架"); }
+  return api.project_generate(id, false);
+};
+
 post "/api/projects/:id/generate", (req) => {
   let id = str(get(req.params, "id", ""));
   let gate = guard.role_allowed(req, "human_admin", "生成项目脚手架");
   if (not get(gate, "allowed", false)) { return denied(gate, "生成项目脚手架"); }
   return api.project_generate(id, qstr(req, "apply", "") == "1");
+};
+
+// 访客统计：GET 只读代理，与上游 handleProjectVisits 同形。
+get "/api/projects/:id/visits", (req) => {
+  return api.project_visits(str(get(req.params, "id", "")));
+};
+
+// validate / probe 上游 GET 与 POST 等价（读操作），这里补齐 GET 形态。
+get "/api/projects/:id/validate", (req) => {
+  return api.project_action(str(get(req.params, "id", "")), "validate", "{}");
+};
+
+get "/api/projects/:id/probe", (req) => {
+  return api.project_action(str(get(req.params, "id", "")), "probe", "{}");
 };
 
 post "/api/projects/:id/:action", (req) => {
@@ -308,6 +346,14 @@ get "/api/runs/:id", (req) => {
 
 get "/api/deployments", (req) => {
   return { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qint(req, "limit", 100), qint(req, "offset", 0)) };
+};
+
+get "/api/deployments/:id", (req) => {
+  return api.deployment_get(str(get(req.params, "id", "")));
+};
+
+post "/api/deployments/:id/diagnose", (req) => {
+  return api.deployment_diagnose(str(get(req.params, "id", "")));
 };
 
 delete "/api/deployments", (req) => {

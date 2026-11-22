@@ -248,6 +248,38 @@ expect_code 403 "目录浏览：.. 逃逸被拒"
 call GET "/api/fs/list?dir=${DATA}x"
 expect_code 403 "目录浏览：同前缀兄弟目录被拒"
 
+# 8.3) 缺口端点：控制面指标、GET generate、visits、部署详情/诊断
+call GET "/metrics" >/dev/null 2>&1
+expect_body 'agenthttpd_uptime_seconds' "指标：框架仍占用 /metrics（已知差异）"
+call GET "/metrics/cicdkit"
+expect_code 200 "指标：/metrics/cicdkit 可达（不鉴权）"
+expect_body '# TYPE cicdkit_active_runs gauge' "指标：带 HELP/TYPE 头"
+expect_body 'cicdkit_runs_total{status="queued"}' "指标：运行状态枚举标签"
+expect_body 'cicdkit_deploys_total 0' "指标：部署累计为 0（临时库）"
+expect_body 'cicdkit_build_seconds_bucket{le="10"}' "指标：构建耗时直方图桶"
+expect_body 'cicdkit_build_seconds_bucket{le="+Inf"}' "指标：直方图 +Inf 桶"
+expect_body 'cicdkit_probe_total{result="skip"}' "指标：探测结果枚举标签"
+# 标签值只能是有限枚举：任何项目名/镜像名都不该出现
+expect_absent 'gate-gen' "指标：不外泄项目名"
+expect_absent 'image_ref' "指标：不外泄镜像字段"
+
+call GET "/api/projects/gate-gen/generate"
+expect_code 403 "生成脚手架：GET 预览同样受 human_admin 门禁"
+call GET "/api/projects/gate-gen/generate?role=human_admin"
+expect_code 200 "生成脚手架：GET 预览 → 200"
+expect_body '"needs_any":false' "生成脚手架：GET 与 POST 同源（幂等）"
+
+call GET "/api/projects/gate-gen/visits"
+expect_code 200 "访客统计：未配置域名/PIN → configured:false"
+expect_body '"configured":false' "访客统计：静默隐藏信号"
+call GET "/api/projects/nope/visits"
+expect_code 404 "访客统计：项目不存在 → 404"
+
+call GET "/api/deployments/nope"
+expect_code 404 "部署详情：不存在 → 404"
+call POST "/api/deployments/nope/diagnose"
+expect_code 404 "部署诊断：不存在 → 404"
+
 # 8.5) 角色口令绑定：另起一个实例，CICD_ROLE_MAP 一设，?role= 自报就不作数了
 echo "▶ 角色口令绑定（CICD_ROLE_MAP）"
 PORT2=""

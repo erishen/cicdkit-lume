@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 四层自测：store 66 + exec 73 + generate 26 + a2a 45 + 闸门 89（临时实例，不碰真实数据）
+make test       # 四层自测：store 66 + exec 73 + generate 26 + a2a 45 + 闸门 107（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -155,6 +155,7 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | 端点 | 说明 |
 | --- | --- |
 | `GET /api/version` | 控制面版本 |
+| `GET /metrics/cicdkit`（别名 `/api/metrics`） | Prometheus 文本指标；`/metrics` 被 lume 框架占用，抓取路径要指这里 |
 | `GET /api/health` | 本进程健康 + `runner_ok`（runner 掉线不拖垮容器探针） |
 | `GET /api/meta` | 审批闸门策略（模式、审批链、角色表） |
 | `GET /api/overview` | 首屏聚合：计数、运行中/失败数、最近记录、`connected` |
@@ -163,8 +164,9 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `POST /api/projects/scan` | 扫描候选目录（有 Dockerfile 或 deploy/k8s/chart/） |
 | `GET/PUT /api/projects/:id` | 详情 / 保存（PUT 需 `?role=human_admin`，掩码字段不回写） |
 | `DELETE /api/projects/:id` | 删除项目（需 `?role=human_admin`） |
-| `POST /api/projects/:id/generate` | 补 `Dockerfile` / k8s 清单；`?apply=1` 才落盘（需 `?role=human_admin`） |
-| `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe` |
+| `GET/POST /api/projects/:id/generate` | 补 `Dockerfile` / k8s 清单；GET = 只出方案，POST 带 `?apply=1` 才落盘（需 `?role=human_admin`） |
+| `GET /api/projects/:id/visits` | 线上访客统计：域名取自 target `note` 的「公网域名 …」、PIN 取自 `*_VISIT_PIN=`；未配置 → `configured:false`，站点挂了 → `online:false` |
+| `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe`（`validate` / `probe` 也支持 GET） |
 | `POST /api/webhook/:id` | 外部 CI 触发流水线；`?secret=` 对 `CICD_HOOK_KEY`，不受角色闸门 |
 | `GET /api/projects/:id/deploy-versions` | 发布版本列表（同目标去重、时间倒序），给回滚下拉用 |
 | `POST /api/projects/:id/rollback` | 回滚：不传 body = 上一版；带 `image_ref` = 回滚到指定历史版本（只认该项目发布过的镜像）。受发布闸门保护，`trigger=rollback` |
@@ -176,6 +178,8 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `POST /api/runs/:id/restore` | 从归档恢复运行 + 日志（需 `?role=human_admin`） |
 | `DELETE /api/runs` | 清空运行记录（需 `?role=human_admin`） |
 | `GET /api/deployments`、`DELETE /api/deployments` | 部署历史 / 清空 |
+| `GET /api/deployments/:id` | 单条部署记录（含 `run_id`、`probe` 结果） |
+| `POST /api/deployments/:id/diagnose` | 对该部署对应的运行做 AI 诊断（运行已裁掉 → 404） |
 | `GET /api/config/llm`、`PUT`、`POST /api/config/llm/test` | LLM 配置（掩码）/ 保存 / 连通性测试 |
 | `POST /api/runs/:id/diagnose`、`POST /api/runs/:id/diagnosis/adopt` | AI 诊断 / 采纳入知识库 |
 | `GET /api/kb`、`POST /api/kb`、`DELETE /api/kb/:id` | 知识库 |
@@ -191,6 +195,14 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 （`human_admin=hp1;agent_operator=op1`）：之后请求必须带 `?pass=<口令>`，角色由口令
 反查，`?role=` 单独出现不再作数；声明角色与口令不符也拒（拿操作员口令冒充终审会被挡）。
 口令走 query 是因为 Lume 的请求对象读不到请求头；前端顶栏有「口令」输入框，存在 localStorage。
+
+## 与上游 cicdkit 的功能对照
+
+逐条对照表（含有意差异与原因）在 [`docs/PARITY.md`](docs/PARITY.md)。最需要记住的三条：
+
+- 指标在 `/metrics/cicdkit`：`/metrics` 被 lume 的 agent-httpd 硬编码占用，脚本层改不了。
+- 直方图只统计改版后跑过的运行：runner 新加了 `started_ts`/`ended_ts`，旧记录没有。
+- 身份边界是 `HTPASSWD_FILE` + 角色口令：Lume 读不到请求头，实现不了上游的 `X-API-Token`。
 
 ## 发布审批闸门
 

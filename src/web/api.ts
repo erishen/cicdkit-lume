@@ -213,6 +213,15 @@ export interface RunPage {
   total: number
 }
 
+export interface Visits {
+  configured?: boolean
+  online?: boolean
+  url?: string
+  error?: string
+  // 应用自己的 /api/visits 字段（总数 / 今日 / 独立访客等），原样透传
+  [key: string]: unknown
+}
+
 export interface DeploymentPage {
   deployments: Deployment[]
   total: number
@@ -444,6 +453,16 @@ export const API = {
     request<FsListing>(
       `/api/fs/list?dir=${encodeURIComponent(dir)}${roleQuery(role).replace('?', '&')}`,
     ),
+
+  // 线上访客统计：代理到项目自己的 /api/visits?pin=。
+  // configured:false = 项目没配域名/PIN（界面应静默隐藏）；
+  // configured:true + online:false = 站点挂了（界面应显示断线，而不是 0）。
+  projectVisits: (id: string) => request<Visits>(`/api/projects/${encodeURIComponent(id)}/visits`),
+
+  deployment: (id: string) => request<Deployment>(`/api/deployments/${encodeURIComponent(id)}`),
+
+  diagnoseDeployment: (id: string) =>
+    request<Diagnosis>(`/api/deployments/${encodeURIComponent(id)}/diagnose`, { method: 'POST' }),
 
   listDeployments: (opts: { project_id?: string; limit?: number } = {}) => {
     const p = new URLSearchParams()

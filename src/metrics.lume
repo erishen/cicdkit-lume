@@ -1,0 +1,159 @@
+// src/metrics.lume — Prometheus 文本格式指标（/metrics），与上游 cicdkit 的
+// internal/api/metrics.go 同名同义。
+//
+// 护栏照抄上游：标签值只用有限枚举（status / result），绝不把项目名、镜像名、
+// 日志、错误文本写进标签，避免未鉴权端点的高基数泄露。
+//
+// 与上游的唯一差异是耗时直方图的数据来源：上游用 Go 的 time.Time 减出秒数，
+// Lume 没有日期解析内建，所以由 runner 在每一步记录 started_ts / ended_ts
+//（unix 整秒，见 runner/main.go 的 StepState），控制面这里直接相减。
+
+import "store.lume" as store;
+
+// 与上游 durationBuckets 一致（秒）。
+let BUCKETS = [10, 30, 60, 120, 300, 600, 1800, 3600];
+
+let STATUSES = ["queued", "running", "success", "failed", "canceled"];
+let PROBE_RESULTS = ["ok", "fail", "err", "skip"];
+
+func bump(m, k) {
+  put(m, k, int(get(m, k, 0)) + 1);
+}
+
+func max_jobs() {
+  let v = env("RUNNER_MAX_JOBS");
+  let n = int(v);
+  if (n <= 0) { return 4; }
+  return n;
+}
+
+// 直方图：cum 是每个桶的累计计数，sum 是所有样本之和，count 是样本数。
+func histogram(name, help, samples) {
+  let b = "";
+  b = b + "# HELP " + name + " " + help + "\n";
+  b = b + "# TYPE " + name + " histogram\n";
+  let total = 0;
+  let i = 0;
+  while (i < len(samples)) {
+    total = total + int(get(samples, i, 0));
+    i = i + 1;
+  }
+  let j = 0;
+  while (j < len(BUCKETS)) {
+    let le = int(get(BUCKETS, j, 0));
+    let cum = 0;
+    let k = 0;
+    while (k < len(samples)) {
+      if (int(get(samples, k, 0)) <= le) { cum = cum + 1; }
+      k = k + 1;
+    }
+    b = b + name + "_bucket{le=\"" + str(le) + "\"} " + str(cum) + "\n";
+    j = j + 1;
+  }
+  b = b + name + "_bucket{le=\"+Inf\"} " + str(len(samples)) + "\n";
+  b = b + name + "_sum " + str(total) + "\n";
+  b = b + name + "_count " + str(len(samples)) + "\n";
+  return b;
+}
+
+// stage_seconds 收集所有保留运行里、名为 name 且已完成（两个时间戳都在）的
+// stage 耗时（秒）。失败但仍跑完的 stage 也算，0 时间戳的跳过。
+func stage_seconds(runs, name) {
+  let out = [];
+  let i = 0;
+  while (i < len(runs)) {
+    let st = get(runs[i], "stages", null);
+    if (st != null) {
+      let j = 0;
+      while (j < len(st)) {
+        let sg = get(st, j, {});
+        if (str(get(sg, "name", "")) == name) {
+          let a = int(get(sg, "started_ts", 0));
+          let z = int(get(sg, "ended_ts", 0));
+          if (a > 0 and z >= a) { push(out, z - a); }
+        }
+        j = j + 1;
+      }
+    }
+    i = i + 1;
+  }
+  return out;
+}
+
+export func text() {
+  let counts = {};
+  let i = 0;
+  while (i < len(STATUSES)) {
+    put(counts, str(get(STATUSES, i, "")), 0);
+    i = i + 1;
+  }
+
+  let runs = [];
+  let rows = store.run_rows();
+  i = 0;
+  while (i < len(rows)) {
+    let r = store.parse_json(get(rows[i], "json", ""), null);
+    if (r != null) {
+      push(runs, r);
+      let sname = str(get(r, "status", ""));
+      if (get(counts, sname, null) != null) { bump(counts, sname); }
+    }
+    i = i + 1;
+  }
+
+  let probe = {};
+  i = 0;
+  while (i < len(PROBE_RESULTS)) {
+    put(probe, str(get(PROBE_RESULTS, i, "")), 0);
+    i = i + 1;
+  }
+  let deploys = 0;
+  let drows = store.deployment_rows();
+  i = 0;
+  while (i < len(drows)) {
+    let d = store.parse_json(get(drows[i], "json", ""), null);
+    if (d != null) {
+      deploys = deploys + 1;
+      let ps = str(get(get(d, "probe", {}), "status", "skip"));
+      if (len(ps) == 0) { ps = "skip"; }
+      if (get(probe, ps, null) != null) { bump(probe, ps); }
+    }
+    i = i + 1;
+  }
+
+  let active = int(get(counts, "queued", 0)) + int(get(counts, "running", 0));
+  let b = "";
+  b = b + "# HELP cicdkit_active_runs Runs currently queued or running.\n";
+  b = b + "# TYPE cicdkit_active_runs gauge\n";
+  b = b + "cicdkit_active_runs " + str(active) + "\n";
+  b = b + "# HELP cicdkit_max_concurrent Runner concurrency limit.\n";
+  b = b + "# TYPE cicdkit_max_concurrent gauge\n";
+  b = b + "cicdkit_max_concurrent " + str(max_jobs()) + "\n";
+
+  b = b + "# HELP cicdkit_runs_total Retained runs by terminal/transient status.\n";
+  b = b + "# TYPE cicdkit_runs_total gauge\n";
+  i = 0;
+  while (i < len(STATUSES)) {
+    let sname = str(get(STATUSES, i, ""));
+    b = b + "cicdkit_runs_total{status=\"" + sname + "\"} " + str(int(get(counts, sname, 0))) + "\n";
+    i = i + 1;
+  }
+
+  b = b + "# HELP cicdkit_deploys_total Retained deployment records.\n";
+  b = b + "# TYPE cicdkit_deploys_total gauge\n";
+  b = b + "cicdkit_deploys_total " + str(deploys) + "\n";
+
+  b = b + "# HELP cicdkit_probe_total Post-deploy service probe outcomes (retained deployments).\n";
+  b = b + "# TYPE cicdkit_probe_total gauge\n";
+  i = 0;
+  while (i < len(PROBE_RESULTS)) {
+    let rname = str(get(PROBE_RESULTS, i, ""));
+    b = b + "cicdkit_probe_total{result=\"" + rname + "\"} " + str(int(get(probe, rname, 0))) + "\n";
+    i = i + 1;
+  }
+
+  b = b + histogram("cicdkit_build_seconds", "Duration of build stages in seconds.", stage_seconds(runs, "build"));
+  b = b + histogram("cicdkit_deploy_seconds", "Duration of deploy stages in seconds.", stage_seconds(runs, "deploy"));
+
+  return { type: "text/plain", body: b };
+}

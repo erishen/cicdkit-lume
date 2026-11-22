@@ -409,6 +409,12 @@ export func list_deployments(project_id, limit, offset) {
   return { deployments: out, total: total };
 }
 
+export func get_deployment(id) {
+  let rows = sql_query(db(), "SELECT json FROM deployments WHERE id = ?", [str(id)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "json", ""), null);
+}
+
 // 回滚用：找同一个发布目标上、上上次成功发布的镜像。
 // deployments 只记成功（失败不写库），所以这里再按 status 过一道只是兜底。
 // 同一镜像连着发两次算一次（跳过与"当前这版"相同的记录）。
