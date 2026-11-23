@@ -376,9 +376,10 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 
 - **写入侧**：`PUT` 项目/LLM 时前端回传 `********` 表示「保持不变」，`merge_secrets`
   保证库里存的还是旧值。
-- **读出侧**：`GET` 永远不回传明文。运行日志和诊断提示词都过 `mask_log()`
-  （`SECRET_RE` / `KEY_RE` / `BEARER_RE`），因为构建参数里本来就有
-  `--build-arg LLM_API_KEY=...`、`-e *_VISIT_PIN=...` 这类真值。
+- **读出侧**：`GET` 永远不回传明文。运行日志、云环境动作输出（`docker logs` /
+  `helm history`）和诊断提示词都过 `mask_log()`（`SECRET_RE` / `KEY_RE` /
+  `BEARER_RE`），因为构建参数里本来就有 `--build-arg LLM_API_KEY=...`、
+  `-e *_VISIT_PIN=...` 这类真值。落盘原件不动，只在返回浏览器前脱敏。
 
 ### 切换前体检与路径重映射
 

@@ -26,6 +26,8 @@ import API, {
   RunLog,
   ScanCandidate,
   StageResult,
+  readRolePass,
+  writeRolePass,
 } from './api'
 
 const ROUTES = ['overview', 'projects', 'runs', 'deployments', 'environments', 'agent', 'kb', 'audit'] as const
@@ -153,7 +155,6 @@ function targetNeedsPort(opt: DeployOption): boolean {
 
 
 const ROLE_KEY = 'cicdkit_lume_role'
-const ROLE_PASS_KEY = 'cicdkit_lume_role_pass'
 // 服务端下发默认角色时只应用一次，之后用户在顶栏切换的选择继续生效。
 const ROLE_DEFAULT_MARK = 'cicdkit_lume_role_default_applied'
 
@@ -165,23 +166,6 @@ function readRole(): string {
       : 'agent_operator'
   } catch {
     return 'agent_operator'
-  }
-}
-
-function readRolePass(): string {
-  try {
-    return localStorage.getItem(ROLE_PASS_KEY) || ''
-  } catch {
-    return ''
-  }
-}
-
-function writeRolePass(pass: string) {
-  try {
-    if (pass) localStorage.setItem(ROLE_PASS_KEY, pass)
-    else localStorage.removeItem(ROLE_PASS_KEY)
-  } catch {
-    /* 隐私模式忽略 */
   }
 }
 

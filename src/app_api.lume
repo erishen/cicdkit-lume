@@ -940,7 +940,9 @@ export func environment_snapshot_get(job_id) {
   let js = str(get(job, "status", ""));
   let g = exec.log_range(jid, 0, 262144);
   let log = "";
-  if (get(g, "ok", false)) { log = str(get(g, "log", "")); }
+  // 这里和运行日志走同一个出口：docker logs / helm history 的输出同样可能
+  // 带 -e KEY=...、token、连接串。落盘原件不动，回浏览器前统一脱敏。
+  if (get(g, "ok", false)) { log = redact.mask_log(str(get(g, "log", ""))); }
   let done = (js == "done" or js == "failed" or js == "canceled" or js == "error");
   let ex = int(get(job, "exit", -1));
   if (done) {
@@ -955,7 +957,7 @@ export func environment_snapshot_get(job_id) {
     body: {
       ok: true, job_id: jid, status: js, exit: ex,
       done: done, log: log, log_len: int(get(g, "log_len", 0)),
-      error: str(get(job, "error", "")),
+      error: redact.mask_log(str(get(job, "error", ""))),
     },
   };
 }
