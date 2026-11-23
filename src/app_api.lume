@@ -272,9 +272,13 @@ export func webhook(id, raw, secret) {
     return { status: 400, body: { ok: false, error: "非法的 tag: " + tag } };
   }
   let tn = trim(str(get(body, "target", "")));
-  if (len(tn) > 0) {
-    let rd = validate.resolve_deploy(p, tn, method);
-    if (not get(rd, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(rd, "err", "目标不存在")) } }; }
+  let rd = validate.resolve_deploy(p, tn, method);
+  if (not get(rd, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(rd, "err", "目标不存在")) } }; }
+  // webhook 是机器入口，没有人工确认这一步：生产目标必须走整体发布链路。
+  // 不能在 hook 里塞 confirm_prod=true 绕过 human_admin。
+  let env = validate.target_env(get(rd, "spec", {}), str(get(rd, "target", "")));
+  if (env == "prod") {
+    return { status: 403, body: { ok: false, error: "生产目标不接受 webhook 自动发布，请走整体发布并人工确认" } };
   }
 
   let opts = {

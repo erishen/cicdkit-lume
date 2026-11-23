@@ -368,17 +368,10 @@ export func start(p, opts, actor) {
   }
   let ready_stages = get(pr, "stages", []);
 
-  let first = {};
-  let f = 0;
-  while (f < len(ready_stages)) {
-    if (str(get(get(ready_stages, f, {}), "env", "")) != "build") {
-      first = get(ready_stages, f, {});
-      f = len(ready_stages);
-    } else {
-      f = f + 1;
-    }
-  }
-  if (str(get(first, "env", "")) == "prod" and get(opts, "confirm_prod", false) != true) {
+  // 只有「第一个阶段就是生产」才需要启动即确认；build → prod 这种链路
+  // 允许 operator 先跑构建，生产阶段再到 advance 拦。
+  let first_prod = (str(get(get(selected, 0, {}), "env", "")) == "prod");
+  if (first_prod and get(opts, "confirm_prod", false) != true) {
     return { ok: false, release: null, err: "生产阶段需要单独确认：请在确认后重试" };
   }
 
@@ -405,6 +398,13 @@ export func start(p, opts, actor) {
   let wr = save(rel);
   if (not get(wr, "ok", false)) {
     return { ok: false, release: rel, err: str(get(wr, "err", "写发布链路失败")) };
+  }
+  // 首段就是生产时也不能「启动即发布」：先落一条 ready，等另一名
+  // human_admin 账号调 advance。这样单人无法既发起又批准生产。
+  if (first_prod) {
+    put(rel, "status", "ready");
+    save(rel);
+    return { ok: true, release: rel, err: "" };
   }
   if (not start_stage(rel, p, 0)) {
     save(rel);
@@ -520,9 +520,13 @@ export func advance(id, opts, actor) {
   }
   let cur = int(get(rel, "current", -1));
   let stages = get(rel, "stages", []);
-  let cst = get(stages, cur, {});
-  if (str(get(cst, "status", "")) != "success") {
-    return { ok: false, release: rel, err: "当前阶段尚未成功，不能推进" };
+  // 首段生产时 current=-1，还没启动任何阶段；此时 next=0，仍要走下面
+  // 的生产确认与「发起人 ≠ 审批人」检查。
+  if (cur >= 0) {
+    let cst = get(stages, cur, {});
+    if (str(get(cst, "status", "")) != "success") {
+      return { ok: false, release: rel, err: "当前阶段尚未成功，不能推进" };
+    }
   }
   let next = cur + 1;
   if (next >= len(stages)) {
@@ -533,6 +537,12 @@ export func advance(id, opts, actor) {
   let nst = get(stages, next, {});
   if (str(get(nst, "env", "")) == "prod" and get(opts, "confirm_prod", false) != true) {
     return { ok: false, release: rel, err: "生产阶段需要单独确认：请在确认后重试" };
+  }
+  // 生产阶段不能由发起人自己确认：换个 Basic Auth 账号（human_admin）来推进。
+  // 单账号部署时这里会明确拦住，逼着把操作员和终审拆成两个人。
+  let req_by = str(get(rel, "requested_by", ""));
+  if (str(get(nst, "env", "")) == "prod" and len(req_by) > 0 and req_by == str(actor)) {
+    return { ok: false, release: rel, err: "生产阶段需要另一名审批人：发起人 " + req_by + " 不能自己确认" };
   }
   let p = store.get_project(str(get(rel, "project_id", "")));
   if (p == null) { return { ok: false, release: rel, err: "项目不存在" }; }

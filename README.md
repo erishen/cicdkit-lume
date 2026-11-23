@@ -123,6 +123,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICDKIT_A2A_PUBLIC_URL` | 空 | Agent Card 里对外公告的地址。**Lume 读不到请求头（也就读不到 Host）**，不配就只能拼 `http://127.0.0.1:<LUME_PORT>` |
 | `LUME_BIND` / `LUME_PORT` | `127.0.0.1` / `8096` | 监听地址 |
 | `CICDKIT_BASIC_USER` / `CICDKIT_BASIC_PASS` | `cicd` / 空 | Basic Auth 的用户名与口令（写在 `.env`，`make auth` 读取并生成派生文件）。它会同时保护 `/api/*` 与 `/metrics/cicdkit`：Prometheus 必须配 `basic_auth`（tsm-hub 侧已配好） |
+| `CICDKIT_APPROVER_USER` / `CICDKIT_APPROVER_PASS` | 空 | 可选独立终审 Basic Auth 账号；配置后 `make auth` 会把它写进 `htpasswd` 和 `accounts.json`（`human_admin`）。生产发布要求审批人 ≠ 发起人，单账号部署需要这个账号来推进 |
 | `CICD_DEFAULT_ROLE` | `agent_operator` | 顶栏默认业务角色；`human_admin` 可让单人 `cicd` 账号首次打开就具备生成脚手架/改配置权限。只影响默认值，用户仍可在顶栏切换 |
 
 ### runner
@@ -283,7 +284,8 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 
 角色参考 `work/knowledge/kb-abac` 的「身份与授权分离」：Basic Auth 用户是身份，
 `/auth/accounts.json` 是该用户在本地的角色授权。compose 默认
-`CICD_ACCOUNTS_ENFORCE=1`，`make auth` 会为当前 `CICDKIT_BASIC_USER` 生成：
+`CICD_ACCOUNTS_ENFORCE=1`，`make auth` 会为当前 `CICDKIT_BASIC_USER` 生成主账号；如果配了
+`CICDKIT_APPROVER_USER`，还会追加一个只有 `human_admin` 的独立终审账号：
 
 ```json
 {"accounts":{"cicd":{"roles":["agent_operator","human_admin"],"title":"Basic Auth user"}}}
@@ -369,6 +371,12 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 | `agent_operator` | `execute`（构建/流水线） |
 | `agent_reviewer` / `agent_reviewer_second` | 一审 / 二审 |
 | `human_admin` | `approve`（发布、改配置、清数据、改项目） |
+
+生产目标有三层闸门，缺一不可：
+
+- 整体发布链路：生产阶段必须 `human_admin` + `confirm_prod=true`，并且**审批人不能是发起人**（按 Basic Auth 用户名判定）。单账号部署会被明确拒绝，需要第二个 `human_admin` 账号来推进。
+- 单目标发布 / 回滚：目标解析为 `prod` 时同样要求 `human_admin` + `confirm_prod=true`，资源表记 `deploy-prod` 授权审计；`CICD_DEPLOY_APPROVAL=off` 也不会跳过这一层。
+- webhook：机器入口不能确认生产，目标为 `prod` 直接 403；生产只能走整体发布或单目标人工确认。
 
 ## 脱敏
 

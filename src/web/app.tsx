@@ -490,7 +490,12 @@ function ProjectsPage({
       }`)) {
         return
       }
-      const res = await API.rollback(p.id, role, { target: cur?.target || '', image_ref: image, port })
+      const res = await API.rollback(p.id, role, {
+        target: cur?.target || '',
+        image_ref: image,
+        port,
+        confirm_prod: true,
+      })
       setNotice({
         id: p.id,
         kind: 'ok',
@@ -1213,7 +1218,7 @@ function DeployModal({
     if (disabled || !selected) return
     setBusy(true)
     setError('')
-    const body = { target: selected.name, port: port.trim() }
+    const body = { target: selected.name, port: port.trim(), confirm_prod: selected.env === 'prod' }
     try {
       const res: any =
         action === 'deploy'

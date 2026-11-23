@@ -99,7 +99,7 @@ ok("无 run_id 的阶段置失败", sb != null and str(get(sb, "status", "")) ==
 
 let ready = {
   id: "rel-ready", project_id: "p-all", project_name: "p-all",
-  status: "ready", current: 1, auto: true, image_ref: "x",
+  status: "ready", current: 1, auto: true, image_ref: "x", requested_by: "tester",
   stages: [
     { env: "build", status: "success", run_id: "r1", target: "", port: "" },
     { env: "test", status: "success", run_id: "r2", target: "腾讯云", port: "8080" },
@@ -110,8 +110,22 @@ let ready = {
 store.put_release(ready);
 let ar = release.advance("rel-ready", {}, "tester");
 ok("生产阶段无确认不能推进", get(ar, "ok", false) == false and contains(str(get(ar, "err", "")), "生产阶段需要单独确认"));
+let ar_self = release.advance("rel-ready", { confirm_prod: true }, "tester");
+ok("发起人不能自己确认生产", get(ar_self, "ok", false) == false and contains(str(get(ar_self, "err", "")), "另一名审批人"));
 let cr = release.cancel("rel-ready", "tester");
 ok("ready 链路可以取消", get(cr, "ok", false) and str(get(get(cr, "release", {}), "status", "")) == "canceled");
+
+print("release: first stage prod waits");
+let p_prod = {
+  id: "p-prod", name: "p-prod",
+  targets: [{ name: "阿里云生产", environment: "prod", method: "ssh", ssh_host: "10.0.0.3",
+    ssh_container: "app", ssh_probe_port: "18095", ssh_container_port: "8080" }],
+};
+let ps = release.start(p_prod, { image_ref: "x", confirm_prod: true, ports: { "阿里云生产": "18095" } }, "tester");
+ok("首段生产不直接启动", get(ps, "ok", false) and str(get(get(ps, "release", {}), "status", "")) == "ready"
+  and int(get(get(ps, "release", {}), "current", 0)) == -1);
+let ps_self = release.advance(str(get(get(ps, "release", {}), "id", "")), { confirm_prod: true }, "tester");
+ok("首段生产也不能自己批准", get(ps_self, "ok", false) == false and contains(str(get(ps_self, "err", "")), "另一名审批人"));
 
 print("release: top-level local deploy");
 let p4 = { id: "p-local", name: "p-local", build: { context: "/tmp" }, deploy: { method: "local-k3s", namespace: "demo", deployment: "app" } };

@@ -71,6 +71,7 @@ import "src/app_api.lume" as api;
 import "src/store.lume" as store;
 import "src/guard.lume" as guard;
 import "src/access.lume" as access;
+import "src/validate.lume" as validate;
 import "src/a2a.lume" as a2a;
 import "src/agent.lume" as agent;
 import "src/metrics.lume" as metrics;
@@ -117,6 +118,55 @@ func body_of(req) {
   let s = str(b);
   if (len(s) == 0) { return "{}"; }
   return s;
+}
+
+func body_map(req) {
+  let br = try(() => json(body_of(req)));
+  if (br.err != null) { return {}; }
+  let b = br.ok;
+  if (b == null) { return {}; }
+  return b;
+}
+
+// 把「请求里指定的目标 / 项目主目标」解析成实际目标，并判断它是不是生产。
+// 直接部署、回滚、webhook 都要先过这一层；否则 operator 可以绕过
+// release 的生产闸门，从旁路直接发到阿里云。
+func target_info(p, target_name, method_override) {
+  let rd = validate.resolve_deploy(p, target_name, method_override);
+  if (not get(rd, "ok", false)) {
+    return { ok: false, env: "", target: str(target_name), spec: {}, err: str(get(rd, "err", "目标解析失败")) };
+  }
+  let spec = get(rd, "spec", {});
+  let used = str(get(rd, "target", ""));
+  return { ok: true, env: validate.target_env(spec, used), target: used, spec: spec, err: "" };
+}
+
+// 生产目标不能在 body 里自己写 confirm_prod 就放行：先要 human_admin，
+// 再由 deploy-prod 资源表记一条授权审计。
+func require_prod_confirm(req) {
+  let b = body_map(req);
+  if (get(b, "confirm_prod", false) != true) {
+    return { status: 403, body: { ok: false, error: "生产发布需要显式确认：请带 confirm_prod=true 并取得终审授权" } };
+  }
+  let pg = abac(req, "deploy-prod", "promote", "生产发布确认", "human_admin");
+  if (not get(pg, "allowed", false)) { return denied(pg, "生产发布确认"); }
+  return null;
+}
+
+// 回滚没有传 target 时，真实目标是上一版部署记录上的目标；不能只看项目主目标。
+func rollback_target(id, b) {
+  let want = trim(str(get(b, "target", "")));
+  if (len(want) > 0) { return want; }
+  let want_image = trim(str(get(b, "image_ref", "")));
+  if (len(want_image) > 0) {
+    let versions = store.deploy_versions(id, "", 200);
+    for (v in versions) {
+      if (str(get(v, "image_ref", "")) == want_image) { return str(get(v, "target", "")); }
+    }
+  }
+  let prev = store.prev_deploy(id, "");
+  if (bool(get(prev, "ok", false))) { return str(get(prev, "target", "")); }
+  return "";
 }
 
 // 发布链路里记录发起人；旧 ?role= 模式没有 Basic Auth 用户时记 local。
@@ -288,7 +338,7 @@ post "/api/projects/scan", (req) => {
   return api.project_scan(qstr(req, "dir", ""));
 };
 
-// 发布单独一条：唯一受审批闸门保护的动作（构建可重跑，发布不可逆）。
+// 发布单独一条：构建可重跑，发布不可逆；生产目标还要额外过 deploy-prod。
 post "/api/projects/:id/deploy", (req) => {
   let id = str(get(req.params, "id", ""));
   // 资源表先拦一层；CICD_DEPLOY_APPROVAL 仍按原模式叠加（off / approve / execute）。
@@ -298,6 +348,16 @@ post "/api/projects/:id/deploy", (req) => {
   let gate = guard.deploy_allowed(req);
   if (not get(gate, "allowed", false)) {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
+  }
+  // 直接发布到生产也必须显式确认 + human_admin；不能只靠 release 链路那一层。
+  let p = store.get_project(id);
+  if (p != null) {
+    let b = body_map(req);
+    let ti = target_info(p, str(get(b, "target", "")), str(get(b, "method", "")));
+    if (get(ti, "ok", false) and str(get(ti, "env", "")) == "prod") {
+      let blocked = require_prod_confirm(req);
+      if (blocked != null) { return blocked; }
+    }
   }
   return api.project_deploy(id, body_of(req));
 };
@@ -314,6 +374,14 @@ post "/api/projects/:id/targets/:target/deploy", (req) => {
   let gate = guard.deploy_allowed(req);
   if (not get(gate, "allowed", false)) {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
+  }
+  let p = store.get_project(id);
+  if (p != null) {
+    let ti = target_info(p, target, str(get(body_map(req), "method", "")));
+    if (get(ti, "ok", false) and str(get(ti, "env", "")) == "prod") {
+      let blocked = require_prod_confirm(req);
+      if (blocked != null) { return blocked; }
+    }
   }
   let port = trim(qstr(req, "port", ""));
   return api.project_deploy(id, "{\"target\":\"" + target + "\",\"port\":\"" + port + "\"}");
@@ -337,6 +405,17 @@ post "/api/projects/:id/rollback", (req) => {
   let gate = guard.deploy_allowed(req);
   if (not get(gate, "allowed", false)) {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
+  }
+  let p = store.get_project(id);
+  if (p != null) {
+    let b = body_map(req);
+    let rt = rollback_target(id, b);
+    if (rt == "deploy") { rt = ""; }
+    let ti = target_info(p, rt, "");
+    if (get(ti, "ok", false) and str(get(ti, "env", "")) == "prod") {
+      let blocked = require_prod_confirm(req);
+      if (blocked != null) { return blocked; }
+    }
   }
   return api.project_rollback(id, body_of(req));
 };
