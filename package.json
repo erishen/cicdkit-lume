@@ -2,7 +2,7 @@
   "name": "cicdkit-lume-web",
   "private": true,
   "version": "0.1.0",
-  "description": "cicdkit-lume 控制面的 React 控制台：esbuild 打包到 www/app.js，由 Lume docroot 直接伺服。",
+  "description": "CICDKit 控制面的 React 控制台：esbuild 打包到 www/app.js，由 Lume docroot 直接伺服。",
   "type": "module",
   "scripts": {
     "build": "esbuild src/web/app.tsx --bundle --minify --format=esm --jsx=automatic --outfile=www/app.js",

@@ -1,4 +1,4 @@
-// src/web/app.tsx — cicdkit Lume 控制台（React 18 + 原生 fetch）
+// src/web/app.tsx — CICDKit 控制台（React 18 + 原生 fetch）
 //
 // 页面：总览 / 项目 / 运行 / 部署 / 云环境 / Agent(Text2SQL) / 知识库。所有数据来自同源 Lume BFF（/api/*），
 // 浏览器不持有 cicdkit 的 API Token。
@@ -936,7 +936,7 @@ function DirPicker({
         </div>
         <div className="modal-body">
           <p className="muted small" style={{ margin: 0 }}>
-            这里列的是 <strong>cicdkit 所在机器</strong>的目录，不是运行浏览器的那台。
+            这里列的是 <strong>CICDKit 所在机器</strong>的目录，不是运行浏览器的那台。
             只能浏览上游配置的允许根目录（<code>FS_ROOTS</code>）。
           </p>
 
@@ -3533,8 +3533,7 @@ function App() {
         <div className="brand" onClick={() => navigate('overview')}>
           <span className="logo">◆</span>
           <div>
-            <strong>cicdkit</strong>
-            <span className="muted small"> · lume</span>
+            <strong>CICDKit</strong>
           </div>
         </div>
 
