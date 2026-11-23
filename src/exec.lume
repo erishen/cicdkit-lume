@@ -195,8 +195,41 @@ func login_steps(p) {
   return out;
 }
 
-// 构建计划。platform 取 build.platforms；ssh_transfer 时按 deploy.ssh_build_platforms
-// 覆盖并只留一个（远端 docker load 只吃单架构 tar）。
+// 构建平台：显式 build.platforms 最高；否则只要链路里出现远端目标，就默认
+// linux/amd64。链路的顶层 deploy 往往是本地 k3s，不能只看顶层，否则本机
+// arm64 构建出的镜像到了 x86 测试/生产机会直接 exec format error。
+func remote_build_platforms(p) {
+  let out = [];
+  let explicit = [];
+  let dep = get(p, "deploy", {});
+  let dm = trim(str(get(dep, "method", "")));
+  let dh = trim(str(get(dep, "ssh_host", "")));
+  if (dm == "ssh" or len(dh) > 0) {
+    out = ["linux/amd64"];
+    let sp = get(dep, "ssh_build_platforms", null);
+    if (sp != null and len(sp) > 0) { explicit = sp; }
+  }
+  let targets = get(p, "targets", null);
+  if (targets != null) {
+    let i = 0;
+    while (i < len(targets)) {
+      let t = get(targets, i, {});
+      let m = trim(str(get(t, "method", "")));
+      let h = trim(str(get(t, "ssh_host", "")));
+      if (m == "ssh" or len(h) > 0) {
+        out = ["linux/amd64"];
+        let sp2 = get(t, "ssh_build_platforms", null);
+        if (sp2 != null and len(sp2) > 0 and len(explicit) == 0) { explicit = sp2; }
+      }
+      i = i + 1;
+    }
+  }
+  if (len(explicit) > 0) { return [explicit[0]]; }
+  return out;
+}
+
+// 构建计划。platform 取 build.platforms；否则按链路里的远端目标推断。
+// ssh_transfer 时只留一个平台（远端 docker load 只吃单架构 tar）。
 export func build_steps(p, tag) {
   let build = get(p, "build", {});
   let repo = trim(str(get(build, "image_repo", "")));
@@ -208,10 +241,11 @@ export func build_steps(p, tag) {
   let steps = login_steps(p);
 
   let platforms = get(build, "platforms", []);
+  if (len(platforms) == 0) {
+    platforms = remote_build_platforms(p);
+  }
   let dep = get(p, "deploy", {});
   if (trim(str(get(dep, "method", ""))) == "ssh" and bool(get(dep, "ssh_transfer", false))) {
-    let sp = get(dep, "ssh_build_platforms", null);
-    if (sp != null and len(sp) > 0) { platforms = sp; }
     if (len(platforms) > 1) { platforms = [platforms[0]]; }
     if (len(platforms) == 0) { platforms = ["linux/amd64"]; }
   }
@@ -374,7 +408,8 @@ export func env_docker_restart_script(container) {
 func ssh_run_script(p, spec, image, remote_tar, transfer) {
   let lines = [];
   if (transfer and len(remote_tar) > 0) {
-    push(lines, "docker load -i '" + remote_tar + "'");
+    // 远端清理放在 SSH 脚本里执行：runner 只白名单 ssh，脚本内的 rm 不会被拦。
+    push(lines, "docker load -i '" + remote_tar + "' && rm -f '" + remote_tar + "'");
   } else if (bool(get(spec, "ssh_pull", false))) {
     push(lines, "docker pull '" + image + "'");
   }
@@ -626,9 +661,10 @@ export func deploy_steps(p, spec, ref, opts) {
     let transfer = bool(get(spec, "ssh_transfer", false));
     let remote_tar = "";
     if (transfer) {
-      // 无注册表中转：本地 save → scp → 远端 load → run。文件名带项目 id 与秒，
-      // 避免两台发布撞名；远端 /tmp 由容器重启自行清理。
-      let local_tar = "/tmp/cicd-ssh-" + str(get(p, "id", "img")) + "-" + str(now()) + ".tar";
+      // 无注册表中转：本地 save → scp → 远端 load → run。
+      // 固定路径：runner 没放行 rm，不能靠本地 rm 清理；固定文件名让下一次
+      // 传输覆盖同一份，避免 /tmp 里按发布时间累积镜像 tar。
+      let local_tar = "/tmp/cicd-ssh-" + str(get(p, "id", "img")) + ".tar";
       remote_tar = "/tmp/cicd-ssh-" + str(get(p, "id", "img")) + ".tar";
       push(steps, { label: "save", argv: ["docker", "save", "-o", local_tar, image], timeout_s: 900 });
       let scp_argv = ["scp"];
@@ -641,7 +677,6 @@ export func deploy_steps(p, spec, ref, opts) {
       push(scp_argv, local_tar);
       push(scp_argv, ssh_target(spec) + ":" + remote_tar);
       push(steps, { label: "scp", argv: scp_argv, timeout_s: 1800 });
-      push(steps, { label: "cleanup", argv: ["rm", "-f", local_tar], timeout_s: 30 });
     }
 
     let script = ssh_run_script(p, spec, image, remote_tar, transfer);

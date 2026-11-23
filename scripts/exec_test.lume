@@ -81,6 +81,54 @@ let bstep = b.steps[1];
 eq("build argv", join(bstep.argv, " "),
    "docker build -f Dockerfile --build-arg A=1 --build-arg B=2 --platform linux/amd64 -t registry.example.com/team/demo:20261121-120000 ./");
 
+// 顶层是本地 k3s、但链路里有 SSH 目标时，默认必须构建 linux/amd64。
+let chain = {
+  id: "chain",
+  build: { context: "./", dockerfile: "Dockerfile", image_repo: "r/chain", tag_strategy: "timestamp" },
+  deploy: { method: "local-k3s", namespace: "default", deployment: "demo", container: "demo" },
+  targets: [
+    { name: "local", method: "local-k3s" },
+    { name: "test", method: "ssh", ssh_host: "10.0.0.9", ssh_user: "root" }
+  ]
+};
+let bc = exec.build_steps(chain, "t");
+eq("链路远端目标推导平台 ok", bc.ok, true);
+let bcstep = bc.steps[len(bc.steps) - 1];
+has("链路远端目标默认 amd64", join(bcstep.argv, " "), "--platform linux/amd64");
+
+// 只有本地目标时不要强塞平台，保留本机默认。
+let localonly = {
+  id: "localonly",
+  build: { context: "./", dockerfile: "Dockerfile", image_repo: "r/local", tag_strategy: "timestamp" },
+  deploy: { method: "local-k3s", namespace: "default", deployment: "demo", container: "demo" },
+  targets: [{ name: "local", method: "local-k3s" }]
+};
+let bl = exec.build_steps(localonly, "t");
+let blstep = bl.steps[len(bl.steps) - 1];
+no("纯本地不指定平台", join(blstep.argv, " "), "--platform");
+
+// 显式 build.platforms 优先于远端目标推断。
+let explicit_arm = {
+  id: "arm",
+  build: { context: "./", dockerfile: "Dockerfile", image_repo: "r/arm", tag_strategy: "timestamp", platforms: ["linux/arm64"] },
+  deploy: { method: "local-k3s" },
+  targets: [{ name: "test", method: "ssh", ssh_host: "10.0.0.9" }]
+};
+let ba = exec.build_steps(explicit_arm, "t");
+let bastep = ba.steps[len(ba.steps) - 1];
+has("显式平台优先", join(bastep.argv, " "), "--platform linux/arm64");
+
+// 目标级 ssh_build_platforms 覆盖默认 amd64。
+let target_arm = {
+  id: "target-arm",
+  build: { context: "./", dockerfile: "Dockerfile", image_repo: "r/ta", tag_strategy: "timestamp" },
+  deploy: { method: "local-k3s" },
+  targets: [{ name: "test", method: "ssh", ssh_host: "10.0.0.9", ssh_build_platforms: ["linux/arm64"] }]
+};
+let bt = exec.build_steps(target_arm, "t");
+let btstep = bt.steps[len(bt.steps) - 1];
+has("目标级平台覆盖", join(btstep.argv, " "), "--platform linux/arm64");
+
 // ---------- 构建参数里的密钥引用（secret:<名字>）----------
 let sp = base();
 put(get(sp, "build", {}), "build_args", { "NORMAL": "v", "LLM_API_KEY": "secret:llm_key_demo" });
@@ -242,12 +290,14 @@ let tr = {
   ssh_transfer: true, ssh_container: "web", ssh_probe_port: "18080", ssh_container_port: "8080"
 };
 let r5 = exec.deploy_steps({ id: "tr1" }, tr, "registry/x:1", {});
-eq("transfer 步数", len(r5.steps), 4);
-has("transfer save", join(r5.steps[0].argv, " "), "docker save -o /tmp/cicd-ssh-tr1-");
+eq("transfer 步数", len(r5.steps), 3);
+has("transfer save", join(r5.steps[0].argv, " "), "docker save -o /tmp/cicd-ssh-tr1.tar");
 has("transfer scp -P", join(r5.steps[1].argv, " "), "scp -P 22 -o StrictHostKeyChecking=accept-new");
 has("transfer scp 目标", join(r5.steps[1].argv, " "), "deploy@10.0.0.9:/tmp/cicd-ssh-tr1.tar");
-let script2 = r5.steps[3].argv[len(r5.steps[3].argv) - 1];
+eq("transfer 无本地 rm 步骤", len(r5.steps), 3);
+let script2 = r5.steps[2].argv[len(r5.steps[2].argv) - 1];
 has("远端 load", script2, "docker load -i '/tmp/cicd-ssh-tr1.tar'");
+has("远端 load 后清理 tar", script2, "&& rm -f '/tmp/cicd-ssh-tr1.tar'");
 no("transfer 不 pull", script2, "docker pull");
 
 // 缺 host 必须报错

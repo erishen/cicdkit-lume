@@ -229,6 +229,8 @@ build（本地 Docker 构建/推送，产出 image_ref）
 - 计划优先按目标名识别环境：名称含「腾讯」= 测试，含「阿里」= 生产；`local-k3s`、名称含「本地/local」、`environment: "local"` 或没有 `ssh_host` 的 kubectl/helm 目标识别为本地。
 - 每个环境默认取一个目标（优先 `primary_target`，否则取第一个）。项目可用 `release_chain: ["目标A", "目标B"]` 显式指定顺序；显式链路不自动补本地/测试/生产槽位。
 - 当前仓库里的项目数据大多没有本地 target，计划会保留「本地阶段未配置，将跳过」的 warning，实际从构建直接进腾讯测试。
+- 构建平台：显式 `build.platforms` 优先；否则只要链路里出现 SSH 远端目标，就默认 `linux/amd64`。顶层 deploy 是本地 k3s、targets 里带腾讯/阿里时，不能沿用本机 arm64 构建。
+- SSH 镜像传输：`ssh_transfer=true` 时本地 tar 使用固定路径并覆盖，远端 `docker load` 后在同一条 SSH 脚本里删除；runner 不需要放行 `rm`。
 - 状态由 `GET /api/releases/:id` 驱动同步：页面每 1.5 秒轮询一次；没有后台线程，页面关掉后链路会停在当前阶段，下次打开再继续。
 - 链路记录落在 `releases` 表，保留条数由 `CICD_RELEASE_KEEP` 控制，只裁终态。
 
