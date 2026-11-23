@@ -111,12 +111,17 @@ func base_of(path) {
 // 发布环境：test / prod / ""（未定义）。优先用 target 的显式 environment，
 // 其次按目标名推断（腾讯云=测试、阿里云=生产），避免现有配置全部手改一遍。
 export func target_env(spec, target_name) {
+  // 显式标记优先；兼容 environment 与 env 两种写法，避免老配置漏判。
   let explicit = lower(trim(str(get(spec, "environment", ""))));
+  if (len(explicit) == 0) { explicit = lower(trim(str(get(spec, "env", "")))); }
   if (explicit == "test" or explicit == "testing" or explicit == "staging") { return "test"; }
-  if (explicit == "prod" or explicit == "production") { return "prod"; }
-  let tn = trim(str(target_name));
-  if (contains(tn, "腾讯")) { return "test"; }
-  if (contains(tn, "阿里")) { return "prod"; }
+  if (explicit == "prod" or explicit == "production" or explicit == "prd") { return "prod"; }
+  // 名称推断只做保守兜底：认腾讯/测试为 test，认阿里/生产/线上/正式/prod 为 prod。
+  // 生产目标仍应在 targets[].environment=prod 明确标注，未标且名称不含这些词时
+  // 这套规则无法识别，不能靠猜。
+  let low = lower(trim(str(target_name)));
+  if (contains(low, "腾讯") or contains(low, "测试") or contains(low, "staging")) { return "test"; }
+  if (contains(low, "阿里") or contains(low, "生产") or contains(low, "线上") or contains(low, "正式") or contains(low, "prod") or contains(low, "prd")) { return "prod"; }
   return "";
 }
 

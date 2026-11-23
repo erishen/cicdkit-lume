@@ -88,11 +88,13 @@ type DeployOption = {
 // 与后端 validate.target_env 保持同一套规则：显式 environment 优先，
 // 现有目标按名称推断（腾讯云=测试、阿里云=生产）。target 名不在这里重复拼字符串。
 function targetEnv(name: string, spec?: Project['deploy']): DeployEnv {
-  const explicit = (spec?.environment || '').trim().toLowerCase()
+  const explicit = ((spec?.environment || spec?.env || '') as string).trim().toLowerCase()
   if (['test', 'testing', 'staging'].includes(explicit)) return 'test'
-  if (['prod', 'production'].includes(explicit)) return 'prod'
-  if (name.includes('腾讯')) return 'test'
-  if (name.includes('阿里')) return 'prod'
+  if (['prod', 'production', 'prd'].includes(explicit)) return 'prod'
+  const low = name.toLowerCase()
+  if (low.includes('腾讯') || low.includes('测试') || low.includes('staging')) return 'test'
+  if (low.includes('阿里') || low.includes('生产') || low.includes('线上') || low.includes('正式') ||
+      low.includes('prod') || low.includes('prd')) return 'prod'
   return ''
 }
 

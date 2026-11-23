@@ -20,6 +20,10 @@ print("deploy-port: env");
 ok("腾讯云推断为测试", validate.target_env({}, "腾讯云") == "test");
 ok("阿里云推断为生产", validate.target_env({}, "阿里云") == "prod");
 ok("显式 environment 覆盖名称", validate.target_env({ environment: "prod" }, "腾讯云") == "prod");
+ok("生产中文名推断", validate.target_env({}, "生产-主机") == "prod");
+ok("线上中文名推断", validate.target_env({}, "线上集群") == "prod");
+ok("prod 英文名推断", validate.target_env({}, "prod-us") == "prod");
+ok("显式 env 也生效", validate.target_env({ env: "prod" }, "未知") == "prod");
 
 print("deploy-port: test");
 let t1 = { method: "ssh", ssh_container_port: "8081" };

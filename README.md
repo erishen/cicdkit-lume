@@ -378,6 +378,8 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 - 单目标发布 / 回滚：目标解析为 `prod` 时同样要求 `human_admin` + `confirm_prod=true`，资源表记 `deploy-prod` 授权审计；`CICD_DEPLOY_APPROVAL=off` 也不会跳过这一层。
 - webhook：机器入口不能确认生产，目标为 `prod` 直接 403；生产只能走整体发布或单目标人工确认。
 
+生产目标建议显式标 `targets[].environment=prod`；未标时按名称兜底识别（阿里/生产/线上/正式/prod/prd 视为生产，腾讯/测试/staging 视为测试）。两套都不命中的目标会被当作未知环境，不会自动套生产闸门，新增生产目标务必写显式标记。
+
 ## 脱敏
 
 两条链路都必须挡住明文密钥：
