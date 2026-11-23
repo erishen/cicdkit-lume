@@ -10,6 +10,7 @@ import "validate.lume" as validate;
 import "exec.lume" as exec;
 import "jobs.lume" as jobs;
 import "generate.lume" as generate;
+import "release.lume" as release;
 
 // ---------- 小工具 ----------
 
@@ -133,7 +134,10 @@ export func project_list(q, limit, offset) {
   let out = [];
   let i = 0;
   while (i < len(items)) {
-    push(out, redact.redact_project(items[i]));
+    let copy = redact.redact_project(items[i]);
+    let rel = release.latest(str(get(copy, "id", "")));
+    if (rel != null) { put(copy, "last_release", rel); }
+    push(out, copy);
     i = i + 1;
   }
   return { projects: out, total: int(get(page, "total", len(out))) };
@@ -142,7 +146,10 @@ export func project_list(q, limit, offset) {
 export func project_get(id) {
   let p = store.get_project(id);
   if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
-  return { status: 200, body: redact.redact_project(p) };
+  let copy = redact.redact_project(p);
+  let rel = release.latest(str(id));
+  if (rel != null) { put(copy, "last_release", rel); }
+  return { status: 200, body: copy };
 }
 
 // 保存：整份替换（与 cicdkit 的 PUT 语义一致）。
@@ -345,6 +352,77 @@ export func project_action(id, action, raw) {
   }
 
   return { status: 400, body: { ok: false, error: "未知动作: " + str(action) } };
+}
+
+// ---------- 整体发布链路 ----------
+
+export func project_release_plan(id) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let pl = release.plan(p);
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      project_id: str(get(p, "id", "")),
+      project_name: str(get(p, "name", "")),
+      stages: get(pl, "stages", []),
+      warnings: get(pl, "warnings", []),
+      configured: int(get(pl, "configured", 0)),
+    },
+  };
+}
+
+export func project_release_start(id, raw, actor) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let r = release.start(p, body, actor);
+  if (not get(r, "ok", false)) {
+    return {
+      status: 400,
+      body: { ok: false, error: str(get(r, "err", "整体发布启动失败")), release: get(r, "release", null) },
+    };
+  }
+  return { status: 200, body: { ok: true, release: get(r, "release", null) } };
+}
+
+export func project_release_list(id, limit) {
+  let p = store.get_project(id);
+  if (p == null) { return { status: 404, body: { ok: false, error: "项目不存在: " + str(id) } }; }
+  let r = release.list(id, limit);
+  return { status: 200, body: r };
+}
+
+export func release_get(id) {
+  let rel = release.detail(id);
+  if (rel == null) { return { status: 404, body: { ok: false, error: "发布链路不存在: " + str(id) } }; }
+  return { status: 200, body: { ok: true, release: rel } };
+}
+
+export func release_advance(id, raw, actor) {
+  let body = parse_body(raw);
+  if (body == null) { body = {}; }
+  let r = release.advance(id, body, actor);
+  if (not get(r, "ok", false)) {
+    return {
+      status: 409,
+      body: { ok: false, error: str(get(r, "err", "推进失败")), release: get(r, "release", null) },
+    };
+  }
+  return { status: 200, body: { ok: true, release: get(r, "release", null) } };
+}
+
+export func release_cancel(id, actor) {
+  let r = release.cancel(id, actor);
+  if (not get(r, "ok", false)) {
+    return {
+      status: 409,
+      body: { ok: false, error: str(get(r, "err", "取消失败")), release: get(r, "release", null) },
+    };
+  }
+  return { status: 200, body: { ok: true, release: get(r, "release", null) } };
 }
 
 export func project_deploy(id, raw) {

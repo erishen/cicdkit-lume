@@ -75,7 +75,7 @@ smoke:
 a2a-demo:
 	@BASE_URL=http://127.0.0.1:18107 bash scripts/a2a_demo.sh demo
 
-# 自测：存储 / 执行计划 / 生成 / A2A / 闸门（临时实例，不碰真实上游）+ runner go test。
+# 自测：存储 / 执行计划 / 整体发布链路 / 生成 / A2A / 闸门（临时实例，不碰真实上游）+ runner go test。
 runner-test:
 	@cd runner && CGO_ENABLED=0 GOWORK=off go test ./... && echo "✓ runner go test 通过"
 
@@ -88,6 +88,7 @@ test: vendor
 	@rm -rf /tmp/lume_test_a2a && mkdir -p /tmp/lume_test_a2a && LUME_DATA=/tmp/lume_test_a2a CICDKIT_PEER_SHARED=test-shared CICD_A2A_TASK_KEEP=10 $(LUME) scripts/a2a_test.lume
 	@rm -rf /tmp/lume_test_agent && mkdir -p /tmp/lume_test_agent && LUME_DATA=/tmp/lume_test_agent $(LUME) scripts/agent_test.lume
 	@LUME_DATA=/tmp/lume_test_deploy_port $(LUME) scripts/deploy_port_test.lume
+	@rm -rf /tmp/lume_test_release && mkdir -p /tmp/lume_test_release && LUME_DATA=/tmp/lume_test_release CICD_RELEASE_KEEP=10 $(LUME) scripts/release_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 	@$(MAKE) runner-test
 

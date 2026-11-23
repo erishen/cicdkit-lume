@@ -1,0 +1,583 @@
+// src/release.lume — 整体发布链路
+//
+// 一次「整体发布」= 构建一次，然后按 本地 Docker/k3s → 腾讯云测试 → 阿里云生产
+// 的顺序推进。每个阶段都是独立的 runner job（独立日志、独立部署记录），
+// 失败就停在当前阶段，不会继续往后发。
+//
+// 没有后台线程是这套控制面的既有约束，所以推进由前端轮询
+// GET /api/releases/:id 驱动：
+//   * auto=true 时，构建/本地/测试成功后自动启动下一阶段；
+//   * 生产阶段永远暂停，等人工 confirm 后再推进；
+//   * auto=false 时每个阶段都要手动点「继续」。
+//
+// 发布本身的审批仍在路由层做（CICD_DEPLOY_APPROVAL + 资源表），本模块只负责
+// 阶段顺序、端口校验、run_id 关联和状态机。
+
+import "store.lume" as store;
+import "validate.lume" as validate;
+import "jobs.lume" as jobs;
+
+let ENV_ORDER = ["local", "test", "prod"];
+
+func stage_env(name, spec) {
+  // 显式 environment 优先；现有目标继续沿用名称推断（腾讯=测试、阿里=生产）。
+  let env = validate.target_env(spec, name);
+  if (len(env) > 0) { return env; }
+  let method = lower(trim(str(get(spec, "method", ""))));
+  let nm = lower(trim(str(name)));
+  if (method == "local-k3s") { return "local"; }
+  if (contains(nm, "本地") or contains(nm, "local")) { return "local"; }
+  // 没有 ssh_host 的 kubectl/helm 目标按本机 k3s 处理；有 ssh_host 的
+  // helm 目标通常已经在 environment 里标了 test，不会走到这里。
+  let host = trim(str(get(spec, "ssh_host", "")));
+  if (len(host) == 0 and (method == "helm" or method == "kubectl-apply" or method == "kubectl-set-image")) {
+    return "local";
+  }
+  return "";
+}
+
+func env_label(env) {
+  if (env == "build") { return "本地构建"; }
+  if (env == "local") { return "本地 Docker/k3s"; }
+  if (env == "test") { return "腾讯云测试"; }
+  if (env == "prod") { return "阿里云生产"; }
+  return "默认发布目标";
+}
+
+func missing_slot(env) {
+  return {
+    env: env,
+    label: env_label(env),
+    target: "",
+    method: "",
+    host: "",
+    configured: false,
+    status: "missing",
+    needs_port: false,
+    port_default: "",
+    warning: "未配置" + env_label(env) + "阶段，将跳过",
+  };
+}
+
+func build_slot(p) {
+  let build = get(p, "build", null);
+  let context = "";
+  if (build != null) { context = trim(str(get(build, "context", ""))); }
+  let ready = (build != null and len(context) > 0);
+  let warning = "";
+  let status = "pending";
+  if (not ready) {
+    warning = "未配置构建上下文，整体发布无法从构建开始";
+    status = "missing";
+  }
+  return {
+    env: "build",
+    label: "本地构建 + 推送",
+    target: "",
+    method: "docker",
+    host: "",
+    configured: ready,
+    status: status,
+    needs_port: false,
+    port_default: "",
+    warning: warning,
+  };
+}
+
+func deploy_stage(p, name) {
+  let rd = validate.resolve_deploy(p, name, "");
+  if (not get(rd, "ok", false)) {
+    return {
+      env: "",
+      label: str(name),
+      target: str(name),
+      method: "",
+      host: "",
+      configured: false,
+      status: "missing",
+      needs_port: false,
+      port_default: "",
+      warning: str(get(rd, "err", "发布目标不存在")),
+    };
+  }
+  let spec = get(rd, "spec", {});
+  let env = stage_env(name, spec);
+  if (len(env) == 0) { env = "default"; }
+  let method = trim(str(get(spec, "method", "")));
+  let host = trim(str(get(spec, "ssh_host", "")));
+  let needs_port = (method == "ssh" or len(method) == 0);
+  let pdefault = "";
+  if (needs_port) {
+    if (env == "test") {
+      pdefault = "8080";
+    } else if (env != "prod") {
+      pdefault = trim(str(get(spec, "ssh_probe_port", "")));
+    }
+  }
+  return {
+    env: env,
+    label: env_label(env),
+    target: str(name),
+    method: method,
+    host: host,
+    configured: true,
+    status: "pending",
+    needs_port: needs_port,
+    port_default: pdefault,
+    warning: "",
+  };
+}
+
+// 默认链路：本地 → 测试 → 生产；每个环境取一个目标（优先 primary_target，
+// 否则按 targets 里第一次出现的顺序）。未配置的环境保留一个 missing 槽位，
+// 前端能明确显示「本地阶段没配」，而不是悄悄从测试开始。
+func default_plan(p) {
+  let warnings = [];
+  let stages = [build_slot(p)];
+  let targets = get(p, "targets", null);
+  if (targets != null and len(targets) > 0) {
+    let buckets = { local: null, test: null, prod: null };
+    let primary = trim(str(get(p, "primary_target", "")));
+    let i = 0;
+    while (i < len(targets)) {
+      let t = targets[i];
+      let name = trim(str(get(t, "name", "")));
+      let st = deploy_stage(p, name);
+      let env = str(get(st, "env", ""));
+      if (env == "local" or env == "test" or env == "prod") {
+        let old = get(buckets, env, null);
+        if (old == null or (len(primary) > 0 and name == primary)) {
+          put(buckets, env, st);
+        }
+      } else if (get(st, "configured", false)) {
+        push(warnings, "目标「" + name + "」无法识别环境，已从默认链路忽略");
+      }
+      i = i + 1;
+    }
+    let e = 0;
+    while (e < len(ENV_ORDER)) {
+      let env = ENV_ORDER[e];
+      let st = get(buckets, env, null);
+      if (st == null) {
+        push(stages, missing_slot(env));
+        push(warnings, "未配置" + env_label(env) + "阶段，将跳过");
+      } else {
+        push(stages, st);
+      }
+      e = e + 1;
+    }
+  } else {
+    let st = deploy_stage(p, "");
+    if (get(st, "configured", false)) {
+      if (str(get(st, "env", "")) == "default") {
+        put(st, "label", env_label("default"));
+      }
+      push(stages, st);
+    } else {
+      push(warnings, str(get(st, "warning", "没有可发布的目标")));
+    }
+  }
+  let configured = 0;
+  let c = 0;
+  while (c < len(stages)) {
+    let st = get(stages, c, {});
+    if (str(get(st, "env", "")) != "build" and get(st, "configured", false)) {
+      configured = configured + 1;
+    }
+    c = c + 1;
+  }
+  if (configured == 0) {
+    push(warnings, "没有可执行的发布目标，整体发布会被拒绝");
+  }
+  return { ok: true, stages: stages, warnings: warnings, configured: configured, error: "" };
+}
+
+func explicit_plan(p, names) {
+  let warnings = [];
+  let stages = [build_slot(p)];
+  let configured = 0;
+  let i = 0;
+  while (i < len(names)) {
+    let name = trim(str(get(names, i, "")));
+    let st = deploy_stage(p, name);
+    if (get(st, "configured", false)) {
+      configured = configured + 1;
+    } else {
+      put(st, "status", "missing");
+      push(warnings, "发布链路目标「" + name + "」无效：" + str(get(st, "warning", "不存在")));
+    }
+    push(stages, st);
+    i = i + 1;
+  }
+  if (configured == 0) {
+    push(warnings, "没有可执行的发布目标，整体发布会被拒绝");
+  }
+  return { ok: true, stages: stages, warnings: warnings, configured: configured, error: "" };
+}
+
+export func plan(p) {
+  let chain = get(p, "release_chain", null);
+  if (chain != null and len(chain) > 0) { return explicit_plan(p, chain); }
+  return default_plan(p);
+}
+
+func copy(v) { return json(stringify(v)); }
+
+// Lume 的 put() 只支持 map；数组按索引替换必须重建。之前直接 put(stages, i, x)
+// 在真实推进时才会报 "put() key must be a map"，计划单测覆盖不到。
+func replace_at(arr, idx, value) {
+  let out = [];
+  let i = 0;
+  while (i < len(arr)) {
+    if (i == idx) { push(out, value); } else { push(out, get(arr, i, {})); }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 把 body 里的 ports 合并进阶段副本。启动、单测都用这一条路径，避免
+// 「校验过的阶段」和「真正落库/执行的阶段」是两份不同的对象。
+export func apply_ports(p, stages, ports) {
+  let out = [];
+  let k = 0;
+  while (k < len(stages)) {
+    let st = copy(get(stages, k, {}));
+    if (str(get(st, "env", "")) != "build") {
+      let name = str(get(st, "target", ""));
+      let rd = validate.resolve_deploy(p, name, "");
+      if (not get(rd, "ok", false)) {
+        return { ok: false, stages: [], err: "发布目标解析失败：" + str(get(rd, "err", name)) };
+      }
+      let spec = get(rd, "spec", {});
+      let pp = validate.apply_target_port(spec, str(get(rd, "target", name)), port_from(ports, name));
+      if (not get(pp, "ok", false)) {
+        return { ok: false, stages: [], err: str(get(pp, "err", "发布端口校验失败")) };
+      }
+      let method = trim(str(get(spec, "method", "")));
+      put(st, "port", trim(str(get(spec, "ssh_probe_port", ""))));
+      put(st, "needs_port", (method == "ssh" or len(method) == 0));
+    }
+    push(out, st);
+    k = k + 1;
+  }
+  return { ok: true, stages: out, err: "" };
+}
+
+func port_from(ports, name) {
+  if (ports == null) { return ""; }
+  let key = str(name);
+  if (len(key) == 0) { key = "__default"; }
+  return trim(str(get(ports, key, "")));
+}
+
+func save(rel) {
+  put(rel, "updated_ts", now());
+  put(rel, "updated_at", store.fmt_iso(now()));
+  return store.put_release(rel);
+}
+
+// 启动第 idx 个阶段。会原地修改 rel（调用方负责 save），失败时把阶段和链路
+// 都置为 failed，返回值只表达「有没有启动成功」。
+func start_stage(rel, p, idx) {
+  let stages = get(rel, "stages", []);
+  let st = get(stages, idx, {});
+  let env = str(get(st, "env", ""));
+  let r = { ok: false, run_id: "", image_ref: "", target: "", err: "" };
+  if (env == "build") {
+    r = jobs.start(p, "build", { trigger: "release" });
+  } else {
+    r = jobs.start(p, "deploy", {
+      trigger: "release",
+      target: str(get(st, "target", "")),
+      port: str(get(st, "port", "")),
+      image_ref: str(get(rel, "image_ref", "")),
+    });
+  }
+  if (not get(r, "ok", false)) {
+    put(st, "status", "failed");
+    put(st, "error", str(get(r, "err", "阶段提交失败")));
+    put(st, "ended_at", store.fmt_iso(now()));
+    stages = replace_at(stages, idx, st);
+    put(rel, "stages", stages);
+    put(rel, "status", "failed");
+    put(rel, "error", str(get(r, "err", "阶段提交失败")));
+    return false;
+  }
+  put(st, "status", "running");
+  put(st, "run_id", str(get(r, "run_id", "")));
+  put(st, "started_at", store.fmt_iso(now()));
+  put(st, "error", "");
+  if (env == "build") {
+    put(st, "image_ref", str(get(r, "image_ref", "")));
+    put(rel, "image_ref", str(get(r, "image_ref", "")));
+  }
+  stages = replace_at(stages, idx, st);
+  put(rel, "stages", stages);
+  put(rel, "current", idx);
+  put(rel, "status", "running");
+  put(rel, "error", "");
+  return true;
+}
+
+// 开始一次整体发布。opts:
+//   image_ref    指定已有镜像时跳过构建阶段
+//   ports        {target: port}，生产必须提供
+//   auto         默认 true，自动推进非生产阶段
+//   confirm_prod 首个可发布阶段就是生产时必须显式 true
+export func start(p, opts, actor) {
+  let pl = plan(p);
+  let selected = [];
+  let stages = get(pl, "stages", []);
+  let image = trim(str(get(opts, "image_ref", "")));
+  let i = 0;
+  while (i < len(stages)) {
+    let st = get(stages, i, {});
+    let env = str(get(st, "env", ""));
+    if (env == "build") {
+      if (len(image) == 0 and get(st, "configured", false)) { push(selected, copy(st)); }
+    } else if (get(st, "configured", false)) {
+      push(selected, copy(st));
+    }
+    i = i + 1;
+  }
+  if (len(selected) == 0) {
+    return { ok: false, release: null, err: "没有可执行的构建/发布阶段" };
+  }
+  let has_build = false;
+  let s = 0;
+  while (s < len(selected)) {
+    if (str(get(selected[s], "env", "")) == "build") { has_build = true; }
+    s = s + 1;
+  }
+  if (len(image) == 0 and not has_build) {
+    return { ok: false, release: null, err: "未配置构建上下文，且没有指定 image_ref" };
+  }
+  let deploy_stages = [];
+  s = 0;
+  while (s < len(selected)) {
+    if (str(get(selected[s], "env", "")) != "build") { push(deploy_stages, selected[s]); }
+    s = s + 1;
+  }
+  if (len(deploy_stages) == 0) {
+    return { ok: false, release: null, err: "没有可执行的发布目标" };
+  }
+
+  let pr = apply_ports(p, selected, get(opts, "ports", null));
+  if (not get(pr, "ok", false)) {
+    return { ok: false, release: null, err: str(get(pr, "err", "发布端口校验失败")) };
+  }
+  let ready_stages = get(pr, "stages", []);
+
+  let first = {};
+  let f = 0;
+  while (f < len(ready_stages)) {
+    if (str(get(get(ready_stages, f, {}), "env", "")) != "build") {
+      first = get(ready_stages, f, {});
+      f = len(ready_stages);
+    } else {
+      f = f + 1;
+    }
+  }
+  if (str(get(first, "env", "")) == "prod" and get(opts, "confirm_prod", false) != true) {
+    return { ok: false, release: null, err: "生产阶段需要单独确认：请在确认后重试" };
+  }
+
+  let auto = true;
+  if (get(opts, "auto", true) == false) { auto = false; }
+  let ts = now();
+  let rel = {
+    id: jobs.new_id("rel"),
+    project_id: str(get(p, "id", "")),
+    project_name: str(get(p, "name", "")),
+    trigger: "release",
+    status: "queued",
+    image_ref: image,
+    current: -1,
+    auto: auto,
+    requested_by: str(actor),
+    stages: ready_stages,
+    created_ts: ts,
+    updated_ts: ts,
+    created_at: store.fmt_iso(ts),
+    updated_at: store.fmt_iso(ts),
+    error: "",
+  };
+  let wr = save(rel);
+  if (not get(wr, "ok", false)) {
+    return { ok: false, release: rel, err: str(get(wr, "err", "写发布链路失败")) };
+  }
+  if (not start_stage(rel, p, 0)) {
+    save(rel);
+    return { ok: false, release: rel, err: str(get(rel, "error", "首阶段提交失败")) };
+  }
+  save(rel);
+  return { ok: true, release: rel, err: "" };
+}
+
+func run_state(status) {
+  if (status == "success") { return "success"; }
+  if (status == "canceled") { return "canceled"; }
+  if (status == "failed" or status == "interrupted") { return "failed"; }
+  if (status == "queued") { return "queued"; }
+  return "running";
+}
+
+func sync_stage(rel, idx) {
+  let stages = get(rel, "stages", []);
+  let st = get(stages, idx, {});
+  let status = str(get(st, "status", ""));
+  if (status != "running" and status != "queued") { return false; }
+  let rid = trim(str(get(st, "run_id", "")));
+  if (len(rid) == 0) {
+    put(st, "status", "failed");
+    put(st, "error", "阶段没有 runner 运行记录");
+    stages = replace_at(stages, idx, st);
+    put(rel, "stages", stages);
+    return true;
+  }
+  let r = jobs.sync(rid);
+  if (r == null) {
+    put(st, "status", "failed");
+    put(st, "error", "运行记录不存在（可能已被归档或清理）");
+    stages = replace_at(stages, idx, st);
+    put(rel, "stages", stages);
+    return true;
+  }
+  let rs = str(get(r, "status", ""));
+  let next = run_state(rs);
+  if (next == status) { return false; }
+  put(st, "status", next);
+  if (next == "success" or next == "failed" or next == "canceled") {
+    put(st, "ended_at", store.fmt_iso(now()));
+  }
+  put(st, "error", str(get(r, "error", "")));
+  stages = replace_at(stages, idx, st);
+  put(rel, "stages", stages);
+  return true;
+}
+
+// 同步当前阶段；auto=true 时自动推进非生产阶段，生产阶段只置 ready。
+export func sync(id) {
+  let rel = store.get_release(id);
+  if (rel == null) { return null; }
+  let status = str(get(rel, "status", ""));
+  if (status == "success" or status == "failed" or status == "canceled") { return rel; }
+  let stages = get(rel, "stages", []);
+  let changed = false;
+  let i = 0;
+  while (i < len(stages)) {
+    if (sync_stage(rel, i)) { changed = true; }
+    i = i + 1;
+  }
+  if (not changed) { return rel; }
+
+  stages = get(rel, "stages", []);
+  put(rel, "stages", stages);
+  let cur = int(get(rel, "current", -1));
+  let cst = get(stages, cur, {});
+  let cstatus = str(get(cst, "status", ""));
+  if (cstatus == "success") {
+    let next = cur + 1;
+    if (next >= len(stages)) {
+      put(rel, "status", "success");
+    } else {
+      let nst = get(stages, next, {});
+      let nenv = str(get(nst, "env", ""));
+      // 生产阶段无论 auto 与否都停下来等人确认。
+      if (get(rel, "auto", true) == true and nenv != "prod") {
+        let p = store.get_project(str(get(rel, "project_id", "")));
+        if (p != null and start_stage(rel, p, next)) {
+          // start_stage 已把 current 指向 next，状态 running。
+        } else {
+          put(rel, "status", "failed");
+        }
+      } else {
+        put(rel, "status", "ready");
+      }
+    }
+  } else if (cstatus == "failed") {
+    put(rel, "status", "failed");
+    put(rel, "error", str(get(cst, "error", "阶段执行失败")));
+  } else if (cstatus == "canceled") {
+    put(rel, "status", "canceled");
+  }
+  save(rel);
+  return rel;
+}
+
+export func detail(id) { return sync(id); }
+
+// 手动推进：auto=false 时逐段点；或生产阶段确认后调用。
+export func advance(id, opts, actor) {
+  let rel = sync(id);
+  if (rel == null) { return { ok: false, release: null, err: "发布链路不存在" }; }
+  let status = str(get(rel, "status", ""));
+  if (status == "success" or status == "failed" or status == "canceled") {
+    return { ok: false, release: rel, err: "发布链路已结束（" + status + "）" };
+  }
+  if (status == "running") {
+    return { ok: false, release: rel, err: "当前阶段还在执行，不能推进" };
+  }
+  let cur = int(get(rel, "current", -1));
+  let stages = get(rel, "stages", []);
+  let cst = get(stages, cur, {});
+  if (str(get(cst, "status", "")) != "success") {
+    return { ok: false, release: rel, err: "当前阶段尚未成功，不能推进" };
+  }
+  let next = cur + 1;
+  if (next >= len(stages)) {
+    put(rel, "status", "success");
+    save(rel);
+    return { ok: false, release: rel, err: "已经没有下一阶段" };
+  }
+  let nst = get(stages, next, {});
+  if (str(get(nst, "env", "")) == "prod" and get(opts, "confirm_prod", false) != true) {
+    return { ok: false, release: rel, err: "生产阶段需要单独确认：请在确认后重试" };
+  }
+  let p = store.get_project(str(get(rel, "project_id", "")));
+  if (p == null) { return { ok: false, release: rel, err: "项目不存在" }; }
+  if (not start_stage(rel, p, next)) {
+    save(rel);
+    return { ok: false, release: rel, err: str(get(rel, "error", "下一阶段提交失败")) };
+  }
+  let stages2 = get(rel, "stages", []);
+  let ns = get(stages2, next, {});
+  put(ns, "approved_by", str(actor));
+  stages2 = replace_at(stages2, next, ns);
+  put(rel, "stages", stages2);
+  save(rel);
+  return { ok: true, release: rel, err: "" };
+}
+
+export func cancel(id, actor) {
+  let rel = store.get_release(id);
+  if (rel == null) { return { ok: false, release: null, err: "发布链路不存在" }; }
+  let status = str(get(rel, "status", ""));
+  if (status == "success" or status == "failed" or status == "canceled") {
+    return { ok: false, release: rel, err: "发布链路已结束（" + status + "）" };
+  }
+  let cur = int(get(rel, "current", -1));
+  let stages = get(rel, "stages", []);
+  let st = get(stages, cur, {});
+  if (str(get(st, "status", "")) == "running") {
+    let r = jobs.cancel(str(get(st, "run_id", "")));
+    if (not get(r, "ok", false)) {
+      return { ok: false, release: rel, err: str(get(r, "err", "取消失败")) };
+    }
+    put(st, "status", "canceled");
+    put(st, "ended_at", store.fmt_iso(now()));
+    stages = replace_at(stages, cur, st);
+  }
+  put(rel, "stages", stages);
+  put(rel, "status", "canceled");
+  put(rel, "canceled_by", str(actor));
+  save(rel);
+  return { ok: true, release: rel, err: "" };
+}
+
+export func list(project_id, limit) {
+  let releases = store.list_releases(project_id, limit);
+  return { ok: true, releases: releases, total: len(releases) };
+}
+
+export func latest(project_id) { return store.latest_release(project_id); }

@@ -63,6 +63,7 @@ services:
       CICD_AUDIT_KEEP: ${CICD_AUDIT_KEEP:-5000}
       CICD_ENV_AUDIT_KEEP: ${CICD_ENV_AUDIT_KEEP:-5000}
       CICD_A2A_TASK_KEEP: ${CICD_A2A_TASK_KEEP:-1000}
+      CICD_RELEASE_KEEP: ${CICD_RELEASE_KEEP:-200}
       # 顶栏默认角色；单人用 cicd 账号时设为 human_admin，省去每次手切。
       CICD_DEFAULT_ROLE: ${CICD_DEFAULT_ROLE:-agent_operator}
     volumes:

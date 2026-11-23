@@ -119,6 +119,13 @@ func body_of(req) {
   return s;
 }
 
+// 发布链路里记录发起人；旧 ?role= 模式没有 Basic Auth 用户时记 local。
+func actor_of(req) {
+  let u = get(req, "user", null);
+  if (u != null and len(trim(str(u))) > 0) { return str(u); }
+  return "local";
+}
+
 
 // 所有闸门判定都留一条授权审计：谁（Basic Auth 用户）、用什么角色、
 // 对哪个资源/动作、放行还是拒绝。写失败不影响主流程，审计不能把业务卡死。
@@ -332,6 +339,75 @@ post "/api/projects/:id/rollback", (req) => {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
   }
   return api.project_rollback(id, body_of(req));
+};
+
+// ---------- 整体发布链路 ----------
+//
+// 一条链路 = 构建一次 → 本地 → 测试 → 生产。启动和推进都复用发布审批；
+// 生产阶段另外要求 human_admin，并且 body 必须显式 confirm_prod=true。
+
+get "/api/projects/:id/release-plan", (req) => {
+  let blocked = read_gate(req, "project-read", "read", "发布链路计划");
+  if (blocked != null) { return blocked; }
+  return api.project_release_plan(str(get(req.params, "id", "")));
+};
+
+get "/api/projects/:id/releases", (req) => {
+  let blocked = read_gate(req, "deployment-read", "read", "发布链路列表");
+  if (blocked != null) { return blocked; }
+  return api.project_release_list(str(get(req.params, "id", "")), qlimit(req, "limit", 20));
+};
+
+post "/api/projects/:id/release", (req) => {
+  let ab = access.decide(req, "deploy-publish", "publish");
+  if (get(ab, "enabled", false)) { audit_access(req, ab, "deploy-publish", "publish", "整体发布"); }
+  if (get(ab, "enabled", false) and not get(ab, "allowed", false)) { return denied(ab, "整体发布"); }
+  let gate = guard.deploy_allowed(req);
+  if (not get(gate, "allowed", false)) {
+    return { status: 403, body: { ok: false, error: str(get(gate, "reason", "整体发布被审批闸门拒绝")), approval: gate } };
+  }
+  // 首段就是生产时，启动请求也会带 confirm_prod；不能只靠后端校验 body，
+  // 否则操作员可以自己塞 true 绕过 deploy-prod 的 human_admin 门禁。
+  let br = try(() => json(body_of(req)));
+  let body = {};
+  if (get(br, "err", null) == null) { body = get(br, "ok", {}); }
+  if (get(body, "confirm_prod", false) == true) {
+    let pg = abac(req, "deploy-prod", "promote", "生产发布确认", "human_admin");
+    if (not get(pg, "allowed", false)) { return denied(pg, "生产发布确认"); }
+  }
+  return api.project_release_start(str(get(req.params, "id", "")), body_of(req), actor_of(req));
+};
+
+get "/api/releases/:id", (req) => {
+  let blocked = read_gate(req, "deployment-read", "read", "发布链路详情");
+  if (blocked != null) { return blocked; }
+  return api.release_get(str(get(req.params, "id", "")));
+};
+
+post "/api/releases/:id/advance", (req) => {
+  let id = str(get(req.params, "id", ""));
+  // 先按普通发布放行；body 明确 confirm_prod=true 时再叠加生产发布门禁。
+  let ab = access.decide(req, "deploy-publish", "publish");
+  if (get(ab, "enabled", false)) { audit_access(req, ab, "deploy-publish", "publish", "推进发布链路"); }
+  if (get(ab, "enabled", false) and not get(ab, "allowed", false)) { return denied(ab, "推进发布链路"); }
+  let gate = guard.deploy_allowed(req);
+  if (not get(gate, "allowed", false)) {
+    return { status: 403, body: { ok: false, error: str(get(gate, "reason", "推进发布链路被审批闸门拒绝")), approval: gate } };
+  }
+  let br = try(() => json(body_of(req)));
+  let body = {};
+  if (get(br, "err", null) == null) { body = get(br, "ok", {}); }
+  if (get(body, "confirm_prod", false) == true) {
+    let pg = abac(req, "deploy-prod", "promote", "生产发布确认", "human_admin");
+    if (not get(pg, "allowed", false)) { return denied(pg, "生产发布确认"); }
+  }
+  return api.release_advance(id, body_of(req), actor_of(req));
+};
+
+post "/api/releases/:id/cancel", (req) => {
+  let gate = abac(req, "run-control", "cancel", "取消发布链路", "agent_operator");
+  if (not get(gate, "allowed", false)) { return denied(gate, "取消发布链路"); }
+  return api.release_cancel(str(get(req.params, "id", "")), actor_of(req));
 };
 
 // 脚手架生成：必须在 :action 之前注册，否则会被当成未知动作。

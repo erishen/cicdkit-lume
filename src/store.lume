@@ -59,6 +59,9 @@ export func init() {
   // 授权审计：每条资源/动作判定都留痕，成功和拒绝都记。只记判定，
   // 不代替 env_actions 的 job 终态；用户、角色、资源、动作、原因都在这里。
   sql_write(db(), "CREATE TABLE IF NOT EXISTS access_events (id TEXT PRIMARY KEY, ts INTEGER, user TEXT, role TEXT, resource TEXT, action TEXT, allowed INTEGER, reason TEXT, label TEXT, json TEXT)");
+  // 整体发布链路：一条链路由多个阶段运行组成（构建 → 本地 → 测试 → 生产）。
+  // 阶段状态和 run_id 都在 json 里，这里只保留列表/详情需要的列。
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS releases (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, status TEXT, image_ref TEXT, current_stage INTEGER, created_ts INTEGER, updated_ts INTEGER, json TEXT)");
   mkdir(archive_dir());
 }
 
@@ -555,6 +558,89 @@ export func put_deployment(d) {
 export func clear_deployments() {
   let n = sql_write(db(), "DELETE FROM deployments WHERE id <> ''");
   return int(n);
+}
+
+// ---------- 整体发布链路 ----------
+
+export func release_keep() {
+  let d = env("CICD_RELEASE_KEEP");
+  let n = 200;
+  if (d != null and len(trim(str(d))) > 0) { n = int(str(d)); }
+  if (n < 10) { n = 10; }
+  return n;
+}
+
+export func put_release(r) {
+  let id = str(get(r, "id", ""));
+  if (len(id) == 0) { return { ok: false, err: "release id 为空" }; }
+  let created = int(get(r, "created_ts", 0));
+  if (created == 0) { created = now(); }
+  let updated = int(get(r, "updated_ts", 0));
+  if (updated == 0) { updated = created; }
+  put(r, "created_ts", created);
+  put(r, "updated_ts", updated);
+  if (len(str(get(r, "created_at", ""))) == 0) { put(r, "created_at", fmt_iso(created)); }
+  if (len(str(get(r, "updated_at", ""))) == 0) { put(r, "updated_at", fmt_iso(updated)); }
+  let sql = "INSERT OR REPLACE INTO releases (id, project_id, project_name, status, image_ref, current_stage, created_ts, updated_ts, json) VALUES (?, ?, ?, ?, ?, " + str(int(get(r, "current", -1))) + ", " + str(created) + ", " + str(updated) + ", ?)";
+  let params = [id,
+    str(get(r, "project_id", "")), str(get(r, "project_name", "")),
+    str(get(r, "status", "")), str(get(r, "image_ref", "")), stringify(r)];
+  let res = try(() => sql_write(db(), sql, params));
+  if (res.err != null) { return { ok: false, err: str(res.err) }; }
+  prune_releases(release_keep());
+  return { ok: true, err: "" };
+}
+
+export func get_release(id) {
+  let rows = sql_query(db(), "SELECT json FROM releases WHERE id = ?", [str(id)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "json", ""), null);
+}
+
+export func latest_release(project_id) {
+  let rows = sql_query(db(), "SELECT json FROM releases WHERE project_id = ? ORDER BY created_ts DESC, id DESC LIMIT 1", [str(project_id)]);
+  if (len(rows) == 0) { return null; }
+  return parse_json(get(rows[0], "json", ""), null);
+}
+
+export func list_releases(project_id, limit) {
+  let n = int(limit);
+  if (n <= 0) { n = 20; }
+  if (n > 200) { n = 200; }
+  let rows = [];
+  if (len(trim(str(project_id))) > 0) {
+    rows = sql_query(db(), "SELECT json FROM releases WHERE project_id = ? ORDER BY created_ts DESC, id DESC LIMIT " + str(n), [str(project_id)]);
+  } else {
+    rows = sql_query(db(), "SELECT json FROM releases ORDER BY created_ts DESC, id DESC LIMIT " + str(n), []);
+  }
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let r = parse_json(get(rows[i], "json", ""), null);
+    if (r != null) { push(out, r); }
+    i = i + 1;
+  }
+  return out;
+}
+
+// 只裁终态链路：running / ready / queued 还在等下一页轮询推进，不能删。
+export func prune_releases(keep) {
+  let k = int(keep);
+  if (k < 10) { k = 10; }
+  let rows = sql_query(db(), "SELECT COUNT(*) AS n FROM releases", []);
+  let total = 0;
+  if (len(rows) > 0) { total = int(get(rows[0], "n", 0)); }
+  if (total <= k) { return 0; }
+  let cut = total - k;
+  let rows2 = sql_query(db(), "SELECT id FROM releases WHERE status = 'success' OR status = 'failed' OR status = 'canceled' ORDER BY created_ts ASC, id ASC LIMIT " + str(cut), []);
+  let n = 0;
+  let j = 0;
+  while (j < len(rows2)) {
+    let res = try(() => sql_write(db(), "DELETE FROM releases WHERE id = ?", [str(get(rows2[j], "id", ""))]));
+    if (res.err == null) { n = n + 1; }
+    j = j + 1;
+  }
+  return n;
 }
 
 // ---------- 知识库 ----------

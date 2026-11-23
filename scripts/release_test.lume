@@ -1,0 +1,125 @@
+// scripts/release_test.lume — 整体发布链路计划自测
+//
+// 只测纯计划，不提交 runner job：本地 → 测试 → 生产排序、缺失阶段槽位、
+// 显式 release_chain、测试端口默认 8080、生产端口不落默认值。
+
+import "../src/release.lume" as release;
+import "../src/store.lume" as store;
+store.init();
+
+let st = { fails: 0, checks: 0 };
+func ok(label, cond) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (cond) {
+    print("  ok  " + label);
+  } else {
+    print("  FAIL " + label);
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+  }
+}
+
+func stage_at(pl, i) { return get(get(pl, "stages", []), i, {}); }
+func stage_env(pl, i) { return str(get(stage_at(pl, i), "env", "")); }
+
+let p = {
+  id: "p-all",
+  name: "p-all",
+  build: { context: "/tmp" },
+  targets: [
+    { name: "阿里云", method: "ssh", environment: "prod", ssh_host: "ali", ssh_probe_port: "8095" },
+    { name: "腾讯云", method: "ssh", environment: "test", ssh_host: "tencent", ssh_probe_port: "8083" },
+    { name: "本地-k3s", method: "local-k3s", environment: "" },
+  ],
+};
+
+print("release: default chain order");
+let pl = release.plan(p);
+ok("计划成功", get(pl, "ok", false));
+ok("构建排第一", stage_env(pl, 0) == "build");
+ok("本地排第二", stage_env(pl, 1) == "local");
+ok("测试排第三", stage_env(pl, 2) == "test");
+ok("生产排第四", stage_env(pl, 3) == "prod");
+ok("本地目标名正确", str(get(stage_at(pl, 1), "target", "")) == "本地-k3s");
+ok("测试端口默认 8080", str(get(stage_at(pl, 2), "port_default", "")) == "8080");
+ok("生产不落默认端口", str(get(stage_at(pl, 3), "port_default", "")) == "");
+ok("生产需要宿主端口", get(stage_at(pl, 3), "needs_port", false));
+
+print("release: missing local slot");
+let p2 = {
+  id: "p-miss",
+  name: "p-miss",
+  build: { context: "/tmp" },
+  targets: [
+    { name: "阿里云", method: "ssh", environment: "prod", ssh_host: "ali" },
+    { name: "腾讯云", method: "ssh", environment: "test", ssh_host: "tencent" },
+  ],
+};
+let pl2 = release.plan(p2);
+ok("缺失本地槽位保留", stage_env(pl2, 1) == "local" and get(stage_at(pl2, 1), "configured", true) == false);
+ok("测试阶段仍然存在", stage_env(pl2, 2) == "test" and get(stage_at(pl2, 2), "configured", false));
+ok("生产阶段仍然存在", stage_env(pl2, 3) == "prod" and get(stage_at(pl2, 3), "configured", false));
+ok("有缺失阶段提示", len(get(pl2, "warnings", [])) > 0);
+
+print("release: explicit chain");
+let p3 = {
+  id: "p-chain",
+  name: "p-chain",
+  build: { context: "/tmp" },
+  release_chain: ["阿里云", "腾讯云"],
+  targets: [
+    { name: "阿里云", method: "ssh", environment: "prod", ssh_host: "ali" },
+    { name: "腾讯云", method: "ssh", environment: "test", ssh_host: "tencent" },
+  ],
+};
+let pl3 = release.plan(p3);
+ok("显式链路不插入本地槽位", stage_env(pl3, 1) == "prod");
+ok("显式链路保持顺序", stage_env(pl3, 2) == "test");
+ok("显式链路目标正确", str(get(stage_at(pl3, 1), "target", "")) == "阿里云");
+
+print("release: apply ports");
+let ap = release.apply_ports(p, get(pl, "stages", []), { "阿里云": "8099" });
+ok("端口合并成功", get(ap, "ok", false));
+let ap_stages = get(ap, "stages", []);
+ok("测试阶段落默认 8080", str(get(get(ap_stages, 2, {}), "port", "")) == "8080");
+let ap2 = release.apply_ports(p, get(pl, "stages", []), { "阿里云": "8099", "腾讯云": "9090" });
+ok("显式端口写回生产阶段", str(get(get(get(ap2, "stages", []), 3, {}), "port", "")) == "8099");
+ok("显式端口写回测试阶段", str(get(get(get(ap2, "stages", []), 2, {}), "port", "")) == "9090");
+
+print("release: state machine");
+let bad = {
+  id: "rel-bad", project_id: "p-all", project_name: "p-all",
+  status: "running", current: 0, auto: true, image_ref: "x",
+  stages: [{ env: "build", status: "running", run_id: "", target: "", port: "" }],
+  created_ts: now(), updated_ts: now(), error: "",
+};
+let wb = store.put_release(bad);
+ok("坏链路能落库", get(wb, "ok", false));
+let sb = release.sync("rel-bad");
+ok("无 run_id 的阶段置失败", sb != null and str(get(sb, "status", "")) == "failed");
+
+let ready = {
+  id: "rel-ready", project_id: "p-all", project_name: "p-all",
+  status: "ready", current: 1, auto: true, image_ref: "x",
+  stages: [
+    { env: "build", status: "success", run_id: "r1", target: "", port: "" },
+    { env: "test", status: "success", run_id: "r2", target: "腾讯云", port: "8080" },
+    { env: "prod", status: "pending", target: "阿里云", port: "8099", configured: true },
+  ],
+  created_ts: now(), updated_ts: now(), error: "",
+};
+store.put_release(ready);
+let ar = release.advance("rel-ready", {}, "tester");
+ok("生产阶段无确认不能推进", get(ar, "ok", false) == false and contains(str(get(ar, "err", "")), "生产阶段需要单独确认"));
+let cr = release.cancel("rel-ready", "tester");
+ok("ready 链路可以取消", get(cr, "ok", false) and str(get(get(cr, "release", {}), "status", "")) == "canceled");
+
+print("release: top-level local deploy");
+let p4 = { id: "p-local", name: "p-local", build: { context: "/tmp" }, deploy: { method: "local-k3s", namespace: "demo", deployment: "app" } };
+let pl4 = release.plan(p4);
+ok("顶层 local-k3s 识别为本地", stage_env(pl4, 1) == "local");
+ok("没有本地目标时不硬造测试槽位", len(get(pl4, "stages", [])) == 2);
+
+print("");
+let nc = int(get(st, "checks", 0));
+let nf = int(get(st, "fails", 0));
+if (nf == 0) { print("release_test: " + str(nc) + " checks passed"); } else { print("release_test: " + str(nf) + " of " + str(nc) + " FAILED"); }

@@ -1,5 +1,5 @@
 {
-  "defaults_version": 4,
+  "defaults_version": 5,
   "resources": {
     "agent-query": {
       "actions": [
@@ -151,6 +151,12 @@
     "project-visits": {
       "actions": [
         "read"
+      ],
+      "min_role": "human_admin"
+    },
+    "deploy-prod": {
+      "actions": [
+        "promote"
       ],
       "min_role": "human_admin"
     }

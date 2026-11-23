@@ -111,6 +111,7 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_AUDIT_KEEP` | `5000` | 授权审计保留条数，最少 100；每次写入后裁掉最旧记录 |
 | `CICD_ENV_AUDIT_KEEP` | `5000` | 云环境动作审计保留条数；`submitted` 记录不参与裁剪 |
 | `CICD_A2A_TASK_KEEP` | `1000` | A2A 任务保留条数，最少 10；只裁终态任务，排队中的不删 |
+| `CICD_RELEASE_KEEP` | `200` | 整体发布链路保留条数，最少 10；只裁 `success` / `failed` / `canceled` 终态，排队/执行中的不删 |
 | `CICD_ROLE_MAP` | 空 | 旧的口令绑定方式：`human_admin=口令;agent_operator=口令`；身份绑定开启时不生效 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `CICDKIT_PEER_SHARED` | 空 | peer 面共享密钥（与上游 `CICDKIT_PEER_*` 同一套命名，可与旧节点互通）。为空且没配 ROOT 时整面 fail-closed 关闭 |
@@ -180,6 +181,12 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/projects/:id/deploy-versions` | 发布版本列表（同目标去重、时间倒序），给回滚下拉用 |
 | `POST /api/projects/:id/rollback` | 回滚：不传 body = 上一版；带 `image_ref` = 回滚到指定历史版本（只认该项目发布过的镜像）；生产 SSH 目标同样必须带 `port`。受发布闸门保护，`trigger=rollback` |
 | `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护；body 可带 `target` / `method` / `port`（生产 SSH 目标必须带 `port`） |
+| `GET /api/projects/:id/release-plan` | 整体发布计划：构建 + 本地 / 测试 / 生产槽位，未配置的环境保留 `missing` 并给出 warning |
+| `GET /api/projects/:id/releases` | 项目的整体发布历史（`?limit=`，默认 20） |
+| `POST /api/projects/:id/release` | 启动整体发布链路；body 可带 `auto`（默认 `true`）、`image_ref`（跳过构建）、`ports`、`confirm_prod`（首段即生产时必填） |
+| `GET /api/releases/:id` | 链路状态；`auto=true` 时这一步会同步运行并自动启动下一个非生产阶段 |
+| `POST /api/releases/:id/advance` | 推进到下一阶段；目标为生产时 body 必须 `confirm_prod=true`，并叠加 `deploy-prod`（`human_admin`）门禁 |
+| `POST /api/releases/:id/cancel` | 取消链路；只取消当前运行，不误伤已完成的阶段 |
 | `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
 | `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |
 | `POST /api/runs/:id/cancel` | 取消（转给 runner） |
@@ -204,6 +211,28 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `POST /a2a` | A2A JSON-RPC：`message/send`、`tasks/get`、`tasks/cancel` |
 | `GET /peer/health`、`GET /peer/tools` | peer 签名面（HMAC，`?node=&ts=&nonce=&sig=`） |
 | `POST /peer/invoke`、`POST /peer/relay` | 带参调用只读能力；relay 已退役（410） |
+
+### 整体发布链路
+
+`POST /api/projects/:id/release` 把一次发布拆成四个阶段，而不是在一个 runner job 里串所有命令：
+
+```text
+build（本地 Docker 构建/推送，产出 image_ref）
+  → local（本地 Docker / k3s，可选）
+  → test（腾讯云测试，默认 8080）
+  → prod（阿里云生产，必须人工确认 + 宿主端口）
+```
+
+- 每个阶段是独立 run，失败只停在当前阶段；后续阶段复用同一个 `image_ref`，不重复构建。
+- `auto=true` 时构建/本地/测试成功后自动推进；**生产阶段永远停在 `ready`**，等 `advance` 带 `confirm_prod=true`。
+- `auto=false` 时每段都需要手动 `advance`。
+- 计划优先按目标名识别环境：名称含「腾讯」= 测试，含「阿里」= 生产；`local-k3s`、名称含「本地/local」、`environment: "local"` 或没有 `ssh_host` 的 kubectl/helm 目标识别为本地。
+- 每个环境默认取一个目标（优先 `primary_target`，否则取第一个）。项目可用 `release_chain: ["目标A", "目标B"]` 显式指定顺序；显式链路不自动补本地/测试/生产槽位。
+- 当前仓库里的项目数据大多没有本地 target，计划会保留「本地阶段未配置，将跳过」的 warning，实际从构建直接进腾讯测试。
+- 状态由 `GET /api/releases/:id` 驱动同步：页面每 1.5 秒轮询一次；没有后台线程，页面关掉后链路会停在当前阶段，下次打开再继续。
+- 链路记录落在 `releases` 表，保留条数由 `CICD_RELEASE_KEEP` 控制，只裁终态。
+
+前端项目卡片新增「整体发布」入口和链路状态条；弹窗内展示阶段、端口、生产确认和实时日志入口。
 
 ### 发布环境与端口
 
@@ -298,6 +327,7 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 | `env-action-read` | `read` | `agent_operator` |
 | `env-action-mutate` | `restart` | `human_admin` |
 | `audit-read` | `read` | `agent_operator` |
+| `deploy-prod` | `promote` | `human_admin` |
 
 只读数据接口也纳入资源表：项目、运行、部署、知识库、LLM 掩码配置、云环境、
 云环境动作审计和授权审计都按 `*-read` 资源判定。访客统计可能含访客 IP / 地域，

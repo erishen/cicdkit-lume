@@ -1418,3 +1418,229 @@ button.chip:hover {
 .modal:focus {
   outline: none;
 }
+
+/* ---------- 整体发布链路 ---------- */
+
+.notice.warn {
+  background: rgba(210, 153, 34, 0.1);
+  border: 1px solid rgba(210, 153, 34, 0.38);
+  color: #e3b341;
+}
+.tiny {
+  font-size: 11px;
+}
+
+.chip.release-running {
+  color: #79c0ff;
+  border-color: rgba(31, 111, 235, 0.45);
+  background: rgba(31, 111, 235, 0.12);
+}
+.chip.release-ready {
+  color: #e3b341;
+  border-color: rgba(210, 153, 34, 0.45);
+  background: rgba(210, 153, 34, 0.12);
+}
+.chip.release-success {
+  color: #7ee787;
+  border-color: rgba(63, 185, 80, 0.45);
+  background: rgba(63, 185, 80, 0.1);
+}
+.chip.release-failed,
+.chip.release-canceled {
+  color: #ff9b96;
+  border-color: rgba(248, 81, 73, 0.45);
+  background: rgba(248, 81, 73, 0.1);
+}
+
+.release-mini {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  width: 100%;
+  margin-top: 10px;
+  padding: 9px 10px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.release-mini:hover {
+  border-color: var(--accent-dim);
+  background: var(--panel-2);
+}
+.release-mini-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.release-mini-open {
+  margin-left: auto;
+  color: var(--accent);
+  font-size: 12px;
+}
+.release-mini-stages {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.release-mini-stage {
+  padding: 2px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.release-mini-stage.success {
+  color: #7ee787;
+  border-color: rgba(63, 185, 80, 0.38);
+}
+.release-mini-stage.running {
+  color: #79c0ff;
+  border-color: rgba(31, 111, 235, 0.45);
+  animation: release-pulse 1.4s ease-in-out infinite;
+}
+.release-mini-stage.failed {
+  color: #ff9b96;
+  border-color: rgba(248, 81, 73, 0.45);
+}
+.release-mini-stage.missing,
+.release-mini-stage.pending {
+  opacity: 0.72;
+}
+
+.release-modal {
+  width: min(860px, 96vw);
+}
+.release-headline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+.release-plan,
+.release-timeline {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.release-step {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel);
+}
+.release-step:last-child {
+  border-bottom: 0;
+}
+.release-step.current {
+  background: rgba(31, 111, 235, 0.08);
+}
+.release-step.off {
+  opacity: 0.55;
+}
+.release-dot {
+  width: 9px;
+  height: 9px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--muted);
+}
+.release-dot.success {
+  background: #3fb950;
+}
+.release-dot.running {
+  background: var(--accent);
+  animation: release-pulse 1.4s ease-in-out infinite;
+}
+.release-dot.failed {
+  background: #f85149;
+}
+.release-dot.missing {
+  background: transparent;
+  border: 1px dashed var(--muted);
+}
+.release-step-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.release-step-main strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+.release-step-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.release-step-side {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.release-state {
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.release-state.success {
+  color: #7ee787;
+}
+.release-state.running {
+  color: #79c0ff;
+}
+.release-state.failed,
+.release-state.canceled {
+  color: #ff9b96;
+}
+.release-step-error {
+  color: #ff9b96;
+  font-size: 12px;
+  line-height: 1.4;
+  white-space: normal;
+}
+.release-port {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: none;
+}
+.release-port .input {
+  width: 120px;
+  min-width: 120px;
+  padding: 5px 8px;
+}
+.chk-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+@keyframes release-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
+@media (max-width: 720px) {
+  .release-step {
+    flex-wrap: wrap;
+  }
+  .release-port {
+    width: 100%;
+    flex-direction: row;
+    align-items: center;
+  }
+  .release-port .input {
+    width: 100%;
+  }
+}

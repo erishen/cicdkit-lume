@@ -19,6 +19,9 @@ import API, {
   Overview,
   AccessEvent,
   Project,
+  Release,
+  ReleasePlan,
+  ReleaseStage,
   Run,
   RunLog,
   ScanCandidate,
@@ -93,6 +96,34 @@ function targetEnv(name: string, spec?: Project['deploy']): DeployEnv {
 
 function envLabel(env: DeployEnv): string {
   return env === 'test' ? '测试' : env === 'prod' ? '生产' : '未定义'
+}
+
+const RELEASE_STATUS_LABEL: Record<string, string> = {
+  queued: '排队中',
+  running: '执行中',
+  ready: '待下一阶段',
+  success: '成功',
+  failed: '失败',
+  canceled: '已取消',
+  pending: '待执行',
+  missing: '未配置',
+}
+
+const RELEASE_STAGE_SHORT: Record<string, string> = {
+  build: '构建',
+  local: '本地',
+  test: '腾讯',
+  prod: '生产',
+  default: '目标',
+}
+
+function releaseStatusLabel(status?: string): string {
+  if (!status) return '未开始'
+  return RELEASE_STATUS_LABEL[status] || status
+}
+
+function releaseStageShort(stage: ReleaseStage): string {
+  return RELEASE_STAGE_SHORT[stage.env] || stage.label || stage.env
 }
 
 function deployOptions(p: Project): DeployOption[] {
@@ -355,7 +386,15 @@ function OverviewPage({ role }: { role: string }) {
 
 type Notice = { id: string; kind: 'ok' | 'err'; text: string }
 
-function ProjectsPage({ role }: { role: string }) {
+function ProjectsPage({
+  role,
+  roleOptions,
+  onRoleChange,
+}: {
+  role: string
+  roleOptions: string[]
+  onRoleChange: (role: string) => void
+}) {
   const [projects, setProjects] = useState<Project[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -365,6 +404,8 @@ function ProjectsPage({ role }: { role: string }) {
   const [editing, setEditing] = useState<Project | null>(null)
   const [creating, setCreating] = useState(false)
   const [deploying, setDeploying] = useState<{ project: Project; action: 'deploy' | 'pipeline' } | null>(null)
+  const [releaseOpen, setReleaseOpen] = useState<{ project: Project; releaseId?: string } | null>(null)
+  const [openRun, setOpenRun] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -595,6 +636,29 @@ function ProjectsPage({ role }: { role: string }) {
                   </div>
                 </dl>
 
+                {p.last_release && (
+                  <button
+                    className="release-mini"
+                    onClick={() => setReleaseOpen({ project: p, releaseId: p.last_release?.id })}
+                    title="查看整体发布链路"
+                  >
+                    <span className="release-mini-head">
+                      <span className={`chip release-${p.last_release.status}`}>
+                        {releaseStatusLabel(p.last_release.status)}
+                      </span>
+                      <span className="muted small">整体发布链路</span>
+                      <span className="release-mini-open">查看 ›</span>
+                    </span>
+                    <span className="release-mini-stages">
+                      {(p.last_release.stages || []).map((s, i) => (
+                        <span className={`release-mini-stage ${s.status || 'pending'}`} key={`${s.env}-${s.target}-${i}`}>
+                          {releaseStageShort(s)}
+                        </span>
+                      ))}
+                    </span>
+                  </button>
+                )}
+
                 <div className="row wrap card-actions">
                   <button
                     className="btn"
@@ -606,9 +670,16 @@ function ProjectsPage({ role }: { role: string }) {
                   <button
                     className="btn primary"
                     disabled={busy !== ''}
+                    onClick={() => setReleaseOpen({ project: p })}
+                  >
+                    整体发布
+                  </button>
+                  <button
+                    className="btn"
+                    disabled={busy !== ''}
                     onClick={() => setDeploying({ project: p, action: 'deploy' })}
                   >
-                    {busy === p.id + ':deploy' ? '发布中…' : '发布'}
+                    {busy === p.id + ':deploy' ? '发布中…' : '单目标发布'}
                   </button>
                   {p.last_deploy ? (
                     <button
@@ -692,6 +763,24 @@ function ProjectsPage({ role }: { role: string }) {
         />
       )}
 
+      {releaseOpen && (
+        <ReleaseModal
+          project={releaseOpen.project}
+          role={role}
+          roleOptions={roleOptions}
+          onRoleChange={onRoleChange}
+          initialId={releaseOpen.releaseId}
+          onClose={() => {
+            setReleaseOpen(null)
+            load()
+          }}
+          onChanged={load}
+          onOpenRun={(id) => setOpenRun(id)}
+        />
+      )}
+
+      {openRun && <RunDrawer runId={openRun} role={role} onClose={() => setOpenRun('')} onChanged={load} />}
+
       {editing && (
         <EditProjectModal
           project={editing}
@@ -703,6 +792,397 @@ function ProjectsPage({ role }: { role: string }) {
           }}
         />
       )}
+    </div>
+  )
+}
+
+// ---------- 整体发布链路 ----------
+
+function releaseDefaultPorts(plan: ReleasePlan | null): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const s of plan?.stages || []) {
+    if (s.configured && s.needs_port) out[s.target || '__default'] = s.port_default || ''
+  }
+  return out
+}
+
+function ReleaseModal({
+  project,
+  role,
+  roleOptions,
+  onRoleChange,
+  initialId,
+  onClose,
+  onChanged,
+  onOpenRun,
+}: {
+  project: Project
+  role: string
+  roleOptions: string[]
+  onRoleChange: (role: string) => void
+  initialId?: string
+  onClose: () => void
+  onChanged: () => void
+  onOpenRun: (runId: string) => void
+}) {
+  const [plan, setPlan] = useState<ReleasePlan | null>(null)
+  const [release, setRelease] = useState<Release | null>(null)
+  const [ports, setPorts] = useState<Record<string, string>>({})
+  const [auto, setAuto] = useState(true)
+  const [imageRef, setImageRef] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (initialId) return
+    let alive = true
+    setLoading(true)
+    API.releasePlan(project.id, role)
+      .then((p) => {
+        if (!alive) return
+        setPlan(p)
+        setPorts(releaseDefaultPorts(p))
+      })
+      .catch((e: any) => alive && setError(e.message || String(e)))
+      .finally(() => alive && setLoading(false))
+    return () => {
+      alive = false
+    }
+  }, [project.id, role, initialId])
+
+  useEffect(() => {
+    if (!initialId) return
+    let alive = true
+    setLoading(true)
+    API.release(initialId, role)
+      .then((r) => {
+        if (!alive) return
+        setRelease(r.release)
+      })
+      .catch((e: any) => alive && setError(e.message || String(e)))
+      .finally(() => alive && setLoading(false))
+    return () => {
+      alive = false
+    }
+  }, [initialId, role])
+
+  useEffect(() => {
+    if (!release?.id || ['success', 'failed', 'canceled'].includes(release.status || '')) return
+    let alive = true
+    let timer: number | undefined
+    const tick = async () => {
+      try {
+        const r = await API.release(release.id, role)
+        if (!alive) return
+        setRelease(r.release)
+        if (['queued', 'running'].includes(r.release.status || '')) {
+          timer = window.setTimeout(tick, 1500)
+        }
+      } catch (e: any) {
+        if (alive) {
+          setError(e.message || String(e))
+          timer = window.setTimeout(tick, 4000)
+        }
+      }
+    }
+    timer = window.setTimeout(tick, 1200)
+    return () => {
+      alive = false
+      if (timer) window.clearTimeout(timer)
+    }
+  }, [release?.id, release?.status, role])
+
+  const canPromote = roleOptions.includes('human_admin')
+  const buildStage = (plan?.stages || []).find((s) => s.env === 'build')
+  const deployStages = (plan?.stages || []).filter((s) => s.env !== 'build' && s.configured)
+  const firstDeploy = deployStages[0]
+  const prodPortOk = deployStages.every((s) => {
+    if (s.env !== 'prod' || !s.needs_port) return true
+    const value = (ports[s.target || '__default'] || '').trim()
+    return /^\d+$/.test(value) && Number(value) >= 1 && Number(value) <= 65535
+  })
+  const canStart =
+    !!plan &&
+    plan.configured > 0 &&
+    auto !== undefined &&
+    !busy &&
+    prodPortOk &&
+    (!!buildStage?.configured || imageRef.trim() !== '') &&
+    (firstDeploy?.env !== 'prod' || role === 'human_admin' || canPromote)
+
+  const start = async () => {
+    if (!canStart || !plan) return
+    setBusy(true)
+    setError('')
+    try {
+      const firstIsProd = firstDeploy?.env === 'prod'
+      if (firstIsProd && role !== 'human_admin' && !canPromote) {
+        setError('当前账号未被授予终审角色，不能确认生产发布。')
+        return
+      }
+      const requestRole = firstIsProd && role !== 'human_admin' ? 'human_admin' : role
+      if (requestRole !== role) onRoleChange(requestRole)
+      const res = await API.releaseStart(project.id, requestRole, {
+        ports,
+        auto,
+        image_ref: imageRef.trim(),
+        confirm_prod: firstIsProd,
+      })
+      setRelease(res.release)
+      setPlan(null)
+      onChanged()
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const stages = release?.stages || []
+  const current = release?.current ?? -1
+  const nextStage = stages[current + 1]
+  const canAdvance = release?.status === 'ready' && !!nextStage
+  const runningStage = current >= 0 ? stages[current] : undefined
+
+  const advance = async () => {
+    if (!release || !nextStage) return
+    setBusy(true)
+    setError('')
+    try {
+      const isProd = nextStage.env === 'prod'
+      if (isProd && role !== 'human_admin' && !canPromote) {
+        setError('当前账号未被授予终审角色，不能确认生产发布。')
+        return
+      }
+      const requestRole = isProd && role !== 'human_admin' ? 'human_admin' : role
+      if (requestRole !== role) onRoleChange(requestRole)
+      const res = await API.releaseAdvance(release.id, requestRole, { confirm_prod: isProd })
+      setRelease(res.release)
+      onChanged()
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const cancelChain = async () => {
+    if (!release) return
+    setBusy(true)
+    setError('')
+    try {
+      const res = await API.releaseCancel(release.id, role)
+      setRelease(res.release)
+      onChanged()
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal release-modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <div>
+            <h3>整体发布 · {project.name}</h3>
+            <div className="muted small">
+              构建一次，按 本地 → 腾讯云测试 → 阿里云生产 串联；生产阶段始终暂停，等人工确认。
+            </div>
+          </div>
+          <button className="btn ghost" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+
+        <div className="modal-body">
+          {loading ? (
+            <div className="empty">
+              <span className="spin" /> 读取发布链路…
+            </div>
+          ) : release ? (
+            <>
+              <div className="release-headline">
+                <span className={`chip release-${release.status}`}>{releaseStatusLabel(release.status)}</span>
+                {release.image_ref && <span className="muted small mono">{release.image_ref}</span>}
+                <span className="muted small">发起人 {release.requested_by || '—'}</span>
+              </div>
+
+              <div className="release-timeline">
+                {stages.map((s, i) => (
+                  <div className={`release-step ${s.env} ${i === current ? 'current' : ''}`} key={`${s.env}-${s.target}-${i}`}>
+                    <span className={`release-dot ${s.status || 'pending'}`} />
+                    <div className="release-step-main">
+                      <strong>{s.label || releaseStageShort(s)}</strong>
+                      <span className="muted small">
+                        {s.env === 'build' ? '本地 Docker 构建 / 推送' : s.target || '默认发布目标'}
+                        {s.port ? ` · 宿主端口 ${s.port}` : ''}
+                      </span>
+                      {s.error && <div className="release-step-error">{s.error}</div>}
+                    </div>
+                    <div className="release-step-side">
+                      <span className={`release-state ${s.status || 'pending'}`}>{releaseStatusLabel(s.status)}</span>
+                      {s.run_id && (
+                        <button className="btn ghost tiny" onClick={() => onOpenRun(s.run_id!)}>
+                          日志
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {release.status === 'running' && (
+                <div className="notice ok">
+                  页面每 1.5 秒同步一次；构建/本地/测试成功后自动推进，生产阶段会停在这里等确认。
+                </div>
+              )}
+              {release.status === 'ready' && nextStage && (
+                <div className={nextStage.env === 'prod' ? 'notice warn' : 'notice ok'}>
+                  {nextStage.env === 'prod'
+                    ? role === 'human_admin'
+                      ? '下一阶段是阿里云生产：需要终审角色并再次确认。'
+                      : canPromote
+                        ? '下一阶段是阿里云生产：点击确认会先切换顶栏到终审，再提交。'
+                        : '下一阶段是阿里云生产：当前账号未被授予终审角色，不能确认。'
+                    : `下一阶段：${nextStage.label || nextStage.target}。确认后继续。`}
+                </div>
+              )}
+              {release.status === 'success' && <div className="notice ok">整体发布完成，所有阶段都已成功。</div>}
+              {release.status === 'failed' && <div className="notice err">链路停在失败阶段：{release.error || runningStage?.error || '查看上方日志'}</div>}
+              {release.status === 'canceled' && <div className="notice err">发布链路已取消。</div>}
+              {error && <div className="notice err">{error}</div>}
+            </>
+          ) : (
+            <>
+              {plan && (
+                <>
+                  <div className="release-headline">
+                    <span className="chip">发布计划</span>
+                    <span className="muted small">构建一次，镜像贯穿所有阶段</span>
+                  </div>
+
+                  <div className="release-plan">
+                    {plan.stages.map((s, i) => (
+                      <div className={`release-step ${s.env} ${s.configured ? '' : 'off'}`} key={`${s.env}-${s.target}-${i}`}>
+                        <span className={`release-dot ${s.status || 'pending'}`} />
+                        <div className="release-step-main">
+                          <strong>{s.label || releaseStageShort(s)}</strong>
+                          <span className="muted small">
+                            {s.env === 'build'
+                              ? '本地 Docker 构建 / 推送'
+                              : s.configured
+                                ? `${s.target || '默认发布目标'}${s.host ? ` · ${s.host}` : ''}`
+                                : s.warning || '未配置，跳过'}
+                          </span>
+                        </div>
+                        {s.env !== 'build' && s.configured && s.needs_port ? (
+                          <div className="release-port">
+                            <label className="muted small" htmlFor={`port-${s.env}-${s.target}`}>
+                              宿主端口{s.env === 'prod' ? '（必填）' : ''}
+                            </label>
+                            <input
+                              id={`port-${s.env}-${s.target}`}
+                              className="input"
+                              inputMode="numeric"
+                              placeholder={s.env === 'prod' ? '例如 8095' : '8080'}
+                              value={ports[s.target || '__default'] || ''}
+                              onChange={(e) => setPorts((p) => ({ ...p, [s.target || '__default']: e.target.value }))}
+                            />
+                          </div>
+                        ) : (
+                          <span className="muted tiny">{s.configured ? '无需端口' : '跳过'}</span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+
+                  {(plan.warnings || []).length > 0 && (
+                    <div className="notice warn">
+                      {plan.warnings!.map((w) => (
+                        <div key={w}>{w}</div>
+                      ))}
+                    </div>
+                  )}
+
+                  <label className="fld">
+                    <span>已有镜像（可选，留空则先执行本地构建）</span>
+                    <input
+                      className="input mono"
+                      placeholder="registry/repo:tag"
+                      value={imageRef}
+                      onChange={(e) => setImageRef(e.target.value)}
+                    />
+                  </label>
+                  <label className="chk-row">
+                    <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+                    <span>构建/本地/测试成功后自动推进；生产阶段始终暂停确认</span>
+                  </label>
+                  {!buildStage?.configured && imageRef.trim() === '' && (
+                    <div className="notice err">未配置构建上下文，必须填写已有镜像才能发布。</div>
+                  )}
+                  {!prodPortOk && <div className="notice err">生产阶段必须填写 1-65535 的宿主端口。</div>}
+                  {firstDeploy?.env === 'prod' && (
+                    <div className="notice warn">
+                      首个可发布阶段就是生产：点击下方按钮即视为确认生产发布。
+                      {role !== 'human_admin' && (canPromote ? ' 提交时会先切换顶栏到终审。' : ' 当前账号未被授予终审角色，不能提交。')}
+                    </div>
+                  )}
+                </>
+              )}
+              {error && <div className="notice err">{error}</div>}
+            </>
+          )}
+        </div>
+
+        <div className="modal-foot">
+          <button className="btn ghost" onClick={onClose} disabled={busy}>
+            关闭
+          </button>
+          {release && (release.status === 'running' || release.status === 'queued') && runningStage?.run_id && (
+            <button className="btn" onClick={() => onOpenRun(runningStage.run_id!)}>
+              查看当前日志
+            </button>
+          )}
+          {release && (release.status === 'running' || release.status === 'queued') && (
+            <button className="btn ghost" onClick={cancelChain} disabled={busy}>
+              取消链路
+            </button>
+          )}
+          {canAdvance && (
+            <button
+              className="btn primary"
+              onClick={advance}
+              disabled={busy || (nextStage?.env === 'prod' && role !== 'human_admin' && !canPromote)}
+            >
+              {busy
+                ? '提交中…'
+                : nextStage?.env === 'prod'
+                  ? role === 'human_admin'
+                    ? '确认发布生产'
+                    : canPromote
+                      ? '切到终审并确认生产'
+                      : '无终审权限'
+                  : '继续下一阶段'}
+            </button>
+          )}
+          {!release && (
+            <button className="btn primary" onClick={start} disabled={!canStart}>
+              {busy
+                ? '提交中…'
+                : firstDeploy?.env === 'prod'
+                  ? role === 'human_admin'
+                    ? '确认发布生产'
+                    : canPromote
+                      ? '切到终审并确认生产'
+                      : '无终审权限'
+                  : '开始整体发布'}
+            </button>
+          )}
+        </div>
+      </div>
     </div>
   )
 }
@@ -3617,7 +4097,9 @@ function App() {
 
       <main>
         {route === 'overview' && <OverviewPage role={role} />}
-        {route === 'projects' && <ProjectsPage role={role} />}
+        {route === 'projects' && (
+          <ProjectsPage role={role} roleOptions={roleOptions} onRoleChange={changeRole} />
+        )}
         {route === 'runs' && <RunsPage role={role} />}
         {route === 'deployments' && <DeploymentsPage role={role} />}
         {route === 'environments' && <EnvironmentsPage role={role} />}

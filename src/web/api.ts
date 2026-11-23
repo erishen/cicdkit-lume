@@ -70,6 +70,8 @@ export interface Project {
   updated_at?: string
   last_deploy?: LastDeploy
   last_deploys?: Record<string, LastDeploy>
+  release_chain?: string[]
+  last_release?: Release
 }
 
 export interface StageResult {
@@ -106,6 +108,52 @@ export interface Deployment {
   status?: string
   created_at?: string
   run_id?: string
+}
+
+export type ReleaseStageEnv = 'build' | 'local' | 'test' | 'prod' | 'default'
+
+export interface ReleaseStage {
+  env: ReleaseStageEnv
+  label: string
+  target?: string
+  method?: string
+  host?: string
+  configured?: boolean
+  status?: string
+  needs_port?: boolean
+  port_default?: string
+  port?: string
+  run_id?: string
+  image_ref?: string
+  warning?: string
+  error?: string
+  started_at?: string
+  ended_at?: string
+  approved_by?: string
+}
+
+export interface Release {
+  id: string
+  project_id: string
+  project_name?: string
+  status: string
+  image_ref?: string
+  current?: number
+  auto?: boolean
+  requested_by?: string
+  error?: string
+  stages?: ReleaseStage[]
+  created_at?: string
+  updated_at?: string
+}
+
+export interface ReleasePlan {
+  ok: boolean
+  project_id: string
+  project_name: string
+  stages: ReleaseStage[]
+  warnings?: string[]
+  configured: number
 }
 
 export interface EnvironmentProjectRow {
@@ -474,6 +522,28 @@ export const API = {
       method: 'POST',
       body: JSON.stringify(body || {}),
     }),
+
+  releasePlan: (id: string, role: string) =>
+    request<ReleasePlan>(`/api/projects/${encodeURIComponent(id)}/release-plan${roleQuery(role)}`),
+  releaseStart: (id: string, role: string, body?: unknown) =>
+    request<{ ok: boolean; release: Release }>(
+      `/api/projects/${encodeURIComponent(id)}/release${roleQuery(role)}`,
+      { method: 'POST', body: JSON.stringify(body || {}) },
+    ),
+  release: (id: string, role: string) =>
+    request<{ ok: boolean; release: Release }>(
+      `/api/releases/${encodeURIComponent(id)}${roleQuery(role)}`,
+    ),
+  releaseAdvance: (id: string, role: string, body?: unknown) =>
+    request<{ ok: boolean; release: Release }>(
+      `/api/releases/${encodeURIComponent(id)}/advance${roleQuery(role)}`,
+      { method: 'POST', body: JSON.stringify(body || {}) },
+    ),
+  releaseCancel: (id: string, role: string) =>
+    request<{ ok: boolean; release: Release }>(
+      `/api/releases/${encodeURIComponent(id)}/cancel${roleQuery(role)}`,
+      { method: 'POST' },
+    ),
 
   // 回滚用的版本列表（同一目标、去重、按时间倒序）
   deployVersions: (id: string, target?: string) =>
