@@ -177,7 +177,7 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET/POST /api/projects/:id/generate` | 补 `Dockerfile` / k8s 清单；GET = 只出方案，POST 带 `?apply=1` 才落盘（需 `?role=human_admin`） |
 | `GET /api/projects/:id/visits` | 线上访客统计：域名取自 target `note` 的「公网域名 …」、PIN 取自 `*_VISIT_PIN=`；未配置 → `configured:false`，站点挂了 → `online:false` |
 | `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe`（`validate` / `probe` 也支持 GET） |
-| `POST /api/webhook/:id` | 外部 CI 触发流水线；`?secret=` 对 `CICD_HOOK_KEY`，不受角色闸门 |
+| `POST /api/webhook/:id` | 外部 CI 触发流水线；body 的 `secret` 对 `CICD_HOOK_KEY`（`?secret=` 仅兼容旧调用），不受角色闸门 |
 | `POST /api/agent/query` | Agent/Text2SQL：自然语言 → 受限单表 SELECT，只查 `agent_projects` / `agent_runs` / `agent_deployments`，强制 `LIMIT ≤ 100`，不写库；返回 SQL、表格和一句 AI 结论摘要（需任意合法角色，每分钟最多 5 次） |
 | `GET /api/projects/:id/deploy-versions` | 发布版本列表（同目标去重、时间倒序），给回滚下拉用 |
 | `POST /api/projects/:id/rollback` | 回滚：不传 body = 上一版；带 `image_ref` = 回滚到指定历史版本（只认该项目发布过的镜像）；生产 SSH 目标同样必须带 `port`。受发布闸门保护，`trigger=rollback` |
@@ -389,7 +389,12 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 - **读出侧**：`GET` 永远不回传明文。运行日志、云环境动作输出（`docker logs` /
   `helm history`）和诊断提示词都过 `mask_log()`（`SECRET_RE` / `KEY_RE` /
   `BEARER_RE`），因为构建参数里本来就有 `--build-arg LLM_API_KEY=...`、
-  `-e *_VISIT_PIN=...` 这类真值。落盘原件不动，只在返回浏览器前脱敏。
+  `-e *_VISIT_PIN=...` 这类真值。项目详情还会对 `build.build_args` 与
+  `ssh_run_args` 里的密钥键逐个掩码；`secret:<名字>` 引用保持可读，PUT 回填时
+  自动还原。落盘原件不动，只在返回浏览器前脱敏。
+- **LLM Key 不再落 `store.db`**：`settings.llm` 只保存 `api_key_ref`，真实值在
+  `.data/secrets/llm_api_key`（0600）。老库首次读取会自动迁移，备份 `store.db`
+  不会再带出 LLM Key。
 
 ### 切换前体检与路径重映射
 
@@ -427,7 +432,8 @@ make sanitize-apply    # 先备份 store.db 再写库
 ```
 
 - 判定逻辑在 `redact.mask_values()`（store_test 里有断言）：字符串形态走 `mask_log()`，
-  map 形态（`build_args: {LLM_API_KEY: "sk-..."}`）整值换成 `********`，不留 `sk-********` 残形。
+  map 形态（`build_args: {LLM_API_KEY: "sk-..."}`）整值换成 `********`，不留 `sk-********` 残形；
+  `secret:` 引用会跳过，不会被二次掩码。
 - 历史运行/部署的 json 里存着当初执行过的命令行，也会按字符串级脱敏（报告里单列 `history:`）。
 - 幂等：清洗完再跑一次全部 `clean`。
 - **是有损操作**：这些参数会变成掩码 `********`，依赖它们注入密钥的构建会失效。
@@ -495,13 +501,13 @@ SSH、registry 操作）一律不进这两面——发布只能走人工审批�
 
 ```bash
 export CICD_HOOK_KEY=$(openssl rand -hex 24)   # 不设就是不启用，接口返回 503
-curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm?secret=$CICD_HOOK_KEY" \
+curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm" \
   -H 'Content-Type: application/json' \
-  -d '{"tag":"v1.2.3","method":"ssh","target":"阿里云"}'
+  -d "{\"secret\":\"$CICD_HOOK_KEY\",\"tag\":\"v1.2.3\",\"method\":\"ssh\",\"target\":\"阿里云\"}"
 ```
 
 - 只收 `POST`；`id` 缺失 400、项目不存在 404。
-- 密钥只从 query `?secret=` 取（Lume 的请求对象不暴露请求头，`X-Webhook-Secret` 这条上游兼容没做）。
+- 密钥优先放 body 的 `secret`，不会进代理日志、浏览器历史和 Referer；旧调用仍兼容 `?secret=`，但新接入不要再走 query。Lume 的请求对象不暴露请求头，`X-Webhook-Secret` 没做。
 - body 全部可选：`tag`（覆盖自动时间戳 tag，只允许 `[A-Za-z0-9][A-Za-z0-9._-]*`，最长 128，否则 400）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）、`port`（生产 SSH 目标必填，否则 400）。
 - 成功返回 `202` 和 `run_id` —— 只是**受理**，进度照样去 `/api/runs/:id` 看。
 - 触发的是 `pipeline`（构建 + 部署），`trigger` 记为 `webhook`，方便在运行列表里区分人点还是机器点。

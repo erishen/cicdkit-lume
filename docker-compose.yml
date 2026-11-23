@@ -34,6 +34,7 @@ services:
       # 必须显式注入：make docker 会自动生成 .data/runner.token 并传进来。
       RUNNER_AUTH: ${RUNNER_AUTH:?先设置 RUNNER_AUTH（make docker 会自动生成）}
       CICD_DEPLOY_APPROVAL: ${CICD_DEPLOY_APPROVAL:-off}
+      CICD_HOOK_KEY: ${CICD_HOOK_KEY:-}
       # 项目配置里存的是**宿主绝对路径**，runner 又是按宿主路径解析 context 的，
       # 所以控制面必须也挂同一批路径、用同一个值做允许根 —— 再映射到 /projects
       # 只会让同一份配置在两边指向不同目录，validation 过、构建找不到文件。

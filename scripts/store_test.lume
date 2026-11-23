@@ -84,6 +84,27 @@ let back = redact.merge_secrets(pub, got);
 ok("回填恢复私钥路径", str(get(get(back, "deploy", {}), "ssh_key_path", "")) == "/app/.data/demo_key");
 ok("回填恢复 PIN", contains(str(get(get(back, "deploy", {}), "ssh_run_args", "")), "p1n2s3cr3t"));
 
+// 运行参数里的普通密钥键（不只是 *_VISIT_PIN）也不能回传浏览器。
+let secrun = { id: "proj-t3", name: "secret-run",
+  deploy: { method: "ssh", ssh_host: "10.0.0.9", ssh_user: "root",
+            ssh_run_args: "-e LLM_API_KEY=sk-abcdefghijklmnop1234 -e DEMO_READONLY=1" } };
+let secpub = redact.redact_project(secrun);
+ok("ssh_run_args 里的 LLM_API_KEY 已掩码", len(str_match("sk-abcdefghijklmnop1234", stringify(secpub))) == 0);
+ok("ssh_run_args 非密参数保留", contains(str(get(get(secpub, "deploy", {}), "ssh_run_args", "")), "DEMO_READONLY=1"));
+let secback = redact.merge_secrets(secpub, secrun);
+ok("ssh_run_args 的 LLM_API_KEY 可回填", contains(str(get(get(secback, "deploy", {}), "ssh_run_args", "")), "sk-abcdefghijklmnop1234"));
+
+// build_args 里的明文密钥同样不能回传；secret: 引用要保留可读。
+let barg = { id: "proj-t3b", name: "build-args",
+  build: { build_args: { LLM_API_KEY: "sk-buildsecret123456", DEMO_FLAG: "1" } } };
+let bargpub = redact.redact_project(barg);
+ok("build_args 密钥已掩码", len(str_match("sk-buildsecret123456", stringify(bargpub))) == 0);
+ok("build_args 非密参数保留", contains(str(get(get(bargpub, "build", {}), "build_args", {}), "DEMO_FLAG", ""), "1"));
+let bargback = redact.merge_secrets(bargpub, barg);
+ok("build_args 密钥可回填", contains(str(get(get(bargback, "build", {}), "build_args", {}), "LLM_API_KEY", ""), "sk-buildsecret123456"));
+let refview = redact.redact_project({ id: "proj-t3c", build: { build_args: { LLM_API_KEY: "secret:lume_crm_llm_api_key" } } });
+ok("build_args 的 secret 引用可读", str(get(get(get(refview, "build", {}), "build_args", {}), "LLM_API_KEY", "")) == "secret:lume_crm_llm_api_key");
+
 // ---- 运行记录 ----
 print("store: runs");
 let run = { id: "run-t1", project_id: "proj-t1", project_name: "demo-app", trigger: "manual",
@@ -226,6 +247,13 @@ ok("不留 sk- 残形", len(str_match("sk-", stringify(cleaned))) == 0);
 ok("字符串内嵌密钥被替换", len(str_match("DEMO_VISIT_PIN=", stringify(cleaned))) > 0 and len(str_match("p1n2s3", stringify(cleaned))) == 0);
 ok("非密钥参数保持原样", len(str_match("DEMO_READONLY=1", stringify(cleaned))) > 0);
 ok("命中计数与路径", int(get(acc, "n", 0)) == 2 and len(get(acc, "items", [])) == 2);
+
+// secret: 引用不能被清洗脚本当成明文掩码。
+let refp = { id: "proj-t4", build: { build_args: { LLM_API_KEY: "secret:lume_crm_llm_api_key" } } };
+let refacc = { n: 0, items: [] };
+let refclean = redact.mask_values(refp, "proj-t4", refacc);
+ok("secret 引用保持原样", str(get(get(get(refclean, "build", {}), "build_args", {}), "LLM_API_KEY", "")) == "secret:lume_crm_llm_api_key");
+ok("secret 引用不计入命中", int(get(refacc, "n", 0)) == 0);
 
 // 代码托管 / IM / 云厂商的 token 也要打码（日志里并不只有 sk- 一种）。
 let leaky = redact.mask_log("git push https://ghp_abcdefghijklmnop123456@x AKIAABCDEFGHIJKLMNOP xoxb-123456789012-abc");

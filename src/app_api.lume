@@ -11,6 +11,7 @@ import "exec.lume" as exec;
 import "jobs.lume" as jobs;
 import "generate.lume" as generate;
 import "release.lume" as release;
+import "secrets.lume" as secrets;
 
 // ---------- 小工具 ----------
 
@@ -1215,7 +1216,30 @@ export func project_visits(id) {
 func llm_raw() {
   let cfg = store.get_setting("llm");
   if (cfg == null) {
-    return { enabled: false, base_url: "https://api.deepseek.com", model: "deepseek-chat", system: "", api_key: "", api_key_set: false };
+    return { enabled: false, base_url: "https://api.deepseek.com", model: "deepseek-chat", system: "", api_key: "", api_key_ref: "", api_key_set: false };
+  }
+  let ref = s(get(cfg, "api_key_ref", ""), "");
+  let plain = s(get(cfg, "api_key", ""), "");
+  if (len(ref) > 0) {
+    // 密钥只存 .data/secrets/llm_api_key，store.db 与备份里不再有明文。
+    let r = secrets.resolve(ref);
+    if (get(r, "ok", false)) {
+      put(cfg, "api_key", str(get(r, "value", "")));
+    } else {
+      put(cfg, "api_key", "");
+      put(cfg, "api_key_error", str(get(r, "err", "LLM 密钥读取失败")));
+    }
+  } else if (len(plain) > 0) {
+    // 老库迁移：把 settings 里的明文搬到 secret 文件，再清掉 settings 里的副本。
+    let name = "llm_api_key";
+    let w = secrets.write_secret(name, plain);
+    if (get(w, "ok", false)) {
+      put(cfg, "api_key_ref", "secret:" + name);
+      put(cfg, "api_key", "");
+      put(cfg, "api_key_set", true);
+      store.put_setting("llm", cfg);
+      put(cfg, "api_key", plain);
+    }
   }
   if (get(cfg, "api_key_set", null) == null) {
     put(cfg, "api_key_set", len(s(get(cfg, "api_key", ""), "")) > 0);
@@ -1239,17 +1263,31 @@ export func llm_put(raw) {
   if (body == null) { return { status: 400, body: { ok: false, error: "请求体不是合法 JSON" } }; }
   let cur = llm_raw();
   let key = s(get(body, "api_key", ""), "");
-  if (len(key) == 0 or key == redact.masked()) {
-    // 空值 / 掩码 = 沿用旧密钥
+  let ref = s(get(cur, "api_key_ref", ""), "");
+  if (len(key) > 0 and key != redact.masked()) {
+    let w = secrets.write_secret("llm_api_key", key);
+    if (not get(w, "ok", false)) {
+      return { status: 500, body: { ok: false, error: "写入 LLM 密钥失败：" + str(get(w, "err", "")) } };
+    }
+    ref = "secret:llm_api_key";
+  } else if (len(ref) == 0) {
+    // 老库可能只读了明文还没迁移：先落到 secret 文件，再写配置。
     let old = s(get(cur, "api_key", ""), "");
-    put(body, "api_key", old);
+    if (len(old) > 0) {
+      let w2 = secrets.write_secret("llm_api_key", old);
+      if (not get(w2, "ok", false)) {
+        return { status: 500, body: { ok: false, error: "写入 LLM 密钥失败：" + str(get(w2, "err", "")) } };
+      }
+      ref = "secret:llm_api_key";
+    }
   }
   let cfg = {
     enabled: bool(get(body, "enabled", false)),
     base_url: s(get(body, "base_url", get(cur, "base_url", "")), ""),
     model: s(get(body, "model", get(cur, "model", "")), ""),
     system: s(get(body, "system", get(cur, "system", "")), ""),
-    api_key: s(get(body, "api_key", ""), ""),
+    api_key_ref: ref,
+    api_key_set: len(ref) > 0,
   };
   let w = store.put_setting("llm", cfg);
   if (not get(w, "ok", false)) { return { status: 500, body: { ok: false, error: str(get(w, "err", "")) } }; }

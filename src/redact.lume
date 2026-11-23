@@ -12,18 +12,27 @@
 
 let MASK = "********";
 
-// posix ERE：组 1 = "<APP>_VISIT_PIN=" 前缀，组 2 = 值
+// posix ERE：组 1 = 键名前缀，组 2 = 值
+// PIN_RE 只覆盖访客统计；SECRET_ENV_RE 覆盖运行参数里常见的密钥键名。
 let PIN_RE = "([A-Z][A-Z0-9_]*_VISIT_PIN=)([^ \t\r\n]+)";
+let SECRET_ENV_RE = "([A-Za-z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_PIN)=)([^ \t\r\n'\"&]+)";
+let SECRET_KEY_RE = "^[A-Za-z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_PIN)$";
+
+// `secret:<名字>` 是引用，不是明文；清洗脚本必须跳过它，否则会把引用掩码掉。
+func looks_like_secret_ref(v) {
+  let s = trim(str(v));
+  return len(s) >= 7 and substr(s, 0, 7) == "secret:";
+}
 
 export func masked() { return MASK; }
 
-// 把 run-args 里所有 *_VISIT_PIN= 的值换成掩码，其余原样保留。
-export func mask_visit_pins(s) {
-  if (s == null) { return ""; }
-  let text = str(s);
-  if (len(text) == 0) { return ""; }
-  let hits = str_match(PIN_RE, text);
-  if (len(hits) == 0) { return text; }
+// 保留 group 1（键名/前缀），把后面那截值换成掩码。
+func mask_env_values(text, re) {
+  if (text == null) { return ""; }
+  let s = str(text);
+  if (len(s) == 0) { return ""; }
+  let hits = str_match(re, s);
+  if (len(hits) == 0) { return s; }
 
   let out = "";
   let pos = 0;
@@ -35,17 +44,20 @@ export func mask_visit_pins(s) {
     let gs = get(mo, "groups", []);
     let prefix = "";
     if (len(gs) > 0) { prefix = str(get(gs, 0, "")); }
-    if (idx > pos) { out = out + substr(text, pos, idx - pos); }
+    if (idx > pos) { out = out + substr(s, pos, idx - pos); }
     out = out + prefix + MASK;
     pos = idx + len(whole);
     i = i + 1;
   }
-  if (pos < len(text)) { out = out + substr(text, pos, len(text) - pos); }
+  if (pos < len(s)) { out = out + substr(s, pos, len(s) - pos); }
   return out;
 }
 
-// 回填：incoming 里带掩码的 PIN 槽位换回 stored 的真值；未掩码（可能是新值）原样保留。
-export func restore_visit_pins(incoming, stored) {
+export func mask_visit_pins(s) { return mask_env_values(s, PIN_RE); }
+export func mask_secret_env(s) { return mask_env_values(s, SECRET_ENV_RE); }
+
+// 回填：incoming 里带掩码的槽位换回 stored 的真值；未掩码（可能是新值）原样保留。
+func restore_env_values(incoming, stored, re, vg) {
   if (incoming == null) { return ""; }
   let inc = str(incoming);
   if (len(inc) == 0) { return ""; }
@@ -56,15 +68,15 @@ export func restore_visit_pins(incoming, stored) {
 
   // 先从真值里收集 prefix -> 真值
   let real = {};
-  let olds = str_match(PIN_RE, old);
+  let olds = str_match(re, old);
   let j = 0;
   while (j < len(olds)) {
     let gs = get(olds[j], "groups", []);
-    if (len(gs) > 1) { put(real, str(get(gs, 0, "")), str(get(gs, 1, ""))); }
+    if (len(gs) > vg) { put(real, str(get(gs, 0, "")), str(get(gs, vg, ""))); }
     j = j + 1;
   }
 
-  let hits = str_match(PIN_RE, inc);
+  let hits = str_match(re, inc);
   if (len(hits) == 0) { return inc; }
   let out = "";
   let pos = 0;
@@ -77,7 +89,7 @@ export func restore_visit_pins(incoming, stored) {
     if (idx > pos) { out = out + substr(inc, pos, idx - pos); }
     let prefix = "";
     let value = "";
-    if (len(gs) > 1) { prefix = str(get(gs, 0, "")); value = str(get(gs, 1, "")); }
+    if (len(gs) > vg) { prefix = str(get(gs, 0, "")); value = str(get(gs, vg, "")); }
     let slot = prefix + value;
     if (contains(value, MASK)) {
       let kept = get(real, prefix, null);
@@ -91,6 +103,9 @@ export func restore_visit_pins(incoming, stored) {
   return out;
 }
 
+export func restore_visit_pins(incoming, stored) { return restore_env_values(incoming, stored, PIN_RE, 1); }
+export func restore_secret_env(incoming, stored) { return restore_env_values(incoming, stored, SECRET_ENV_RE, 2); }
+
 // 一份可安全返回给浏览器的项目副本（深拷贝后改字段，不动库里的原对象）。
 export func redact_project(p) {
   if (p == null) { return null; }
@@ -102,6 +117,20 @@ export func redact_project(p) {
     if (reg != null and len(str(get(reg, "password", ""))) > 0) {
       put(reg, "password", MASK);
     }
+    // build_args 里的 LLM_API_KEY 等键，值可能是明文；secret: 引用保持可读。
+    let args = get(build, "build_args", null);
+    if (args != null) {
+      let ks = keys(args);
+      let ai = 0;
+      while (ai < len(ks)) {
+        let k = str(ks[ai]);
+        let v = str(get(args, k, ""));
+        if (len(str_match(SECRET_KEY_RE, k)) > 0 and len(v) > 0 and v != MASK and not looks_like_secret_ref(v)) {
+          put(args, k, MASK);
+        }
+        ai = ai + 1;
+      }
+    }
   }
 
   let dep = get(copy, "deploy", null);
@@ -109,7 +138,7 @@ export func redact_project(p) {
     if (len(str(get(dep, "ssh_key_path", ""))) > 0) { put(dep, "ssh_key_path", MASK); }
     if (len(str(get(dep, "kubeconfig", ""))) > 0) { put(dep, "kubeconfig", MASK); }
     let ra = str(get(dep, "ssh_run_args", ""));
-    if (len(ra) > 0) { put(dep, "ssh_run_args", mask_visit_pins(ra)); }
+    if (len(ra) > 0) { put(dep, "ssh_run_args", mask_secret_env(ra)); }
   }
 
   let targets = get(copy, "targets", null);
@@ -121,7 +150,7 @@ export func redact_project(p) {
         if (len(str(get(t, "ssh_key_path", ""))) > 0) { put(t, "ssh_key_path", MASK); }
         if (len(str(get(t, "kubeconfig", ""))) > 0) { put(t, "kubeconfig", MASK); }
         let ra = str(get(t, "ssh_run_args", ""));
-        if (len(ra) > 0) { put(t, "ssh_run_args", mask_visit_pins(ra)); }
+        if (len(ra) > 0) { put(t, "ssh_run_args", mask_secret_env(ra)); }
       }
       i = i + 1;
     }
@@ -149,6 +178,22 @@ export func merge_secrets(incoming, stored) {
         }
       }
     }
+    let args = get(build, "build_args", null);
+    if (args != null) {
+      let ob2 = get(old, "build", null);
+      let oa = null;
+      if (ob2 != null) { oa = get(ob2, "build_args", null); }
+      let ks = keys(args);
+      let ai = 0;
+      while (ai < len(ks)) {
+        let k = str(ks[ai]);
+        let v = str(get(args, k, ""));
+        if ((len(v) == 0 or v == MASK) and oa != null) {
+          put(args, k, str(get(oa, k, "")));
+        }
+        ai = ai + 1;
+      }
+    }
   }
 
   let dep = get(p, "deploy", null);
@@ -164,7 +209,7 @@ export func merge_secrets(incoming, stored) {
     }
     let ra = str(get(dep, "ssh_run_args", ""));
     if (od != null) {
-      put(dep, "ssh_run_args", restore_visit_pins(ra, str(get(od, "ssh_run_args", ""))));
+      put(dep, "ssh_run_args", restore_secret_env(ra, str(get(od, "ssh_run_args", ""))));
     }
   }
 
@@ -185,7 +230,7 @@ export func merge_secrets(incoming, stored) {
         }
         let ra = str(get(t, "ssh_run_args", ""));
         if (ot != null and i < len(ot)) {
-          put(t, "ssh_run_args", restore_visit_pins(ra, str(get(ot[i], "ssh_run_args", ""))));
+          put(t, "ssh_run_args", restore_secret_env(ra, str(get(ot[i], "ssh_run_args", ""))));
         }
       }
       i = i + 1;
@@ -240,8 +285,6 @@ func mask_after_prefix(text, re) {
 //   1) 字符串里内嵌 `LLM_API_KEY=sk-...`（`--build-arg` / `-e` 拼成的参数）
 //   2) map 形态的 `build_args: {LLM_API_KEY: "sk-..."}`（值本身就是密钥）
 // 形态 2 必须整值换成掩码，否则会留下 `sk-********` 这种带前缀的残形。
-let SECRET_KEY_RE = "^[A-Za-z0-9_]*(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|_PIN)$";
-
 // 递归改写 node（就地改 map/list），命中路径与条数记在 acc（acc = {n, items}）。
 // 没有 typeof/is_map 内建，所以用「试探调用」判别容器：keys() 只在 map 上成功、
 // substr() 只在 string 上成功，两者都失败就当标量。
@@ -255,7 +298,7 @@ export func mask_values(node, path, acc) {
     while (i < len(ks)) {
       let k = str(ks[i]);
       let child = get(node, k, null);
-      if (len(str_match(SECRET_KEY_RE, k)) > 0 and child != null and len(str(child)) > 0 and str(child) != MASK) {
+      if (len(str_match(SECRET_KEY_RE, k)) > 0 and child != null and len(str(child)) > 0 and str(child) != MASK and not looks_like_secret_ref(child)) {
         put(node, k, MASK);
         put(acc, "n", int(get(acc, "n", 0)) + 1);
         push(get(acc, "items", []), path + "." + k);

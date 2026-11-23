@@ -313,7 +313,12 @@ post "/peer/relay", (req) => { return a2a.peer_relay(req); };
 
 // ---------- webhook（外部 CI 触发，不受角色闸门，用自己的 key 校验）----------
 post "/api/webhook/:id", (req) => {
-  return api.webhook(str(get(req.params, "id", "")), body_of(req), qstr(req, "secret", ""));
+  // Lume 的 req 不暴露请求头，密钥优先放 body；?secret= 仅作旧调用兼容。
+  // body 里的 secret 不会进代理/浏览器历史，比 query 少一处泄漏面。
+  let b = body_map(req);
+  let secret = qstr(req, "secret", "");
+  if (len(secret) == 0) { secret = str(get(b, "secret", "")); }
+  return api.webhook(str(get(req.params, "id", "")), body_of(req), secret);
 };
 
 // ---------- 项目 ----------
