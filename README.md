@@ -391,10 +391,13 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
   `BEARER_RE`），因为构建参数里本来就有 `--build-arg LLM_API_KEY=...`、
   `-e *_VISIT_PIN=...` 这类真值。项目详情还会对 `build.build_args` 与
   `ssh_run_args` 里的密钥键逐个掩码；`secret:<名字>` 引用保持可读，PUT 回填时
-  自动还原。落盘原件不动，只在返回浏览器前脱敏。
+  自动还原。控制面读旧日志时仍会 mask；runner 新写入的日志在落盘前就会脱敏。
 - **LLM Key 不再落 `store.db`**：`settings.llm` 只保存 `api_key_ref`，真实值在
   `.data/secrets/llm_api_key`（0600）。老库首次读取会自动迁移，备份 `store.db`
   不会再带出 LLM Key。
+- **runner 写入侧**：日志按行过 `redactLog()`（KEY=VALUE、`sk-`、Bearer、
+  `?secret=`、`sshpass -p` 等），`$` 命令行和 `GET /jobs/:id` 返回的 step argv
+  也走同一套掩码；密钥即使出现在 stdout，也不会原样落盘。
 
 ### 切换前体检与路径重映射
 

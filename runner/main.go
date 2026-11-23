@@ -30,6 +30,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
@@ -44,6 +45,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,6 +99,99 @@ type Job struct {
 	steps   []Step
 	cancel  context.CancelFunc
 	mu      sync.Mutex
+}
+
+// ---------- 日志脱敏 ----------
+
+// 日志和步骤 argv 会原样落盘/回读，里面本来就有 `--build-arg LLM_API_KEY=...`、
+// `-e *_VISIT_PIN=...`、`?secret=...` 这类真值。控制面读出时也会 mask，但落盘
+// 这份是长期留存的，必须在 runner 写入侧就抹掉；否则备份、共享日志、直接看
+// 日志文件都能拿到密钥。
+var secretPatterns = []struct {
+	re   *regexp.Regexp
+	repl string
+}{
+	// KEY=value / KEY: value，覆盖 API_KEY / TOKEN / SECRET / PASSWORD /
+	// PASSWD / CREDENTIAL / PRIVATE_KEY / *_PIN 等；引号原样保留。
+	{regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*(?:API[_ -]?KEY|ACCESS[_ -]?KEY|SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|PRIVATE[_ -]?KEY|_PIN)\s*[=:]\s*)([\"']?)([^\s\"'&]+)([\"']?)`), `${1}${2}********${4}`},
+	// sk- 开头的模型 Key，即使裸奔在输出里也抹掉。
+	{regexp.MustCompile(`sk-[A-Za-z0-9_-]{8,}`), `sk-********`},
+	// Authorization / X-Runner-Token 头。
+	{regexp.MustCompile(`(?i)((?:Authorization|X-Runner-Token)\s*[:=]\s*)(Basic|Bearer)?\s*([^\s,;]+)`), `${1}${2} ********`},
+	{regexp.MustCompile(`(?i)(Bearer\s+)[A-Za-z0-9._~+/-]+=*`), `${1}********`},
+	// URL query 里的密钥。
+	{regexp.MustCompile(`([?&](?:secret|pass|password|token|key|api_key)=)[^&\s]+`), `${1}********`},
+	// sshpass / curl 的 -p / --password 参数。
+	{regexp.MustCompile(`(?i)(sshpass\s+-p\s+)([^\s]+)`), `${1}********`},
+	{regexp.MustCompile(`(?i)(--password\s+)([^\s]+)`), `${1}********`},
+}
+
+func redactLog(s string) string {
+	for _, p := range secretPatterns {
+		s = p.re.ReplaceAllString(s, p.repl)
+	}
+	return s
+}
+
+func redactArgv(argv []string) []string {
+	out := make([]string, len(argv))
+	for i, a := range argv {
+		out[i] = redactLog(a)
+	}
+	return out
+}
+
+// redactWriter 按行脱敏后再交给 cappedWriter。不能逐 chunk 直接 regex：
+// stdout/stderr 是流式的，密钥可能被切在两个 Write 之间。保留未完成行，
+// 超过 512 字节也强制冲刷，避免 docker build 的 \r 进度条一直不落盘。
+type redactWriter struct {
+	dst     io.Writer
+	mu      sync.Mutex
+	pending []byte
+}
+
+func newRedactWriter(dst io.Writer) *redactWriter {
+	return &redactWriter{dst: dst}
+}
+
+func (w *redactWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := len(p)
+	w.pending = append(w.pending, p...)
+	for {
+		i := bytes.IndexByte(w.pending, '\n')
+		if i < 0 {
+			break
+		}
+		if err := w.emit(w.pending[:i+1]); err != nil {
+			return 0, err
+		}
+		w.pending = w.pending[i+1:]
+	}
+	if len(w.pending) >= 512 {
+		if err := w.emit(w.pending); err != nil {
+			return 0, err
+		}
+		w.pending = w.pending[:0]
+	}
+	return n, nil
+}
+
+func (w *redactWriter) emit(b []byte) error {
+	_, err := io.WriteString(w.dst, redactLog(string(b)))
+	return err
+}
+
+func (w *redactWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pending) == 0 {
+		return nil
+	}
+	err := w.emit(w.pending)
+	w.pending = w.pending[:0]
+	return err
 }
 
 type cappedWriter struct {
@@ -354,7 +449,7 @@ func (s *server) handleJobs(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, st := range req.Steps {
 		job.Steps = append(job.Steps, StepState{
-			Label: st.Label, Argv: st.Argv, Status: "pending", Exit: -1,
+			Label: st.Label, Argv: redactArgv(st.Argv), Status: "pending", Exit: -1,
 		})
 	}
 
@@ -479,6 +574,7 @@ func (s *server) run(job *Job, timeoutS int) {
 	}
 	defer f.Close()
 	out := newCappedWriter(f, s.logMax)
+	redact := newRedactWriter(out)
 
 	if timeoutS > 0 {
 		var stop context.CancelFunc
@@ -495,7 +591,7 @@ func (s *server) run(job *Job, timeoutS int) {
 			break
 		}
 		job.setStep(i, "running", -1, nowISO())
-		fmt.Fprintf(out, "\n$ %s\n", joinArgv(step.Argv))
+		fmt.Fprintf(redact, "\n$ %s\n", joinArgv(step.Argv))
 
 		stepCtx := ctx
 		stopStep := func() {}
@@ -504,7 +600,7 @@ func (s *server) run(job *Job, timeoutS int) {
 			stepCtx, stop = context.WithTimeout(ctx, time.Duration(step.Timeout)*time.Second)
 			stopStep = stop
 		}
-		code, runErr := execStep(stepCtx, step, out)
+		code, runErr := execStep(stepCtx, step, redact)
 		// 取消有两种来源：整 job 的 cancel 端点和单步超时。两种都必须走 canceled，
 		// 不能落成 failed —— 否则前端会把「人工取消」当成一次失败构建，
 		// 还会触发 AI 诊断。
@@ -516,7 +612,7 @@ func (s *server) run(job *Job, timeoutS int) {
 
 		if canceled {
 			job.setStep(i, "canceled", code, nowISO())
-			fmt.Fprintf(out, "\n[step %d canceled: %v]\n", i+1, stepCtx.Err())
+			fmt.Fprintf(redact, "\n[step %d canceled: %v]\n", i+1, stepCtx.Err())
 			job.mu.Lock()
 			job.Canceled = true
 			job.mu.Unlock()
@@ -529,12 +625,15 @@ func (s *server) run(job *Job, timeoutS int) {
 			if exit == 0 {
 				exit = 1
 			}
-			fmt.Fprintf(out, "\n[step %d failed: exit=%d err=%v]\n", i+1, code, runErr)
+			fmt.Fprintf(redact, "\n[step %d failed: exit=%d err=%v]\n", i+1, code, runErr)
 			break
 		}
 		job.setStep(i, "done", 0, nowISO())
 	}
 
+	if err := redact.Close(); err != nil {
+		log.Printf("warn: flush redacted log: %v", err)
+	}
 	s.finish(job, exit)
 }
 

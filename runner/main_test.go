@@ -135,3 +135,35 @@ func TestFsListHidesSymlinkOutsideRoot(t *testing.T) {
 		t.Fatalf("outside dir: got %d", rec.Code)
 	}
 }
+
+func TestRedactLogMasksSecretArgs(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"docker build --build-arg LLM_API_KEY=sk-live123456789 .", "docker build --build-arg LLM_API_KEY=******** ."},
+		{"docker run -e VISIT_PIN='123456' img", "docker run -e VISIT_PIN='********' img"},
+		{"Authorization: Bearer abc.def.ghi", "Authorization: Bearer ********"},
+		{"https://x/api/webhook/a?secret=abc123&tag=v1", "https://x/api/webhook/a?secret=********&tag=v1"},
+		{"plain token budget", "plain token budget"},
+	}
+	for _, c := range cases {
+		if got := redactLog(c.in); got != c.want {
+			t.Errorf("redactLog(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestRedactWriterBuffersSplitSecret(t *testing.T) {
+	var buf bytes.Buffer
+	w := newRedactWriter(&buf)
+	if _, err := w.Write([]byte("LLM_API_KEY=sk-1")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("23456789\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); got != "LLM_API_KEY=********\n" {
+		t.Fatalf("got %q", got)
+	}
+}
