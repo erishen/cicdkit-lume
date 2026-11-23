@@ -501,11 +501,12 @@ SSH、registry 操作）一律不进这两面——发布只能走人工审批�
 
 ```bash
 export CICD_HOOK_KEY=$(openssl rand -hex 24)   # 不设就是不启用，接口返回 503
-curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm" \
+curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST "http://127.0.0.1:8096/api/webhook/lume-crm" \
   -H 'Content-Type: application/json' \
   -d "{\"secret\":\"$CICD_HOOK_KEY\",\"tag\":\"v1.2.3\",\"method\":\"ssh\",\"target\":\"阿里云\"}"
 ```
 
+- `/api/*` 仍受 Basic Auth 保护：外部 CI 除了 `CICD_HOOK_KEY`，还要带 Basic Auth 凭据；它不参与角色闸门。
 - 只收 `POST`；`id` 缺失 400、项目不存在 404。
 - 密钥优先放 body 的 `secret`，不会进代理日志、浏览器历史和 Referer；旧调用仍兼容 `?secret=`，但新接入不要再走 query。Lume 的请求对象不暴露请求头，`X-Webhook-Secret` 没做。
 - body 全部可选：`tag`（覆盖自动时间戳 tag，只允许 `[A-Za-z0-9][A-Za-z0-9._-]*`，最长 128，否则 400）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）、`port`（生产 SSH 目标必填，否则 400）。
