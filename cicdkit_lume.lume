@@ -10,6 +10,7 @@
 //   GET  /api/meta              runner 地址、审批闸门策略、LLM 状态
 //   GET  /api/version           版本信息（前端顶栏）
 //   GET  /api/overview          首屏聚合
+//   POST /api/agent/query       Agent/Text2SQL：自然语言 → 受限只读 SELECT
 //   GET  /api/projects          项目列表（?q= &limit= &offset=）
 //   POST /api/projects          新建项目（需 ?role=human_admin）
 //   POST /api/projects/scan     扫描工作目录里的候选项目（需 ?role=human_admin）
@@ -28,6 +29,11 @@
 //   POST /api/runs/:id/diagnose        AI 诊断失败运行
 //   POST /api/runs/:id/diagnosis/adopt 采纳 / 不采纳（采纳写入知识库）
 //   GET  /api/deployments       部署历史；DELETE 清空（需 ?role=human_admin）
+//   GET  /api/environments      云环境聚合（按 ssh_host，只读）
+//   POST /api/environments/:host/snapshot  固定只读主机快照（需任意合法角色）
+//   GET  /api/environments/snapshot/:job    快照 job 状态与日志
+//   POST /api/environments/:host/actions    受控动作：helm-history / docker-logs 需任意角色；rollout-restart / docker-restart 需 human_admin
+//   GET  /api/environments/actions          云环境动作审计（?host= &limit=）
 //   GET  /api/kb                知识库；POST 新增（需 human_admin）；DELETE 删除
 //   GET  /api/config/llm        LLM 配置（掩码）；PUT 保存；POST /test 测连通
 //   GET  /api/config/ssh-defaults      CICD_SSH_* 兜底值（掩码，供表单预填）
@@ -64,13 +70,16 @@ server {
 import "src/app_api.lume" as api;
 import "src/store.lume" as store;
 import "src/guard.lume" as guard;
+import "src/access.lume" as access;
 import "src/a2a.lume" as a2a;
+import "src/agent.lume" as agent;
 import "src/metrics.lume" as metrics;
 
 // ---------- 启动期：把库建好，必要时把 cicdkit 的历史数据搬进来 ----------
 // 只搬一次：import_legacy() 用 empty() 判空，库里已有内容就跳过。
 store.init();
 a2a.init();
+agent.init();
 let lc_imp = store.import_legacy();
 if (get(lc_imp, "imported", false)) {
   print("legacy import: " + stringify(lc_imp));
@@ -110,6 +119,63 @@ func body_of(req) {
   return s;
 }
 
+
+// 所有闸门判定都留一条授权审计：谁（Basic Auth 用户）、用什么角色、
+// 对哪个资源/动作、放行还是拒绝。写失败不影响主流程，审计不能把业务卡死。
+func audit_access(req, gate, resource, action, label) {
+  let g = gate;
+  if (g == null) { g = {}; }
+  let who = str(get(g, "user", ""));
+  let how = str(get(g, "auth", ""));
+  if (len(how) == 0 and len(who) > 0) { how = "identity"; }
+  let e = {
+    user: who,
+    role: str(get(g, "role", "")),
+    resource: str(resource),
+    action: str(action),
+    label: str(label),
+    allowed: bool(get(g, "allowed", false)),
+    reason: str(get(g, "reason", "")),
+    auth: how,
+  };
+  store.put_access_event(e);
+}
+
+// 身份绑定开启时按资源表判定；没开启才回退旧的 guard（resource 表未登记即拒绝）。
+// fallback_role 为空表示旧模式只要求“任意合法角色”，否则要求指定角色。
+func abac(req, resource, action, label, fallback_role) {
+  let gate = access.decide(req, resource, action);
+  if (not get(gate, "enabled", false)) {
+    if (len(fallback_role) > 0) { gate = guard.role_allowed(req, fallback_role, label); }
+    else { gate = guard.role_any(req, label); }
+  }
+  audit_access(req, gate, resource, action, label);
+  return gate;
+}
+
+// 只读接口的身份闸门：开启身份绑定后按资源表 deny-by-default；旧 ?role= 模式
+// 保持原来的“Basic Auth 已登录即可读”，避免迁移期把只读页全部锁死。
+// 返回 null 表示放行，否则返回 403 响应。
+func read_gate(req, resource, action, label) {
+  let gate = access.decide(req, resource, action);
+  if (not get(gate, "enabled", false)) { return null; }
+  audit_access(req, gate, resource, action, label);
+  if (not get(gate, "allowed", false)) { return denied(gate, label); }
+  return null;
+}
+
+// 高频轮询接口（运行日志、云环境快照）只审计拒绝，不记每次放行：
+// 运行中的日志 1.5s 拉一次，若每次也写 access_events，会把保留窗口冲掉。
+func read_gate_quiet(req, resource, action, label) {
+  let gate = access.decide(req, resource, action);
+  if (not get(gate, "enabled", false)) { return null; }
+  if (not get(gate, "allowed", false)) {
+    audit_access(req, gate, resource, action, label);
+    return denied(gate, label);
+  }
+  return null;
+}
+
 func denied(gate, label) {
   return {
     status: 403,
@@ -138,7 +204,7 @@ get "/api/health", (req) => {
 
 get "/api/meta", (req) => {
   let m = api.meta();
-  put(m, "approval", guard.policy());
+  put(m, "approval", guard.policy(req));
   return { status: 200, body: m };
 };
 
@@ -147,7 +213,17 @@ get "/api/version", (req) => {
 };
 
 get "/api/overview", (req) => {
+  let blocked = read_gate(req, "project-read", "read", "总览");
+  if (blocked != null) { return blocked; }
   return { status: 200, body: api.overview() };
+};
+
+// ---------- Agent / Text2SQL（只读）----------
+// 自然语言 → 受限 SELECT → 查三张扁平表；不写库、不触发发布。
+post "/api/agent/query", (req) => {
+  let gate = abac(req, "agent-query", "read", "Agent 查询", "");
+  if (not get(gate, "allowed", false)) { return denied(gate, "Agent 查询"); }
+  return agent.query(body_of(req));
 };
 
 // ---------- A2A 标准面 + peer 签名面 ----------
@@ -186,19 +262,21 @@ post "/api/webhook/:id", (req) => {
 // ---------- 项目 ----------
 
 get "/api/projects", (req) => {
+  let blocked = read_gate(req, "project-read", "read", "项目列表");
+  if (blocked != null) { return blocked; }
   let page = api.project_list(qstr(req, "q", ""), qlimit(req, "limit", 200), qint(req, "offset", 0));
   return { status: 200, body: page };
 };
 
 post "/api/projects", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "新建项目");
+  let gate = abac(req, "project-admin", "create", "新建项目", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "新建项目"); }
   return api.project_create(body_of(req));
 };
 
 // 放在 /api/projects/:id 之前：静态段优先匹配（路由按注册顺序，先命中先返回）。
 post "/api/projects/scan", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "扫描工作目录");
+  let gate = abac(req, "project-admin", "scan", "扫描工作目录", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "扫描工作目录"); }
   return api.project_scan(qstr(req, "dir", ""));
 };
@@ -206,6 +284,10 @@ post "/api/projects/scan", (req) => {
 // 发布单独一条：唯一受审批闸门保护的动作（构建可重跑，发布不可逆）。
 post "/api/projects/:id/deploy", (req) => {
   let id = str(get(req.params, "id", ""));
+  // 资源表先拦一层；CICD_DEPLOY_APPROVAL 仍按原模式叠加（off / approve / execute）。
+  let ab = access.decide(req, "deploy-publish", "publish");
+  if (get(ab, "enabled", false)) { audit_access(req, ab, "deploy-publish", "publish", "发布"); }
+  if (get(ab, "enabled", false) and not get(ab, "allowed", false)) { return denied(ab, "发布"); }
   let gate = guard.deploy_allowed(req);
   if (not get(gate, "allowed", false)) {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
@@ -218,15 +300,22 @@ post "/api/projects/:id/deploy", (req) => {
 post "/api/projects/:id/targets/:target/deploy", (req) => {
   let id = str(get(req.params, "id", ""));
   let target = str(get(req.params, "target", ""));
+  // 资源表先拦一层；CICD_DEPLOY_APPROVAL 仍按原模式叠加（off / approve / execute）。
+  let ab = access.decide(req, "deploy-publish", "publish");
+  if (get(ab, "enabled", false)) { audit_access(req, ab, "deploy-publish", "publish", "发布"); }
+  if (get(ab, "enabled", false) and not get(ab, "allowed", false)) { return denied(ab, "发布"); }
   let gate = guard.deploy_allowed(req);
   if (not get(gate, "allowed", false)) {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
   }
-  return api.project_deploy(id, "{\"target\":\"" + target + "\"}");
+  let port = trim(qstr(req, "port", ""));
+  return api.project_deploy(id, "{\"target\":\"" + target + "\",\"port\":\"" + port + "\"}");
 };
 
 // 发布版本列表（只读）：给回滚下拉用。
 get "/api/projects/:id/deploy-versions", (req) => {
+  let blocked = read_gate(req, "project-read", "read", "发布版本列表");
+  if (blocked != null) { return blocked; }
   return api.deploy_versions(str(get(req.params, "id", "")), qstr(req, "target", ""));
 };
 
@@ -234,6 +323,10 @@ get "/api/projects/:id/deploy-versions", (req) => {
 // body 里可以带 image_ref / target，指定任意历史版本；不带就是"上一版"。
 post "/api/projects/:id/rollback", (req) => {
   let id = str(get(req.params, "id", ""));
+  // 资源表先拦一层；CICD_DEPLOY_APPROVAL 仍按原模式叠加（off / approve / execute）。
+  let ab = access.decide(req, "deploy-publish", "publish");
+  if (get(ab, "enabled", false)) { audit_access(req, ab, "deploy-publish", "publish", "发布"); }
+  if (get(ab, "enabled", false) and not get(ab, "allowed", false)) { return denied(ab, "发布"); }
   let gate = guard.deploy_allowed(req);
   if (not get(gate, "allowed", false)) {
     return { status: 403, body: { ok: false, error: str(get(gate, "reason", "发布被审批闸门拒绝")), approval: gate } };
@@ -244,50 +337,66 @@ post "/api/projects/:id/rollback", (req) => {
 // 脚手架生成：必须在 :action 之前注册，否则会被当成未知动作。
 get "/api/projects/:id/generate", (req) => {
   let id = str(get(req.params, "id", ""));
-  let gate = guard.role_allowed(req, "human_admin", "生成项目脚手架");
+  let gate = abac(req, "project-admin", "generate", "生成项目脚手架", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "生成项目脚手架"); }
   return api.project_generate(id, false);
 };
 
 post "/api/projects/:id/generate", (req) => {
   let id = str(get(req.params, "id", ""));
-  let gate = guard.role_allowed(req, "human_admin", "生成项目脚手架");
+  let gate = abac(req, "project-admin", "generate", "生成项目脚手架", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "生成项目脚手架"); }
   return api.project_generate(id, qstr(req, "apply", "") == "1");
 };
 
 // 访客统计：GET 只读代理，与上游 handleProjectVisits 同形。
 get "/api/projects/:id/visits", (req) => {
+  // 访客统计可能含 IP / 地域等访客信息，收窄到终审。
+  let blocked = read_gate(req, "project-visits", "read", "访客统计");
+  if (blocked != null) { return blocked; }
   return api.project_visits(str(get(req.params, "id", "")));
 };
 
 // validate / probe 上游 GET 与 POST 等价（读操作），这里补齐 GET 形态。
 get "/api/projects/:id/validate", (req) => {
+  let blocked = read_gate(req, "project-inspect", "read", "项目校验");
+  if (blocked != null) { return blocked; }
   return api.project_action(str(get(req.params, "id", "")), "validate", "{}");
 };
 
 get "/api/projects/:id/probe", (req) => {
+  let blocked = read_gate(req, "project-inspect", "read", "项目探测");
+  if (blocked != null) { return blocked; }
   return api.project_action(str(get(req.params, "id", "")), "probe", "{}");
 };
 
 post "/api/projects/:id/:action", (req) => {
   let id = str(get(req.params, "id", ""));
   let action = str(get(req.params, "action", ""));
+  // validate / probe 只读；build / pipeline 会真正投递 job。不能因为共用
+  // :action 路由就跳过闸门。
+  let resource = "project-run";
+  let act = "build";
+  if (action == "validate" or action == "probe") { resource = "project-inspect"; act = "read"; }
+  let gate = abac(req, resource, act, "项目动作", "");
+  if (not get(gate, "allowed", false)) { return denied(gate, "项目动作"); }
   return api.project_action(id, action, body_of(req));
 };
 
 get "/api/projects/:id", (req) => {
+  let blocked = read_gate(req, "project-read", "read", "项目详情");
+  if (blocked != null) { return blocked; }
   return api.project_get(str(get(req.params, "id", "")));
 };
 
 put "/api/projects/:id", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "修改项目配置");
+  let gate = abac(req, "project-admin", "update", "修改项目配置", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "项目配置"); }
   return api.project_put(str(get(req.params, "id", "")), body_of(req));
 };
 
 delete "/api/projects/:id", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "删除项目");
+  let gate = abac(req, "project-admin", "delete", "删除项目", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "删除项目"); }
   return api.project_delete(str(get(req.params, "id", "")));
 };
@@ -295,13 +404,13 @@ delete "/api/projects/:id", (req) => {
 // ---------- 服务器目录浏览（编辑 build.context 用）----------
 // 只读，但会暴露目录名，所以与「保存项目配置」同门禁。
 get "/api/fs/roots", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "浏览服务器目录");
+  let gate = abac(req, "fs-browse", "read", "浏览服务器目录", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "目录浏览"); }
   return { status: 200, body: api.fs_roots() };
 };
 
 get "/api/fs/list", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "浏览服务器目录");
+  let gate = abac(req, "fs-browse", "read", "浏览服务器目录", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "目录浏览"); }
   return api.fs_list(qstr(req, "dir", ""));
 };
@@ -309,67 +418,147 @@ get "/api/fs/list", (req) => {
 // ---------- 运行 ----------
 
 get "/api/runs", (req) => {
+  let blocked = read_gate(req, "run-read", "read", "运行列表");
+  if (blocked != null) { return blocked; }
   return { status: 200, body: api.run_list(qstr(req, "project_id", ""), qlimit(req, "limit", 100), qint(req, "offset", 0)) };
 };
 
 delete "/api/runs", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "清空运行记录");
+  let gate = abac(req, "run-admin", "clear", "清空运行记录", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "清空运行记录"); }
   return api.run_clear();
 };
 
 // 归档列表必须排在 /api/runs/:id 之前，否则 "archive" 会被当成一个 run id。
 get "/api/runs/archive", (req) => {
+  let blocked = read_gate(req, "run-read", "read", "归档列表");
+  if (blocked != null) { return blocked; }
   return api.run_archive(qlimit(req, "limit", 200));
 };
 
 post "/api/runs/:id/restore", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "恢复归档运行");
+  let gate = abac(req, "run-admin", "restore", "恢复归档运行", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "恢复归档运行"); }
   return api.run_restore(str(get(req.params, "id", "")));
 };
 
 // 日志尾放在 :id 之前也无所谓（路径段数不同），但按具体优先写更清楚。
 get "/api/runs/:id/log", (req) => {
+  let blocked = read_gate_quiet(req, "run-read", "read", "运行日志");
+  if (blocked != null) { return blocked; }
   return api.run_log(str(get(req.params, "id", "")), qint(req, "from", 0));
 };
 
 post "/api/runs/:id/cancel", (req) => {
+  let gate = abac(req, "run-control", "cancel", "取消运行", "");
+  if (not get(gate, "allowed", false)) { return denied(gate, "取消运行"); }
   return api.run_cancel(str(get(req.params, "id", "")));
 };
 
 post "/api/runs/:id/diagnose", (req) => {
-  let gate = guard.role_any(req, "AI 诊断");
+  let gate = abac(req, "run-diagnose", "read", "AI 诊断", "");
   if (not get(gate, "allowed", false)) { return denied(gate, "AI 诊断"); }
   return api.run_diagnose(str(get(req.params, "id", "")));
 };
 
 post "/api/runs/:id/diagnosis/adopt", (req) => {
+  let gate = abac(req, "run-adopt", "adopt", "采纳诊断", "human_admin");
+  if (not get(gate, "allowed", false)) { return denied(gate, "采纳诊断"); }
   return api.run_adopt(str(get(req.params, "id", "")), body_of(req));
 };
 
 get "/api/runs/:id", (req) => {
+  let blocked = read_gate(req, "run-read", "read", "运行详情");
+  if (blocked != null) { return blocked; }
   return api.run_get(str(get(req.params, "id", "")));
+};
+
+// ---------- 云环境（只读） ----------
+
+get "/api/environments", (req) => {
+  let blocked = read_gate(req, "env-snapshot", "read", "云环境列表");
+  if (blocked != null) { return blocked; }
+  return { status: 200, body: api.environment_list() };
+};
+
+post "/api/environments/:host/snapshot", (req) => {
+  // 身份绑定开启时按资源表判定；没开启才回退旧的“任意角色”闸门。
+  let gate = access.decide(req, "env-snapshot", "read");
+  if (get(gate, "enabled", false)) { audit_access(req, gate, "env-snapshot", "read", "云环境快照"); }
+  if (not get(gate, "enabled", false)) { gate = guard.role_any(req, "云环境快照"); }
+  if (not get(gate, "allowed", false)) { return denied(gate, "云环境快照"); }
+  return api.environment_snapshot(str(get(req.params, "host", "")));
+};
+
+post "/api/environments/:host/actions", (req) => {
+  let raw = body_of(req);
+  let b = store.parse_json(raw, {});
+  if (b == null) { b = {}; }
+  let act = str(get(b, "action", ""));
+  // 只读动作与重启动作分离成两个资源：(user, resource, action) 由资源表判定。
+  let mutation = (act == "rollout-restart" or act == "docker-restart");
+  let label = "云环境动作";
+  let resource = "env-action-read";
+  let action = "read";
+  if (mutation) { resource = "env-action-mutate"; action = "restart"; }
+  let gate = access.decide(req, resource, action);
+  if (get(gate, "enabled", false)) { audit_access(req, gate, resource, action, label); }
+  if (not get(gate, "enabled", false)) {
+    gate = guard.role_any(req, label);
+    if (mutation) { gate = guard.role_allowed(req, "human_admin", label); }
+  }
+  if (not get(gate, "allowed", false)) { return denied(gate, label); }
+  // 审计必须能回答“谁点的”：身份绑定模式下写 user(role)，旧模式退回角色。
+  let actor = str(get(gate, "role", ""));
+  let who = str(get(gate, "user", ""));
+  if (len(who) > 0) { actor = who + " (" + actor + ")"; }
+  return api.environment_action(str(get(req.params, "host", "")), b, actor);
+};
+
+get "/api/environments/actions", (req) => {
+  let blocked = read_gate(req, "env-action-read", "read", "云环境动作审计");
+  if (blocked != null) { return blocked; }
+  return { status: 200, body: api.environment_actions(qstr(req, "host", ""), qint(req, "since", 0), qint(req, "until", 0), qlimit(req, "limit", 20)) };
+};
+
+// 授权判定审计：每次资源/动作闸门判定都有一条，?user= / ?resource= 可过滤。
+get "/api/audit/access", (req) => {
+  let blocked = read_gate(req, "audit-read", "read", "授权审计");
+  if (blocked != null) { return blocked; }
+  return {
+    status: 200,
+    body: store.list_access_events(qstr(req, "user", ""), qstr(req, "resource", ""), qint(req, "since", 0), qint(req, "until", 0), qlimit(req, "limit", 50)),
+  };
+};
+
+get "/api/environments/snapshot/:job", (req) => {
+  let blocked = read_gate_quiet(req, "env-snapshot", "read", "云环境快照");
+  if (blocked != null) { return blocked; }
+  return api.environment_snapshot_get(str(get(req.params, "job", "")));
 };
 
 // ---------- 部署历史 ----------
 
 get "/api/deployments", (req) => {
+  let blocked = read_gate(req, "deployment-read", "read", "部署列表");
+  if (blocked != null) { return blocked; }
   return { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qlimit(req, "limit", 100), qint(req, "offset", 0)) };
 };
 
 get "/api/deployments/:id", (req) => {
+  let blocked = read_gate(req, "deployment-read", "read", "部署详情");
+  if (blocked != null) { return blocked; }
   return api.deployment_get(str(get(req.params, "id", "")));
 };
 
 post "/api/deployments/:id/diagnose", (req) => {
-  let gate = guard.role_any(req, "AI 诊断");
+  let gate = abac(req, "deployment-diagnose", "read", "AI 诊断", "");
   if (not get(gate, "allowed", false)) { return denied(gate, "AI 诊断"); }
   return api.deployment_diagnose(str(get(req.params, "id", "")));
 };
 
 delete "/api/deployments", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "清空部署历史");
+  let gate = abac(req, "deployment-admin", "clear", "清空部署历史", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "清空部署历史"); }
   return api.deployment_clear();
 };
@@ -377,16 +566,20 @@ delete "/api/deployments", (req) => {
 // ---------- 知识库 ----------
 
 get "/api/kb", (req) => {
+  let blocked = read_gate(req, "kb-read", "read", "知识库");
+  if (blocked != null) { return blocked; }
   return { status: 200, body: api.kb_list(qstr(req, "q", ""), qlimit(req, "limit", 200)) };
 };
 
 post "/api/kb", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "写入知识库");
+  let gate = abac(req, "kb-write", "write", "写入知识库", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "写入知识库"); }
   return api.kb_add(body_of(req));
 };
 
 delete "/api/kb/:id", (req) => {
+  let gate = abac(req, "kb-write", "delete", "删除知识库条目", "human_admin");
+  if (not get(gate, "allowed", false)) { return denied(gate, "删除知识库条目"); }
   return api.kb_delete(str(get(req.params, "id", "")));
 };
 
@@ -395,23 +588,27 @@ delete "/api/kb/:id", (req) => {
 // 密钥发到任意地址），强制 human_admin。
 
 get "/api/config/llm", (req) => {
+  let blocked = read_gate(req, "llm-read", "read", "LLM 配置读取");
+  if (blocked != null) { return blocked; }
   return { status: 200, body: api.llm_get() };
 };
 
 put "/api/config/llm", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "修改 LLM 配置");
+  let gate = abac(req, "llm-config", "update", "修改 LLM 配置", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "LLM 配置"); }
   return api.llm_put(body_of(req));
 };
 
 post "/api/config/llm/test", (req) => {
-  let gate = guard.role_allowed(req, "human_admin", "测试 LLM 连接");
+  let gate = abac(req, "llm-config", "test", "测试 LLM 连接", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "LLM 配置"); }
   return api.llm_test(body_of(req));
 };
 
 // 表单预填用：只给「兜底值是否存在」，不把私钥路径回传给浏览器以外的用途。
 get "/api/config/ssh-defaults", (req) => {
+  let blocked = read_gate(req, "fs-browse", "read", "SSH 默认值");
+  if (blocked != null) { return blocked; }
   return { status: 200, body: api.ssh_defaults() };
 };
 

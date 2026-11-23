@@ -158,6 +158,18 @@ ok("缺 tool 报 400", get(a2a.peer_invoke(no_tool), "status", 0) == 400);
 let relay = a2a.peer_relay(preq);
 ok("relay 已退役 410", get(relay, "status", 0) == 410);
 
+// ---- 任务保留 ----
+print("a2a: task retention");
+let ri = 0;
+while (ri < 20) {
+  a2a.rpc({ body: "{\"jsonrpc\":\"2.0\",\"id\":" + str(100 + ri) + ",\"method\":\"message/send\",\"params\":{\"contextId\":\"ret-" + str(ri) + "\",\"metadata\":{\"capability\":\"cicd.capabilities\",\"args\":{}}}}" });
+  ri = ri + 1;
+}
+let count_rows = sql_query(store.db(), "SELECT COUNT(*) AS n FROM a2a_tasks", []);
+let task_count = 0;
+if (len(count_rows) > 0) { task_count = int(get(count_rows[0], "n", 0)); }
+ok("任务总数不超过保留上限", task_count <= 10);
+
 // ---- 汇总 ----
 print("");
 print("checks=" + str(get(st, "checks", 0)) + " fails=" + str(get(st, "fails", 0)));

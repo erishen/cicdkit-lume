@@ -65,7 +65,7 @@ runner 推荐跑在**宿主机**（`make runner`）：`docker.sock`、`kubectl`�
 ```bash
 make check      # lume --check 遍历入口 + 所有模块
 make ui         # esbuild 打包 → www/app.js
-make test       # 自测：store 77 + exec 73 + generate 26 + a2a 47 + 闸门 108 + runner go test（临时实例，不碰真实数据）
+make test       # 自测：store 77 + exec 75 + generate 26 + a2a 47 + agent 15 + deploy-port 11 + 闸门 108 + runner go test（临时实例，不碰真实数据）
 make plan       # 对着真实项目把 argv 计划干跑一遍（迁移前先看它要跑什么）
 make smoke      # 对运行中的服务做只读冒烟
 ```
@@ -105,7 +105,13 @@ legacy import: {"imported":true,"projects":6,"runs":200,"deployments":169,"kb":0
 | `CICD_LEGACY_STORE` | 空 | 导入时改用这个 store.json |
 | `CICD_RUN_KEEP` | `300` | 运行历史保留条数；超出的**归档**（不删除），可用 `make restore ID=...` 恢复 |
 | `CICD_ARCHIVE_KEEP` | `1000` | 归档保留条数；超出的最老归档连日志一起清掉（每次归档后裁剪） |
-| `CICD_ROLE_MAP` | 空 | `human_admin=口令;agent_operator=口令`：设置后角色只能由 `?pass=` 反查，`?role=` 自报作废 |
+| `CICD_ACCOUNTS_ENFORCE` | compose 默认 `1` | 开启身份绑定：角色来自 Basic Auth 用户对应的 `accounts.json`，账号表读不到/用户未登记一律拒绝 |
+| `CICD_ACCOUNTS_FILE` | `data/accounts.json` | 账号表路径；compose 里挂到 `/auth/accounts.json`，`make auth` 首次生成 |
+| `CICD_ACCESS_RESOURCES_FILE` | `data/access-resources.json` | 资源/动作白名单；compose 里挂到 `/auth/resources.json`，`make auth` 首次生成 |
+| `CICD_AUDIT_KEEP` | `5000` | 授权审计保留条数，最少 100；每次写入后裁掉最旧记录 |
+| `CICD_ENV_AUDIT_KEEP` | `5000` | 云环境动作审计保留条数；`submitted` 记录不参与裁剪 |
+| `CICD_A2A_TASK_KEEP` | `1000` | A2A 任务保留条数，最少 10；只裁终态任务，排队中的不删 |
+| `CICD_ROLE_MAP` | 空 | 旧的口令绑定方式：`human_admin=口令;agent_operator=口令`；身份绑定开启时不生效 |
 | `CICD_HOOK_KEY` | 空 | webhook 共享密钥；为空时 `POST /api/webhook/:id` 一律 503（默认关闭） |
 | `CICDKIT_PEER_SHARED` | 空 | peer 面共享密钥（与上游 `CICDKIT_PEER_*` 同一套命名，可与旧节点互通）。为空且没配 ROOT 时整面 fail-closed 关闭 |
 | `CICDKIT_PEER_ROOT` | 空 | 派生密钥的根：`peer_key(node)=HMAC-SHA256(ROOT,"peer:"+node)`，**优先于** SHARED |
@@ -170,9 +176,10 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/projects/:id/visits` | 线上访客统计：域名取自 target `note` 的「公网域名 …」、PIN 取自 `*_VISIT_PIN=`；未配置 → `configured:false`，站点挂了 → `online:false` |
 | `POST /api/projects/:id/:action` | `build` / `pipeline` / `validate` / `probe`（`validate` / `probe` 也支持 GET） |
 | `POST /api/webhook/:id` | 外部 CI 触发流水线；`?secret=` 对 `CICD_HOOK_KEY`，不受角色闸门 |
+| `POST /api/agent/query` | Agent/Text2SQL：自然语言 → 受限单表 SELECT，只查 `agent_projects` / `agent_runs` / `agent_deployments`，强制 `LIMIT ≤ 100`，不写库；返回 SQL、表格和一句 AI 结论摘要（需任意合法角色，每分钟最多 5 次） |
 | `GET /api/projects/:id/deploy-versions` | 发布版本列表（同目标去重、时间倒序），给回滚下拉用 |
-| `POST /api/projects/:id/rollback` | 回滚：不传 body = 上一版；带 `image_ref` = 回滚到指定历史版本（只认该项目发布过的镜像）。受发布闸门保护，`trigger=rollback` |
-| `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护 |
+| `POST /api/projects/:id/rollback` | 回滚：不传 body = 上一版；带 `image_ref` = 回滚到指定历史版本（只认该项目发布过的镜像）；生产 SSH 目标同样必须带 `port`。受发布闸门保护，`trigger=rollback` |
+| `POST /api/projects/:id/deploy` | **发布**，受审批闸门保护；body 可带 `target` / `method` / `port`（生产 SSH 目标必须带 `port`） |
 | `GET /api/runs`、`GET /api/runs/:id` | 运行列表 / 详情 |
 | `GET /api/runs/:id/log` | 增量日志尾（`?from=` 字节偏移） |
 | `POST /api/runs/:id/cancel` | 取消（转给 runner） |
@@ -182,6 +189,12 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /api/deployments`、`DELETE /api/deployments` | 部署历史 / 清空 |
 | `GET /api/deployments/:id` | 单条部署记录（含 `run_id`、`probe` 结果） |
 | `POST /api/deployments/:id/diagnose` | 对该部署对应的运行做 AI 诊断（运行已裁掉 → 404） |
+| `GET /api/environments` | 云环境聚合：按 `ssh_host` 汇总项目 / target / 最近部署，只读 |
+| `POST /api/environments/:host/snapshot` | 对已配置主机提交固定只读快照（`docker ps` + `k3s kubectl get nodes/pods/svc/deploy,sts`；Helm 目标再由 runner 附 `helm list -A`），需任意合法角色；不接受自由命令 |
+| `GET /api/environments/snapshot/:job` | 读取快照 job 状态与日志，供前端轮询 |
+| `POST /api/environments/:host/actions` | 受控动作：`helm-history` / `docker-logs` 需任意合法角色；`rollout-restart` / `docker-restart` 需 `human_admin`。请求只传 `project_id` / `target` / `action`，命令由后端从 target 配置拼装 |
+| `GET /api/environments/actions` | 云环境动作审计（`?host=&since=&until=&limit=`），记录动作、角色、job_id、提交状态 |
+| `GET /api/audit/access` | 授权判定审计（`?user=&resource=&since=&until=&limit=`），记录每次闸门放行/拒绝 |
 | `GET /api/config/llm`、`PUT`、`POST /api/config/llm/test` | LLM 配置（掩码）/ 保存 / 连通性测试 |
 | `POST /api/runs/:id/diagnose`、`POST /api/runs/:id/diagnosis/adopt` | AI 诊断（需任意合法角色，全局每分钟最多 3 次；同 run 命中缓存不计费）/ 采纳入知识库 |
 | `GET /api/kb`、`POST /api/kb`、`DELETE /api/kb/:id` | 知识库 |
@@ -192,24 +205,124 @@ job 时，控制面把该运行标成 `interrupted`，不会误判成 failed。
 | `GET /peer/health`、`GET /peer/tools` | peer 签名面（HMAC，`?node=&ts=&nonce=&sig=`） |
 | `POST /peer/invoke`、`POST /peer/relay` | 带参调用只读能力；relay 已退役（410） |
 
-`?role=` 只在本层做闸门判定，是**流程门禁**而不是身份认证——真正的身份边界交给
-`HTPASSWD_FILE` 或反向代理。想让角色不能随口报，就设 `CICD_ROLE_MAP`
-（`human_admin=hp1;agent_operator=op1`）：之后请求必须带 `?pass=<口令>`，角色由口令
-反查，`?role=` 单独出现不再作数；声明角色与口令不符也拒（拿操作员口令冒充终审会被挡）。
-口令走 query 是因为 Lume 的请求对象读不到请求头；前端顶栏有「口令」输入框，存在 localStorage。
+### 发布环境与端口
 
-## 与上游 cicdkit 的功能对照
+发布目标可以显式标 `environment: "test" | "prod"`；没标时按目标名推断（名称含「腾讯」= 测试，含「阿里」= 生产）。
 
-逐条对照表（含有意差异与原因）在 [`docs/PARITY.md`](docs/PARITY.md)。最需要记住的三条：
+- 测试目标：`ssh_probe_port` 统一取 `8080`（腾讯云只开放 8080，配置里的旧 `8081/8082` 不再沿用）；发布时仍可显式覆盖。
+- 生产目标：配置里的 `ssh_probe_port` 不作为默认值，`POST /api/projects/:id/deploy`（以及 `pipeline` / `rollback` / webhook）必须传 `port`，否则 400。
+- `ssh_container_port` 是应用容器内监听端口，不属于发布时选择项。
+- 测试环境 `8080` 是独占槽位：SSH Docker 发布前会清掉 publish 8080 的旧容器；k3s Helm 发布前会经 SSH 清掉旧容器并删除所有以 8080 暴露的 K8s Service，保证最新发布的应用拿到 8080。代价是先清后发，新发布失败时旧应用不会自动恢复。
+- 腾讯云 Helm 测试目标需要同时配 `ssh_host` / `ssh_user`，用于释放 8080 上的旧占用。
 
-- **Basic Auth 已默认启用**：用户名/口令写在 `.env`（`CICDKIT_BASIC_USER` /
-  `CICDKIT_BASIC_PASS`），`make docker` 会先跑 `scripts/auth.sh` 生成派生文件到
-  `~/.config/cicdkit-lume`（`htpasswd`、`username`、`prometheus.pass`、`health-header`）。
+腾讯云 k3s 的 API 6443 不对外，compose 里的 `k3s-tunnel` 用 SSH 把远端 6443 转到内网
+`k3s-tunnel:16443`，runner 的 `kubectl` / `helm` 通过
+`data-docker/kubeconfig-tencent-k3s.yaml` 访问。该 kubeconfig 的 `server` 写
+`https://k3s-tunnel:16443`，并带 `tls-server-name: 127.0.0.1` 过 k3s 自签证书校验；
+腾讯云主机上的 containerd 已配置 Docker Hub 镜像（`docker.m.daocloud.io`、
+`docker.1ms.run`），否则 `rancher/mirrored-pause` 拉不下来，Pod 会卡在
+`ContainerCreating`。
+
+前端「云环境」页以只读为主：按 `ssh_host` 把项目、target、最近一次发布聚到一起；
+「只读快照」会对该主机提交一个固定命令的 runner job，展示 `docker ps` 和
+`k3s kubectl get nodes/pods/svc/deploy,sts`；如果目标是 Helm 方式，runner 还会用
+自己的 `helm` + target 的 kubeconfig 跑一次 `helm list -A`（经 k3s-tunnel 访问集群，
+不依赖宿主机装 helm）。不写 runs 表，也不开放交互式 shell。
+
+页面上每个项目还有受控动作：Helm 目标可看 `helm history`、做 `rollout restart`；
+SSH Docker 目标可看 `docker logs --tail 200`、重启容器。只读动作任意合法角色可用，
+两个重启动作要求 `human_admin`，前端点击后会打开动作弹窗并直接提交执行，
+弹窗负责展示目标上下文、权限门禁、实时输出和最终状态。动作参数只来自 target 配置
+（`release_name` / `namespace` / `kubeconfig` / `ssh_container`），请求体只选
+`project_id` / `target` / `action`，不接受自由命令；提交记录写入 `env_actions` 表，
+页面上展示最近 5 条审计；任务结束后会把 runner 的 `done/failed/canceled` 回写成
+`success/failed/canceled`，避免审计一直停在“已提交”。
+快照只允许项目里已经配置过的 `ssh_host`；命令写死在 `src/exec.lume` 的
+`env_snapshot_script()`，前端没有输入框。新增动作应继续走预置动作 + runner + 审计，
+而不是任意 shell。
+
+```bash
+curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
+  'http://127.0.0.1:18107/api/projects/specpulse-lume/deploy?role=human_admin' \
+  -H 'content-type: application/json' \
+  -d '{"target":"阿里云","port":"8097"}'
+```
+
+前端「发布 / 流水线」按钮会弹出目标与端口确认框；生产目标端口为空时不能提交。
+
+角色参考 `work/knowledge/kb-abac` 的「身份与授权分离」：Basic Auth 用户是身份，
+`/auth/accounts.json` 是该用户在本地的角色授权。compose 默认
+`CICD_ACCOUNTS_ENFORCE=1`，`make auth` 会为当前 `CICDKIT_BASIC_USER` 生成：
+
+```json
+{"accounts":{"cicd":{"roles":["agent_operator","human_admin"],"title":"Basic Auth user"}}}
+```
+
+之后 `?role=` 只能从该账号 `roles` 里选，选未授予的角色不会提权；账号表读不到、
+用户未登记、没有角色都按 fail-closed 拒绝。审计里的 `actor` 会写成
+`cicd (human_admin)`，能回答“谁点的”。本地无认证开发可以显式关掉
+`CICD_ACCOUNTS_ENFORCE=0`，回到旧的 `?role=` 模式；`CICD_ROLE_MAP` 仅作为旧部署的
+兼容路径保留。
+
+授权已经从“路由里写死角色”收到一张资源表：`/auth/resources.json` 登记
+`资源 → 可用动作 + 最低角色`，路由只调用 `access.decide(user, resource, action)`。
+`make auth` 首次从 `scripts/resources.default.json` 生成；默认表带
+`defaults_version`，升级时只补缺失资源，不覆盖手工改过的条目。版本追平后不再
+自动补，管理员删掉的默认资源不会在下次 `make auth` 时被重新加回来。
+
+当前默认表：
+
+| 资源 | 动作 | 最低角色 |
+|---|---|---|
+| `agent-query` | `read` | `agent_operator` |
+| `project-read` | `read` | `agent_operator` |
+| `project-visits` | `read` | `human_admin` |
+| `project-admin` | `create` / `scan` / `generate` / `update` / `delete` | `human_admin` |
+| `project-run` | `build` / `pipeline` | `agent_operator` |
+| `project-inspect` | `validate` / `probe` | `agent_operator` |
+| `deploy-publish` | `publish` | `agent_operator` |
+| `run-read` | `read` | `agent_operator` |
+| `run-admin` | `clear` / `restore` | `human_admin` |
+| `run-control` | `cancel` | `agent_operator` |
+| `run-adopt` | `adopt` | `human_admin` |
+| `run-diagnose` | `read` | `agent_operator` |
+| `deployment-read` | `read` | `agent_operator` |
+| `deployment-admin` | `clear` | `human_admin` |
+| `deployment-diagnose` | `read` | `agent_operator` |
+| `kb-read` | `read` | `agent_operator` |
+| `kb-write` | `write` / `delete` | `human_admin` |
+| `llm-read` | `read` | `agent_operator` |
+| `llm-config` | `update` / `test` | `human_admin` |
+| `fs-browse` | `read` | `human_admin` |
+| `env-snapshot` | `read` | `agent_operator` |
+| `env-action-read` | `read` | `agent_operator` |
+| `env-action-mutate` | `restart` | `human_admin` |
+| `audit-read` | `read` | `agent_operator` |
+
+只读数据接口也纳入资源表：项目、运行、部署、知识库、LLM 掩码配置、云环境、
+云环境动作审计和授权审计都按 `*-read` 资源判定。访客统计可能含访客 IP / 地域，
+单独登记为 `project-visits`，只允许 `human_admin`。身份绑定开启时默认拒绝；
+旧 `?role=` 模式保持“Basic Auth 登录即可读”，避免迁移期把只读页一次性锁死。
+
+发布仍保留 `CICD_DEPLOY_APPROVAL` 的审批链，资源表只是先拦掉没有发布资格的身份；
+`off` 模式下也不会再出现“不带角色就能发布”。资源表读不到、资源或动作未登记、
+角色低于 `min_role` 都拒绝。加新动作先改 `scripts/resources.default.json`，再在
+路由里写清 resource/action，不再在路由里加角色分支。
+
+每次闸门判定还会写一条 `access_events` 审计：用户、角色、资源、动作、放行/拒绝、
+拒绝原因。运行日志和云环境快照属于 1.5 秒级轮询，只记录拒绝，不记每次放行，
+避免短时间把审计保留窗口冲掉。它和 `env_actions` 分工不同——`access_events` 记“谁被允许/拒绝做这件事”，
+`env_actions` 记“云环境动作最后跑成没跑成”。页面新增「审计」页，分「授权判定」「云环境动作」两个视图：前者可按用户或资源过滤，
+后者按主机过滤；都支持时间范围（`since` / `until`，Unix 秒）和把当前结果导出为 JSON。
+审计默认保留 5000 条（`CICD_AUDIT_KEEP`，最少 100），每次写入后自动裁掉最旧的
+记录，避免长期运行把 SQLite 撑大。云环境动作审计另有 `CICD_ENV_AUDIT_KEEP`，
+只裁终态记录；`submitted` 可能还有 runner job 在跑，必须保留到终态回写完成。
+
+`~/.config/cicdkit-lume`（`htpasswd`、`username`、`prometheus.pass`、`health-header`、`accounts.json`、`resources.json`）。
   浏览器首次访问会弹 Basic 认证框；curl/脚本要带 `-u "<用户名>:<口令>"`。容器健康检查与
   Prometheus 抓取都用同一份派生文件，改 `.env` 后重跑 `make docker` 即可。
-- **Basic Auth 账号 ≠ 业务角色**：`cicd` 只证明通过了身份认证；`?role=` 决定能做什么。
-  单人本地用 `cicd` 登录时把 `.env` 的 `CICD_DEFAULT_ROLE` 设成 `human_admin`，前端首次加载
-  会把顶栏切到「终审」，之后仍可手动切回操作员。
+- **Basic Auth 账号 = 业务身份**：`cicd` 通过身份认证后，角色来自 `/auth/accounts.json` 的
+  `roles`；顶栏只显示该账号被授予的角色。`CICD_DEFAULT_ROLE` 只是首次加载时选哪个默认角色。
 - 指标在 `/metrics/cicdkit`：`/metrics` 被 lume 的 agent-httpd 硬编码占用，脚本层改不了。
 - 直方图只统计改版后跑过的运行：runner 新加了 `started_ts`/`ended_ts`，旧记录没有。
 - 身份边界是 `HTPASSWD_FILE` + 角色口令：Lume 读不到请求头，实现不了上游的 `X-API-Token`。
@@ -346,7 +459,7 @@ curl -X POST "http://127.0.0.1:8096/api/webhook/lume-crm?secret=$CICD_HOOK_KEY" 
 
 - 只收 `POST`；`id` 缺失 400、项目不存在 404。
 - 密钥只从 query `?secret=` 取（Lume 的请求对象不暴露请求头，`X-Webhook-Secret` 这条上游兼容没做）。
-- body 全部可选：`tag`（覆盖自动时间戳 tag，只允许 `[A-Za-z0-9][A-Za-z0-9._-]*`，最长 128，否则 400）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）。
+- body 全部可选：`tag`（覆盖自动时间戳 tag，只允许 `[A-Za-z0-9][A-Za-z0-9._-]*`，最长 128，否则 400）、`method`（受同一套白名单约束，非法 400）、`target`（不存在 400）、`port`（生产 SSH 目标必填，否则 400）。
 - 成功返回 `202` 和 `run_id` —— 只是**受理**，进度照样去 `/api/runs/:id` 看。
 - 触发的是 `pipeline`（构建 + 部署），`trigger` 记为 `webhook`，方便在运行列表里区分人点还是机器点。
 - 自测：`scripts/test_gate.sh` 覆盖 503 / 401 / 404 / 400 四条拒绝路径（`CICD_HOOK_KEY=testkey` 起临时实例）。
@@ -401,10 +514,11 @@ make docker-down
 
 ## 已知限制与运维提醒
 
-- **角色默认是自报的（`?role=`），不是身份认证**：不配 `CICD_ROLE_MAP` 时，`CICD_DEPLOY_APPROVAL` 挡住的
-  只是「没自报角色的手滑调用」，挡不住知道 URL 的人。配了口令后角色由 `?pass=` 反查，但口令本身仍在
-  query 里（会进访问日志），且比较是普通字符串相等——它是"防误操作"而不是"抗攻击"。对外暴露仍必须加
-  `HTPASSWD_FILE` 或前置反代。
+- **角色身份绑定默认开启**：compose 注入 `CICD_ACCOUNTS_ENFORCE=1`，角色只能来自
+  Basic Auth 用户对应的账号表；账号表缺失/用户未登记/无角色都 fail-closed。只有显式设
+  `CICD_ACCOUNTS_ENFORCE=0` 才回到旧的 `?role=` 自报模式。`CICD_ROLE_MAP` 的 `?pass=` 仍在 query 里，
+  只作为旧部署兼容路径，不建议新部署使用；前端只把口令放 `sessionStorage`，不持久化，
+  身份模式开启时会主动清掉旧口令。即使如此，query 仍可能进入反向代理访问日志，生产应使用 Basic Auth 身份模式。
   另一个坑：`env()` 会把名字里含 `TOKEN`/`SECRET`/`PASSWORD` 的变量对脚本层脱敏成 `null`，所以这个变量
   只能叫 `CICD_ROLE_MAP`（叫 `CICD_ROLE_TOKENS` 会永远读不到值，看起来像"口令全没生效"）。
 - **`patch_run` 是读-改-写，没有事务**（Lume 的 SQL 护栏不开放事务，也没有进程内互斥）。
@@ -421,8 +535,9 @@ make docker-down
 - **SQLite 不能建索引**：DDL 护栏只允许 `CREATE TABLE`，`CREATE INDEX` 被拒。当前 200 来条记录无所谓，
   记录量上百倍增长后列表查询会变慢，到那时得换存储层而不是硬扛。
 - **runner 的任务表只在内存里**：重启即丢，控制面会把还在跑的运行标成 `interrupted`（不会再标成 running 干等）。
-- **A2A 任务表不会自动清理**（和 `runs` 不同，它没有保留策略）：每次 `message/send` 都落一条。
-  只读问答量大了要手动清，或将来接上 `CICDKIT_A2A_KEEP`。任务记录里只有能力名/参数/结果摘要，
+- **A2A 任务表有保留上限**：每次 `message/send` 都落一条，默认保留 1000 条
+  （`CICD_A2A_TASK_KEEP`，最少 10）。只裁 `completed`/`rejected`/`canceled` 等终态，
+  `submitted`/`working`/`input-required` 不参与，避免删掉正在排队的任务。任务记录里只有能力名/参数/结果摘要，
   不含日志原文。
 - **peer 面不加密**：签名保证不可伪造/篡改，但明文传输；不要经此通道传密码、密钥、证件号。
   防重放只是时间窗级别（同一 nonce 在窗口内重放仍会过）。

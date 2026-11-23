@@ -81,10 +81,13 @@ runner-test:
 
 test: vendor
 	@rm -rf /tmp/lume_test_store && mkdir -p /tmp/lume_test_store/logs && dd if=/dev/zero of=/tmp/lume_test_store/logs/run-big.log bs=1048576 count=17 2>/dev/null
-	@LUME_DATA=/tmp/lume_test_store $(LUME) scripts/store_test.lume
+	@LUME_DATA=/tmp/lume_test_store CICD_AUDIT_KEEP=100 CICD_ENV_AUDIT_KEEP=100 $(LUME) scripts/store_test.lume
 	@rm -rf /tmp/lume_test_exec && LUME_DATA=/tmp/lume_test_exec RUNNER_BASE=http://127.0.0.1:9 $(LUME) scripts/exec_test.lume
+	@rm -f /tmp/lume_test_access.json /tmp/lume_test_resources.json; CICD_ACCOUNTS_ENFORCE=1 CICD_ACCOUNTS_FILE=/tmp/lume_test_access.json CICD_ACCESS_RESOURCES_FILE=/tmp/lume_test_resources.json $(LUME) scripts/access_test.lume >/tmp/lume_test_access.log 2>&1; st=$$?; cat /tmp/lume_test_access.log; test $$st -eq 0 && ! grep -q 'FAIL' /tmp/lume_test_access.log
 	@rm -rf /tmp/lume_test_gen && LUME_DATA=/tmp/lume_test_gen $(LUME) scripts/generate_test.lume
-	@rm -rf /tmp/lume_test_a2a && mkdir -p /tmp/lume_test_a2a && LUME_DATA=/tmp/lume_test_a2a CICDKIT_PEER_SHARED=test-shared $(LUME) scripts/a2a_test.lume
+	@rm -rf /tmp/lume_test_a2a && mkdir -p /tmp/lume_test_a2a && LUME_DATA=/tmp/lume_test_a2a CICDKIT_PEER_SHARED=test-shared CICD_A2A_TASK_KEEP=10 $(LUME) scripts/a2a_test.lume
+	@rm -rf /tmp/lume_test_agent && mkdir -p /tmp/lume_test_agent && LUME_DATA=/tmp/lume_test_agent $(LUME) scripts/agent_test.lume
+	@LUME_DATA=/tmp/lume_test_deploy_port $(LUME) scripts/deploy_port_test.lume
 	@bash scripts/test_gate.sh "$(LUME)"
 	@$(MAKE) runner-test
 

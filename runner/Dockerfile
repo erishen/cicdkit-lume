@@ -11,7 +11,7 @@
 #
 # 路径陷阱：runner 用宿主 docker daemon 执行 `docker build <context>` 时，
 # daemon 解析的是**宿主机**路径。若把 runner 放进容器，就必须把项目目录
-# 以「相同绝对路径」挂进来（-v /Users/erishen/Workspace:/Users/erishen/Workspace），
+# 以「相同绝对路径」挂进来（-v /workspace/project:/workspace/project），
 # 否则 docker 会报 context 不存在。本地开发更推荐直接跑宿主机二进制：
 #   make runner
 ARG GO_IMAGE=golang:1.22-alpine

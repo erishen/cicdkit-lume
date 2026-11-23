@@ -432,6 +432,33 @@ export func dispatch(name, args) {
 
 // ---------- 任务 ----------
 
+func task_keep() {
+  let v = env("CICD_A2A_TASK_KEEP");
+  if (v == null) { return 1000; }
+  let n = int(v);
+  if (n < 10) { return 10; }
+  return n;
+}
+
+// 任务里存的是调用方的问题和只读结果，属于业务数据；长期只增不减会留隐私尾巴。
+// 只裁终态任务，submitted/working/input-required 不参与，避免把正在排队的任务删掉。
+func prune_tasks() {
+  let keep = task_keep();
+  let rows = sql_query(store.db(), "SELECT COUNT(*) AS n FROM a2a_tasks", []);
+  let total = 0;
+  if (len(rows) > 0) { total = int(get(rows[0], "n", 0)); }
+  while (total > keep) {
+    let old = sql_query(store.db(),
+      "SELECT id FROM a2a_tasks WHERE state NOT IN ('submitted','working','input-required')" +
+      " ORDER BY updated_ts ASC, id ASC LIMIT 1", []);
+    if (len(old) == 0) { break; }
+    let id = str(get(old[0], "id", ""));
+    let r = try(() => sql_write(store.db(), "DELETE FROM a2a_tasks WHERE id = ?", [id]));
+    if (r.err != null) { break; }
+    total = total - 1;
+  }
+}
+
 func save_task(t) {
   let id = jstr(t, "id");
   if (len(id) == 0) { return { ok: false, err: "empty task id" }; }
@@ -440,6 +467,7 @@ func save_task(t) {
     "INSERT OR REPLACE INTO a2a_tasks (id, state, json, created_ts, updated_ts) VALUES (?,?,?,?,?)",
     [id, st, stringify(t), int(get(t, "created", 0)), int(get(t, "updated", 0))]));
   if (r.err != null) { return { ok: false, err: str(r.err) }; }
+  prune_tasks();
   return { ok: true, err: "" };
 }
 

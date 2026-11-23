@@ -22,6 +22,7 @@
 
 // import 路径相对于本文件目录：src/ → ../vendor/lume-core/lib/
 import "../vendor/lume-core/lib/approval.lume" as approval;
+import "access.lume" as access;
 
 // 按 ";" 切分（LUME 没有 split，只能手扫）。
 func split_semi(text) {
@@ -61,12 +62,28 @@ export func role_map() {
 }
 
 export func auth_mode() {
+  if (access.enabled()) { return "identity"; }
   if (len(keys(role_map())) > 0) { return "role-map"; }
   return "self-reported";
 }
 
-// 解析请求里的角色：{ok, role, via, declared, reason}
+// 解析请求里的角色：{ok, role, via, declared, reason, user}
 func resolve_role(req) {
+  // 身份绑定优先：角色只能来自 Basic Auth 用户对应的账号表。
+  // 账号表读不到 / 用户未登记 → DENY，不回退到 ?role=。
+  let id = access.identity(req);
+  if (get(id, "enabled", false)) {
+    if (not get(id, "ok", false)) {
+      return {
+        ok: false, role: "", via: "identity", declared: str(get(id, "requested", "")),
+        user: str(get(id, "user", "")), reason: str(get(id, "reason", "身份校验失败")),
+      };
+    }
+    return {
+      ok: true, role: str(get(id, "role", "")), via: "identity",
+      declared: str(get(id, "requested", "")), user: str(get(id, "user", "")), reason: "",
+    };
+  }
   let declared = "";
   let pass = "";
   let qp = get(req, "query_params", null);
@@ -126,7 +143,7 @@ export func deploy_allowed(req) {
     return {
       allowed: false, mode: m, role: role, action: action, chain: chain,
       reason: "发布已被审批闸门拦截：" + str(get(who, "reason", "角色不明")) + "（本动作需要 " + action + "）",
-      auth: str(get(who, "via", "")),
+      auth: str(get(who, "via", "")), user: str(get(who, "user", "")),
     };
   }
   if (not approval.can(role, action)) {
@@ -137,7 +154,7 @@ export func deploy_allowed(req) {
   }
   return {
     allowed: true, mode: m, role: role, action: action, chain: chain, reason: "",
-    auth: str(get(who, "via", "")),
+    auth: str(get(who, "via", "")), user: str(get(who, "user", "")),
   };
 }
 
@@ -150,16 +167,19 @@ export func role_allowed(req, role, label) {
   if (not bool(get(who, "ok", false))) {
     return {
       allowed: false, role: got, action: role, auth: str(get(who, "via", "")),
+      user: str(get(who, "user", "")),
       reason: label + "被拒：" + str(get(who, "reason", "角色不明")) + "（需要 " + role + "）",
     };
   }
   if (got != role) {
     return {
       allowed: false, role: got, action: role, auth: str(get(who, "via", "")),
+      user: str(get(who, "user", "")),
       reason: label + "需要 " + role + "，当前是 " + got,
     };
   }
-  return { allowed: true, role: got, action: role, reason: "", auth: str(get(who, "via", "")) };
+  return { allowed: true, role: got, action: role, reason: "", auth: str(get(who, "via", "")),
+    user: str(get(who, "user", "")) };
 }
 
 // 只要角色能解析出来（任一已知角色）就放行：用于「读日志/诊断」这类
@@ -169,21 +189,52 @@ export func role_any(req, label) {
   if (not bool(get(who, "ok", false))) {
     return {
       allowed: false, role: str(get(who, "role", "")), action: "any", auth: str(get(who, "via", "")),
+      user: str(get(who, "user", "")),
       reason: label + "被拒：" + str(get(who, "reason", "角色不明")),
     };
   }
-  return { allowed: true, role: str(get(who, "role", "")), action: "any", reason: "", auth: str(get(who, "via", "")) };
+  return { allowed: true, role: str(get(who, "role", "")), action: "any", reason: "",
+    auth: str(get(who, "via", "")), user: str(get(who, "user", "")) };
 }
 
 // GET /api/meta 用：让前端知道闸门当前模式与默认审批链。
-export func policy() {
+func role_in(roles, want) {
+  let i = 0;
+  while (i < len(roles)) {
+    if (str(get(roles, i)) == str(want)) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+export func policy(req) {
   let def = env("CICD_DEFAULT_ROLE");
   let role_default = "agent_operator";
   if (def != null and approval.known_role(str(def))) { role_default = str(def); }
+  let all_roles = ["agent_operator", "agent_reviewer", "agent_reviewer_second", "human_admin"];
+  let id = access.identity(req);
+  if (get(id, "enabled", false)) {
+    let granted = get(id, "roles", []);
+    if (len(granted) > 0) {
+      // 顶栏只展示该身份真正被授予的角色，不能把未授权角色露给用户选。
+      all_roles = granted;
+      if (not role_in(granted, role_default)) { role_default = str(get(granted, 0, "")); }
+    }
+    return {
+      mode: mode(),
+      chain: approval.chain_for("medium"),
+      roles: all_roles,
+      auth: "identity",
+      default_role: role_default,
+      user: str(get(id, "user", "")),
+      identity_ok: get(id, "ok", false),
+      identity_reason: str(get(id, "reason", "")),
+    };
+  }
   return {
     mode: mode(),
     chain: approval.chain_for("medium"),
-    roles: ["agent_operator", "agent_reviewer", "agent_reviewer_second", "human_admin"],
+    roles: all_roles,
     auth: auth_mode(),
     default_role: role_default,
   };

@@ -1,0 +1,71 @@
+// scripts/agent_test.lume — Agent/Text2SQL 的安全校验与扁平表自测（不调模型）
+//
+//   LUME_DATA=/tmp/lume_test_agent ./vendor/lume/bin/lume scripts/agent_test.lume
+//
+// 覆盖：三张表同步、单表 SELECT 放行、写操作/JOIN/子查询/敏感表/超限 LIMIT 拒绝、
+// 无 LIMIT 自动补、执行结果列名。
+import "../src/store.lume" as store;
+import "../src/agent.lume" as agent;
+
+let st = { fails: 0, checks: 0 };
+func ok(label, cond) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (cond) { print("  ok " + label); }
+  else {
+    print("  FAIL " + label);
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+  }
+}
+
+print("agent: init");
+store.init();
+agent.init();
+store.put_project({ id: "proj-agent", name: "agent-demo", branch: "main",
+                    primary_target: "prod", created_at: "2026-11-01T00:00:00Z",
+                    updated_at: "2026-11-02T00:00:00Z" }, true);
+store.put_run({ id: "run-agent-1", project_id: "proj-agent", project_name: "agent-demo",
+                trigger: "manual", status: "failed", image_ref: "agent-demo:t1",
+                created_at: "2026-11-03T10:00:00Z", created_ts: 100,
+                started_ts: 100, ended_ts: 130,
+                stages: [{ name: "build", status: "success" }, { name: "deploy", status: "failed" }] });
+store.put_deployment({ id: "dep-agent-1", project_id: "proj-agent", project_name: "agent-demo",
+                       method: "ssh", target: "prod", image_ref: "agent-demo:t1",
+                       status: "success", probe: { status: "ok", url: "http://127.0.0.1:1/x" },
+                       created_at: "2026-11-03T10:05:00Z" });
+agent.sync();
+
+print("agent: sync");
+let projects = agent.execute("SELECT name, branch FROM agent_projects LIMIT 5");
+ok("项目同步", get(projects, "ok", false) == true and get(projects, "count", 0) == 1);
+let runs = agent.execute("SELECT project_name, status, duration_sec, stage_summary FROM agent_runs LIMIT 5");
+ok("运行同步", get(runs, "count", 0) == 1);
+let row0 = get(runs, "rows", [])[0];
+ok("运行耗时", int(get(row0, "duration_sec", 0)) == 30);
+ok("阶段摘要", str(get(row0, "stage_summary", "")) == "build:success,deploy:failed");
+let deps = agent.execute("SELECT project_name, status, probe_status FROM agent_deployments LIMIT 5");
+ok("部署同步", get(deps, "count", 0) == 1);
+
+print("agent: sql guard");
+let good = agent.validate_sql("SELECT project_name, status FROM agent_runs WHERE status = 'failed' ORDER BY created_at DESC LIMIT 5");
+ok("单表 SELECT 放行", get(good, "ok", false) == true);
+let no_lim = agent.validate_sql("SELECT name FROM agent_projects");
+ok("无 LIMIT 自动补", get(no_lim, "ok", false) == true and contains(str(get(no_lim, "sql", "")), "LIMIT 100"));
+let semi_ok = agent.validate_sql("SELECT name FROM agent_projects LIMIT 5;");
+ok("末尾单个分号被容忍", get(semi_ok, "ok", false) == true and not contains(str(get(semi_ok, "sql", "")), ";"));
+let semi_bad = agent.validate_sql("SELECT name FROM agent_projects LIMIT 5; SELECT name FROM agent_runs");
+ok("多条语句被拒", get(semi_bad, "ok", true) == false);
+let write = agent.validate_sql("DELETE FROM agent_runs WHERE 1=1");
+ok("写操作被拒", get(write, "ok", true) == false);
+let joinq = agent.validate_sql("SELECT a.name FROM agent_projects a JOIN agent_runs r ON a.id = r.project_id");
+ok("JOIN 被拒", get(joinq, "ok", true) == false);
+let sub = agent.validate_sql("SELECT name FROM (SELECT name FROM agent_projects)");
+ok("子查询被拒", get(sub, "ok", true) == false);
+let hidden = agent.validate_sql("SELECT value FROM settings LIMIT 5");
+ok("敏感表被拒", get(hidden, "ok", true) == false);
+let big = agent.validate_sql("SELECT name FROM agent_projects LIMIT 500");
+ok("超限 LIMIT 被拒", get(big, "ok", true) == false);
+let comments = agent.validate_sql("SELECT name FROM agent_projects -- x");
+ok("注释被拒", get(comments, "ok", true) == false);
+
+print("");
+print("checks=" + str(get(st, "checks", 0)) + " fails=" + str(get(st, "fails", 0)));

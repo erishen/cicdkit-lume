@@ -166,6 +166,24 @@ eq("helm argv", join(r2.steps[0].argv, " "),
    "helm --kubeconfig /root/.kube/config -n prod upgrade --install demo ./chart --set replicas=2 --set image.repository=registry/x:1 --wait --timeout 300s");
 eq("helm timeout 带余量", r2.steps[0].timeout_s, 310);
 
+let hm_test = {
+  method: "helm", environment: "test", ssh_host: "10.0.0.8", ssh_user: "root",
+  kubeconfig: "/root/.kube/config", namespace: "test",
+  chart_path: "./chart", release_name: "demo-test"
+};
+let r2b = exec.deploy_steps({ id: "hl-test" }, hm_test, "registry/x:1", {});
+eq("helm 测试环境先释放 8080", r2b.ok and r2b.steps[0].label == "release-8080", true);
+eq("释放步骤走 SSH", join(r2b.steps[0].argv, " "), "ssh -p 22 -o StrictHostKeyChecking=accept-new -o LogLevel=ERROR -o ConnectTimeout=10 root@10.0.0.8 " + exec.test_slot_cleanup_script("8080"));
+
+// 前端把空 values 输入序列化成 ""，不能 keys("") 崩掉，也不应生成空 --set。
+let hm_empty_values = {
+  method: "helm", kubeconfig: "/root/.kube/config", namespace: "demo",
+  chart_path: "./chart", release_name: "demo", helm_values: ""
+};
+let r2c = exec.deploy_steps({ id: "hl-empty" }, hm_empty_values, "registry/x:1", {});
+eq("helm 空 values 不报错", r2c.ok, true);
+eq("helm 空 values 无 --set", contains(join(r2c.steps[0].argv, " "), "--set"), false);
+
 // ---------- local-k3s ----------
 
 let k3 = {

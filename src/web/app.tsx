@@ -1,19 +1,23 @@
 // src/web/app.tsx — cicdkit Lume 控制台（React 18 + 原生 fetch）
 //
-// 页面：总览 / 项目 / 运行 / 部署 / 知识库。所有数据来自同源 Lume BFF（/api/*），
+// 页面：总览 / 项目 / 运行 / 部署 / 云环境 / Agent(Text2SQL) / 知识库。所有数据来自同源 Lume BFF（/api/*），
 // 浏览器不持有 cicdkit 的 API Token。
 
 import React, { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import API, {
+  AgentResult,
   Deployment,
   Diagnosis,
+  EnvironmentAction,
+  EnvironmentGroup,
   FsEntry,
   Health,
   KBEntry,
   LLMConfig,
   Meta,
   Overview,
+  AccessEvent,
   Project,
   Run,
   RunLog,
@@ -21,7 +25,7 @@ import API, {
   StageResult,
 } from './api'
 
-const ROUTES = ['overview', 'projects', 'runs', 'deployments', 'kb'] as const
+const ROUTES = ['overview', 'projects', 'runs', 'deployments', 'environments', 'agent', 'kb', 'audit'] as const
 type Route = (typeof ROUTES)[number]
 
 const NAV: Array<{ key: Route; label: string }> = [
@@ -29,7 +33,10 @@ const NAV: Array<{ key: Route; label: string }> = [
   { key: 'projects', label: '项目' },
   { key: 'runs', label: '运行' },
   { key: 'deployments', label: '部署' },
+  { key: 'environments', label: '云环境' },
+  { key: 'agent', label: 'Agent' },
   { key: 'kb', label: '知识库' },
+  { key: 'audit', label: '审计' },
 ]
 
 const ROLE_LABEL: Record<string, string> = {
@@ -45,6 +52,8 @@ const STATUS_LABEL: Record<string, string> = {
   success: '成功',
   failed: '失败',
   canceled: '已取消',
+  submitted: '已提交',
+  submit_failed: '提交失败',
 }
 
 const METHOD_LABEL: Record<string, string> = {
@@ -61,6 +70,56 @@ const PROBE_LABEL: Record<string, string> = {
   fail: '未达标',
   err: '出错',
 }
+
+type DeployEnv = 'test' | 'prod' | ''
+
+type DeployOption = {
+  name: string
+  spec: Project['deploy']
+  env: DeployEnv
+  envLabel: string
+}
+
+// 与后端 validate.target_env 保持同一套规则：显式 environment 优先，
+// 现有目标按名称推断（腾讯云=测试、阿里云=生产）。target 名不在这里重复拼字符串。
+function targetEnv(name: string, spec?: Project['deploy']): DeployEnv {
+  const explicit = (spec?.environment || '').trim().toLowerCase()
+  if (['test', 'testing', 'staging'].includes(explicit)) return 'test'
+  if (['prod', 'production'].includes(explicit)) return 'prod'
+  if (name.includes('腾讯')) return 'test'
+  if (name.includes('阿里')) return 'prod'
+  return ''
+}
+
+function envLabel(env: DeployEnv): string {
+  return env === 'test' ? '测试' : env === 'prod' ? '生产' : '未定义'
+}
+
+function deployOptions(p: Project): DeployOption[] {
+  if (p.targets && p.targets.length > 0) {
+    return p.targets.map((t) => {
+      const spec = t as Project['deploy']
+      return { name: t.name, spec, env: targetEnv(t.name, spec), envLabel: envLabel(targetEnv(t.name, spec)) }
+    })
+  }
+  const spec = p.deploy
+  const env = targetEnv('', spec)
+  return [{ name: '', spec, env, envLabel: envLabel(env) }]
+}
+
+// 生产目标配置里的端口只作历史参考，发布时必须重新填；测试目标缺省 8080。
+function deployPortFor(opt: DeployOption): string {
+  if (!targetNeedsPort(opt)) return ''
+  if (opt.env === 'prod') return ''
+  if (opt.env === 'test') return '8080'
+  return opt.spec?.ssh_probe_port || ''
+}
+
+function targetNeedsPort(opt: DeployOption): boolean {
+  const m = (opt.spec?.method || '').trim()
+  return m === '' || m === 'ssh'
+}
+
 
 const ROLE_KEY = 'cicdkit_lume_role'
 const ROLE_PASS_KEY = 'cicdkit_lume_role_pass'
@@ -124,7 +183,7 @@ function statusClass(status?: string): string {
   if (status === 'success' || status === 'ok') return 'badge ok'
   if (status === 'running') return 'badge run'
   if (status === 'queued') return 'badge queue'
-  if (status === 'failed' || status === 'canceled' || status === 'err') return 'badge err'
+  if (status === 'failed' || status === 'canceled' || status === 'err' || status === 'submit_failed') return 'badge err'
   return 'badge gray'
 }
 
@@ -305,6 +364,7 @@ function ProjectsPage({ role }: { role: string }) {
   const [notice, setNotice] = useState<Notice | null>(null)
   const [editing, setEditing] = useState<Project | null>(null)
   const [creating, setCreating] = useState(false)
+  const [deploying, setDeploying] = useState<{ project: Project; action: 'deploy' | 'pipeline' } | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -334,18 +394,14 @@ function ProjectsPage({ role }: { role: string }) {
     )
   }, [projects, q])
 
-  const trigger = async (p: Project, action: 'build' | 'pipeline' | 'validate' | 'deploy') => {
-    if (action === 'deploy' && !window.confirm(`确认发布「${p.name}」？\n角色：${ROLE_LABEL[role] || role}`)) {
-      return
-    }
+  const trigger = async (p: Project, action: 'build' | 'validate') => {
     setBusy(p.id + ':' + action)
     setNotice(null)
     try {
-      const res: any =
-        action === 'deploy' ? await API.deploy(p.id, role) : await API.action(p.id, action, role)
+      const res: any = await API.action(p.id, action, role)
       const run = res && (res.run || res)
       const runId = run && typeof run === 'object' ? run.id : ''
-      const label = action === 'deploy' ? '发布' : action === 'build' ? '构建' : action === 'pipeline' ? '流水线' : '验证'
+      const label = action === 'build' ? '构建' : '验证'
       setNotice({
         id: p.id,
         kind: 'ok',
@@ -362,6 +418,18 @@ function ProjectsPage({ role }: { role: string }) {
   // 回滚：先拉版本列表让用户选；直接确定 = 上一版，填序号 = 指定历史版本
   const rollback = async (p: Project) => {
     const cur = p.last_deploy
+    const opts = deployOptions(p)
+    const opt = opts.find((o) => o.name === (cur?.target || '')) || opts[0]
+    let port = deployPortFor(opt)
+    if (targetNeedsPort(opt) && opt.env === 'prod') {
+      const input = window.prompt(`生产环境回滚「${p.name}」需要指定端口（1-65535）`, '')
+      if (input === null) return
+      port = input.trim()
+      if (!/^\d+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+        setNotice({ id: p.id, kind: 'err', text: `端口非法：${port || '空'}` })
+        return
+      }
+    }
     setBusy(p.id + ':rollback')
     setNotice(null)
     try {
@@ -397,7 +465,7 @@ function ProjectsPage({ role }: { role: string }) {
       }`)) {
         return
       }
-      const res = await API.rollback(p.id, role, { target: cur?.target || '', image_ref: image })
+      const res = await API.rollback(p.id, role, { target: cur?.target || '', image_ref: image, port })
       setNotice({
         id: p.id,
         kind: 'ok',
@@ -538,7 +606,7 @@ function ProjectsPage({ role }: { role: string }) {
                   <button
                     className="btn primary"
                     disabled={busy !== ''}
-                    onClick={() => trigger(p, 'deploy')}
+                    onClick={() => setDeploying({ project: p, action: 'deploy' })}
                   >
                     {busy === p.id + ':deploy' ? '发布中…' : '发布'}
                   </button>
@@ -555,7 +623,7 @@ function ProjectsPage({ role }: { role: string }) {
                   <button
                     className="btn"
                     disabled={busy !== ''}
-                    onClick={() => trigger(p, 'pipeline')}
+                    onClick={() => setDeploying({ project: p, action: 'pipeline' })}
                   >
                     {busy === p.id + ':pipeline' ? '执行中…' : '流水线'}
                   </button>
@@ -594,6 +662,24 @@ function ProjectsPage({ role }: { role: string }) {
         </div>
       )}
 
+      {deploying && (
+        <DeployModal
+          project={deploying.project}
+          action={deploying.action}
+          role={role}
+          onClose={() => setDeploying(null)}
+          onDone={(runId, label) => {
+            setDeploying(null)
+            setNotice({
+              id: deploying.project.id,
+              kind: 'ok',
+              text: runId ? `${label}已触发，运行 ${runId}` : `${label}已触发`,
+            })
+            load()
+          }}
+        />
+      )}
+
       {creating && (
         <NewProjectModal
           role={role}
@@ -617,6 +703,142 @@ function ProjectsPage({ role }: { role: string }) {
           }}
         />
       )}
+    </div>
+  )
+}
+
+// ---------- 发布确认 ----------
+
+// 发布/流水线共用：先选目标，再确认端口。
+// 腾讯云测试目标默认 8080（现有 8081/8082 保留）；阿里云生产目标不读配置端口，必须手填。
+function DeployModal({
+  project,
+  action,
+  role,
+  onClose,
+  onDone,
+}: {
+  project: Project
+  action: 'deploy' | 'pipeline'
+  role: string
+  onClose: () => void
+  onDone: (runId: string, label: string) => void
+}) {
+  const options = useMemo(() => deployOptions(project), [project])
+  const initial = options.find((o) => o.name === (project.primary_target || '')) || options[0]
+  const [targetName, setTargetName] = useState(initial?.name || '')
+  const [port, setPort] = useState(deployPortFor(initial))
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const selected = options.find((o) => o.name === targetName) || initial
+  const portRelevant = selected ? targetNeedsPort(selected) : false
+  const portInvalid =
+    portRelevant && port.trim() !== '' && (!/^\d+$/.test(port.trim()) || Number(port) < 1 || Number(port) > 65535)
+  const needPort = portRelevant && selected.env === 'prod' && port.trim() === ''
+  const disabled = busy || !selected || needPort || portInvalid
+
+  const pickTarget = (name: string) => {
+    const next = options.find((o) => o.name === name)
+    setTargetName(name)
+    setPort(next ? deployPortFor(next) : '')
+    setError('')
+  }
+
+  const submit = async () => {
+    if (disabled || !selected) return
+    setBusy(true)
+    setError('')
+    const body = { target: selected.name, port: port.trim() }
+    try {
+      const res: any =
+        action === 'deploy'
+          ? await API.deploy(project.id, role, body)
+          : await API.action(project.id, 'pipeline', role, body)
+      const run = res && (res.run || res)
+      const runId = run && typeof run === 'object' ? run.id : res?.run_id || ''
+      onDone(runId, action === 'deploy' ? '发布' : '流水线')
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="modal-mask" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <div className="modal-head">
+          <h3>{action === 'deploy' ? '发布' : '流水线'}「{project.name}」</h3>
+          <button className="btn ghost" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+        <div className="modal-body">
+          <p className="muted small" style={{ margin: 0 }}>
+            测试目标默认使用 8080，可改；生产目标不保存端口，每次发布必须指定。
+          </p>
+
+          <label className="fld">
+            <span>发布目标</span>
+            <select className="input" value={targetName} onChange={(e) => pickTarget(e.target.value)}>
+              {options.map((o) => (
+                <option key={o.name || '__default'} value={o.name}>
+                  {o.name || '默认发布目标'} · {o.envLabel}
+                  {o.spec?.method ? ` · ${METHOD_LABEL[o.spec?.method || ''] || o.spec.method}` : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+
+          {selected && (
+            <div className="deploy-target">
+              <span className={selected.env === 'prod' ? 'env-pill prod' : selected.env === 'test' ? 'env-pill test' : 'env-pill'}>
+                {selected.envLabel}
+              </span>
+              <span className="muted small">
+                {selected.name || '默认发布目标'}
+                {selected.spec?.ssh_host ? ` · ${selected.spec.ssh_host}` : ''}
+                {selected.spec?.ssh_container_port ? ` · 容器端口 ${selected.spec.ssh_container_port}` : ''}
+              </span>
+            </div>
+          )}
+
+          {portRelevant ? (
+            <label className="fld">
+              <span>
+                宿主端口
+                {selected.env === 'prod'
+                  ? '（生产必填）'
+                  : selected.env === 'test'
+                    ? '（默认 8080）'
+                    : ''}
+              </span>
+              <input
+                className="input"
+                inputMode="numeric"
+                placeholder={selected.env === 'prod' ? '例如 8095' : '8080'}
+                value={port}
+                onChange={(e) => setPort(e.target.value)}
+              />
+            </label>
+          ) : (
+            <div className="notice ok">该目标是 {METHOD_LABEL[selected.spec?.method || ''] || selected.spec?.method} 部署，不需要宿主端口。</div>
+          )}
+
+          {needPort && <div className="notice err">生产环境必须填写端口，配置里的旧端口不会作为默认值。</div>}
+          {portInvalid && <div className="notice err">端口必须是 1-65535 的数字。</div>}
+          {error && <div className="notice err">{error}</div>}
+        </div>
+        <div className="modal-foot">
+          <button className="btn ghost" onClick={onClose} disabled={busy}>
+            取消
+          </button>
+          <button className="btn primary" onClick={submit} disabled={disabled}>
+            {busy ? '提交中…' : action === 'deploy' ? '确认发布' : '执行流水线'}
+          </button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -1385,7 +1607,7 @@ function RunDrawer({
 
         {error && <div className="notice err">{error}</div>}
 
-        {showDiag && <DiagnosePanel runId={runId} onClose={() => setShowDiag(false)} />}
+        {showDiag && <DiagnosePanel runId={runId} role={role} onClose={() => setShowDiag(false)} />}
 
         {logNote && <div className="notice warn">{logNote}</div>}
         <pre className="log" ref={preRef}>
@@ -1412,13 +1634,13 @@ type DiagState =
     }
 
 // 挂载即发起诊断：模型调用有成本，所以只在用户显式点「AI 诊断」后渲染。
-function DiagnosePanel({ runId, onClose }: { runId: string; onClose: () => void }) {
+function DiagnosePanel({ runId, role, onClose }: { runId: string; role: string; onClose: () => void }) {
   const [state, setState] = useState<DiagState>({ kind: 'loading' })
   const [acting, setActing] = useState(false)
 
   useEffect(() => {
     let alive = true
-    API.diagnoseRun(runId, readRole())
+    API.diagnoseRun(runId, role)
       .then((d: Diagnosis) => {
         if (!alive) return
         setState({
@@ -1442,7 +1664,7 @@ function DiagnosePanel({ runId, onClose }: { runId: string; onClose: () => void 
   const adopt = async (value: boolean) => {
     setActing(true)
     try {
-      const res = await API.adoptDiagnosis(runId, value)
+      const res = await API.adoptDiagnosis(runId, value, role)
       setState((prev) =>
         prev.kind === 'done' ? { ...prev, adopted: !!res.adopted, rejected: !!res.rejected } : prev,
       )
@@ -1985,11 +2207,1100 @@ function DeploymentsPage({ role }: { role: string }) {
   )
 }
 
+// ---------- 云环境（只读 + 受控动作） ----------
+
+type SnapshotState = {
+  loading: boolean
+  status?: string
+  exit?: number
+  done?: boolean
+  log?: string
+  error?: string
+  title?: string
+}
+
+const ENV_ACTION_LABEL: Record<string, string> = {
+  'helm-history': 'Helm 历史',
+  'rollout-restart': '滚动重启',
+  'docker-logs': '容器日志',
+  'docker-restart': '重启容器',
+}
+
+const ENV_ACTION_DESC: Record<string, string> = {
+  'helm-history': '读取该 Helm release 最近 10 次 revision。只读，不改动集群。',
+  'rollout-restart': '对该 Helm 工作负载执行 rollout restart，Pod 会重新拉起。',
+  'docker-logs': '读取该 Docker 容器最近 200 行日志。只读，不改动容器。',
+  'docker-restart': '重启该 Docker 容器，服务会短暂中断。',
+}
+
+function EnvActionModal({
+  group,
+  project,
+  action,
+  role,
+  onClose,
+  onDone,
+}: {
+  group: EnvironmentGroup
+  project: EnvironmentGroup['projects'][number]
+  action: string
+  role: string
+  onClose: () => void
+  onDone: () => void
+}) {
+  const label = ENV_ACTION_LABEL[action] || action
+  const desc = ENV_ACTION_DESC[action] || ''
+  const mutation = action === 'rollout-restart' || action === 'docker-restart'
+  const canMutate = role === 'human_admin'
+  const blocked = mutation && !canMutate
+
+  const modalRef = useRef<HTMLDivElement>(null)
+  const prevFocusRef = useRef<HTMLElement | null>(null)
+  const [running, setRunning] = useState(false)
+  const [jobId, setJobId] = useState('')
+  const [status, setStatus] = useState('')
+  const [exit, setExit] = useState(-1)
+  const [done, setDone] = useState(false)
+  const [log, setLog] = useState('')
+  const [error, setError] = useState('')
+
+  const close = () => {
+    if (running) return
+    onClose()
+  }
+
+  const run = async () => {
+    setRunning(true)
+    setError('')
+    setLog('')
+    setStatus('')
+    setDone(false)
+    try {
+      const started = await API.environmentAction(
+        group.host,
+        { project_id: project.id, target: project.target || '', action },
+        role || undefined,
+      )
+      setJobId(started.job_id)
+      const deadline = Date.now() + 90000
+      for (;;) {
+        const st = await API.environmentSnapshotGet(started.job_id)
+        setStatus(st.status)
+        setExit(st.exit)
+        setDone(st.done)
+        setLog(st.log || '')
+        if (st.error) setError(st.error)
+        if (st.done) {
+          setRunning(false)
+          onDone()
+          return
+        }
+        if (Date.now() > deadline) {
+          setRunning(false)
+          setError('动作读取超时；任务可能仍在远端执行，可用审计里的 job_id 排查')
+          onDone()
+          return
+        }
+        await new Promise((r) => setTimeout(r, 1500))
+      }
+    } catch (e: any) {
+      setRunning(false)
+      setError(e.message || String(e))
+      onDone()
+    }
+  }
+
+  // 打开弹窗即执行；重启类动作仍受角色门禁。执行结果持续留在弹窗里。
+  useEffect(() => {
+    prevFocusRef.current = document.activeElement as HTMLElement | null
+    modalRef.current?.focus()
+    return () => {
+      prevFocusRef.current?.focus?.()
+    }
+  }, [])
+
+  useEffect(() => {
+    if (blocked) return
+    void run()
+    // 只在首次挂载时触发，后续不再自动重跑
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // 弹窗打开时锁住母页面滚动，避免滚轮穿透。
+  useEffect(() => {
+    const body = document.body
+    const prev = body.style.overflow
+    body.style.overflow = 'hidden'
+    return () => {
+      body.style.overflow = prev
+    }
+  }, [])
+
+  return (
+    <div className="modal-mask" onClick={close}>
+      <div
+        className="modal"
+        ref={modalRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`${label} ${project.name || project.id}`}
+        onKeyDown={(e) => {
+          if (e.key === 'Escape') {
+            e.stopPropagation()
+            close()
+          }
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="modal-head">
+          <h3>{label}「{project.name || project.id}」</h3>
+          <button className="btn ghost" onClick={close} disabled={running}>
+            ✕
+          </button>
+        </div>
+        <div className="modal-body">
+          <p className="muted small" style={{ margin: 0 }}>{desc}</p>
+
+          <div className="deploy-target">
+            <span className={project.environment === 'prod' ? 'env-pill prod' : project.environment === 'test' ? 'env-pill test' : 'env-pill'}>
+              {project.environment === 'test' ? '测试' : project.environment === 'prod' ? '生产' : '未定义'}
+            </span>
+            <span className="muted small">
+              {group.host} · {project.target || '默认目标'} · {METHOD_LABEL[project.method || ''] || project.method || '—'}
+            </span>
+          </div>
+
+          {(project.namespace || project.release || project.container) && (
+            <dl className="meta">
+              {project.namespace && <div><dt>命名空间</dt><dd className="mono">{project.namespace}</dd></div>}
+              {project.release && <div><dt>Release</dt><dd className="mono">{project.release}</dd></div>}
+              {project.container && <div><dt>容器</dt><dd className="mono">{project.container}</dd></div>}
+              {project.port && <div><dt>端口</dt><dd className="mono">{project.port}</dd></div>}
+            </dl>
+          )}
+
+          {mutation && (
+            <div className="notice err">
+              这是会改变运行状态的动作，可能造成短暂中断；只允许终审角色执行。
+              当前角色：{ROLE_LABEL[role] || role || '未知'}。
+            </div>
+          )}
+          {blocked && <div className="notice err">当前角色不是终审，不能执行重启。请先在顶栏切换角色。</div>}
+          {error && <div className="notice err">{error}</div>}
+
+          {(jobId || log || running) && (
+            <div className="env-action-result">
+              <div className="env-snapshot-head">
+                <strong>执行输出</strong>
+                {running ? (
+                  <Badge status="running" />
+                ) : done ? (
+                  <Badge status={exit === 0 ? 'success' : 'failed'} />
+                ) : status ? (
+                  <Badge status={status} />
+                ) : null}
+                {jobId && <span className="muted small mono">{jobId}</span>}
+              </div>
+              <pre className="env-log">{log || (running ? '等待远端输出…' : '')}</pre>
+            </div>
+          )}
+        </div>
+        <div className="modal-foot">
+          {jobId ? (
+            <button className="btn primary" onClick={close} disabled={running}>
+              {running ? '执行中…' : '关闭'}
+            </button>
+          ) : (
+            <>
+              <button className="btn ghost" onClick={close} disabled={running}>
+                取消
+              </button>
+              <button className={mutation ? 'btn danger' : 'btn primary'} onClick={run} disabled={running || blocked}>
+                {running ? '执行中…' : mutation ? '确认重启' : '执行'}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function EnvironmentsPage({ role }: { role: string }) {
+  const [groups, setGroups] = useState<EnvironmentGroup[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [snapshots, setSnapshots] = useState<Record<string, SnapshotState>>({})
+  const [dialog, setDialog] = useState<{
+    group: EnvironmentGroup
+    project: EnvironmentGroup['projects'][number]
+    action: string
+  } | null>(null)
+  const [audits, setAudits] = useState<Record<string, EnvironmentAction[]>>({})
+
+  const refreshAudit = useCallback(async (host: string) => {
+    try {
+      const r = await API.listEnvironmentActions(host, 5)
+      setAudits((prev) => ({ ...prev, [host]: r.actions || [] }))
+    } catch {
+      /* 审计读取失败不影响主视图 */
+    }
+  }, [])
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const res = await API.listEnvironments()
+      const next = res.environments || []
+      setGroups(next)
+      next.forEach((g) => void refreshAudit(g.host))
+      setError('')
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [refreshAudit])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  // 固定只读快照：先提交 runner job，再轮询日志；不接收任何用户输入命令。
+  const runSnapshot = async (host: string) => {
+    setSnapshots((prev) => ({ ...prev, [host]: { loading: true } }))
+    try {
+      const started = await API.environmentSnapshot(host, role || undefined)
+      const deadline = Date.now() + 90000
+      for (;;) {
+        const st = await API.environmentSnapshotGet(started.job_id)
+        setSnapshots((prev) => ({
+          ...prev,
+          [host]: {
+            loading: !st.done,
+            status: st.status,
+            exit: st.exit,
+            done: st.done,
+            log: st.log,
+            error: st.error,
+          },
+        }))
+        if (st.done) return
+        if (Date.now() > deadline) {
+          setSnapshots((prev) => ({ ...prev, [host]: { ...(prev[host] || {}), loading: false, error: '快照读取超时' } }))
+          return
+        }
+        await new Promise((r) => setTimeout(r, 1500))
+      }
+    } catch (e: any) {
+      setSnapshots((prev) => ({
+        ...prev,
+        [host]: { loading: false, error: e.message || String(e) },
+      }))
+    }
+  }
+
+  const canMutate = role === 'human_admin'
+
+  return (
+    <div className="page">
+      <div className="page-head">
+        <div>
+          <h1>云环境</h1>
+          <p className="muted">按 SSH 主机聚合项目与最近部署；快照只读，日志/历史只读，重启类动作需终审</p>
+        </div>
+        <div className="row">
+          <button className="btn" onClick={load} disabled={loading}>
+            {loading ? '读取中…' : '刷新'}
+          </button>
+        </div>
+      </div>
+
+      {error && <ErrorBox error={error} onRetry={load} />}
+      {loading && groups.length === 0 ? (
+        <Spinner label="正在聚合云环境…" />
+      ) : groups.length === 0 ? (
+        <div className="empty">还没有配置了 ssh_host 的发布目标</div>
+      ) : (
+        <div className="env-list">
+          {groups.map((g) => {
+            const snap = snapshots[g.host]
+            const audit = audits[g.host] || []
+            return (
+              <section className="env-card" key={g.host}>
+                <div className="env-head">
+                  <div className="env-title">
+                    <h2>{g.host}</h2>
+                    <div className="env-sub">
+                      <span className="mono">{g.user ? `${g.user}@` : ''}{g.host}{g.port ? `:${g.port}` : ''}</span>
+                      {g.latest_at && <span className="muted small">最近发布 {fmtTime(g.latest_at)}</span>}
+                    </div>
+                  </div>
+                  <div className="env-actions">
+                    <span className="env-pill test">测试 {g.environments.test || 0}</span>
+                    <span className="env-pill prod">生产 {g.environments.prod || 0}</span>
+                    {(g.environments.other || 0) > 0 && <span className="env-pill">未定义 {g.environments.other}</span>}
+                    <button className="btn ghost" onClick={() => runSnapshot(g.host)} disabled={snap?.loading}>
+                      {snap?.loading ? '读取中…' : '只读快照'}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="env-projects">
+                  <table className="table compact">
+                    <thead>
+                      <tr>
+                        <th>项目</th>
+                        <th>目标</th>
+                        <th>环境</th>
+                        <th>方式</th>
+                        <th>端口</th>
+                        <th>最近发布</th>
+                        <th>操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {g.projects.map((p, idx) => (
+                        <tr key={`${p.id}-${p.target || idx}`}>
+                          <td>
+                            <strong>{p.name || p.id}</strong>
+                            {(p.namespace || p.release) && (
+                              <div className="muted small mono">
+                                {p.namespace || '—'}{p.release ? ` / ${p.release}` : ''}
+                              </div>
+                            )}
+                          </td>
+                          <td className="muted">{p.target || '—'}</td>
+                          <td>
+                            <span className={`env-pill ${p.environment || ''}`}>
+                              {p.environment === 'test' ? '测试' : p.environment === 'prod' ? '生产' : '未定义'}
+                            </span>
+                          </td>
+                          <td className="muted">{METHOD_LABEL[p.method || ''] || p.method || '—'}</td>
+                          <td className="mono muted">{p.port || '—'}{p.container_port ? ` → ${p.container_port}` : ''}</td>
+                          <td>
+                            {p.last_deploy ? (
+                              <div className="env-last">
+                                <span>{fmtTime(p.last_deploy.at)}</span>
+                                <span className="mono muted small" title={p.last_deploy.image_ref}>
+                                  {p.last_deploy.image_ref || '—'}
+                                </span>
+                              </div>
+                            ) : (
+                              <span className="muted">—</span>
+                            )}
+                          </td>
+                          <td>
+                            <div className="env-row-actions">
+                              {p.method === 'helm' && (
+                                <>
+                                  <button
+                                    className="btn ghost tiny"
+                                    onClick={() => setDialog({ group: g, project: p, action: 'helm-history' })}
+                                  >
+                                    历史
+                                  </button>
+                                  <button
+                                    className="btn ghost tiny"
+                                    title={canMutate ? 'rolling restart 该 Helm 工作负载' : '打开弹窗；执行需要终审角色'}
+                                    onClick={() => setDialog({ group: g, project: p, action: 'rollout-restart' })}
+                                  >
+                                    重启
+                                  </button>
+                                </>
+                              )}
+                              {p.method === 'ssh' && p.container && (
+                                <>
+                                  <button
+                                    className="btn ghost tiny"
+                                    onClick={() => setDialog({ group: g, project: p, action: 'docker-logs' })}
+                                  >
+                                    日志
+                                  </button>
+                                  <button
+                                    className="btn ghost tiny"
+                                    title={canMutate ? '重启该 Docker 容器' : '打开弹窗；执行需要终审角色'}
+                                    onClick={() => setDialog({ group: g, project: p, action: 'docker-restart' })}
+                                  >
+                                    重启
+                                  </button>
+                                </>
+                              )}
+                              {!((p.method === 'helm') || (p.method === 'ssh' && p.container)) && (
+                                <span className="muted small">—</span>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                {snap && (snap.loading || snap.log || snap.error) && (
+                  <div className="env-snapshot">
+                    <div className="env-snapshot-head">
+                      <strong>主机快照</strong>
+                      {snap.error ? (
+                        <span className="badge err">{snap.error}</span>
+                      ) : (
+                        <Badge status={snap.done ? (snap.exit === 0 ? 'success' : 'failed') : 'running'} />
+                      )}
+                      {snap.log && <span className="muted small">docker ps · k3s nodes/pods/svc/workloads · Helm 目标附 helm list</span>}
+                    </div>
+                    <pre className="env-log">{snap.log || (snap.error ? '' : '等待远端输出…')}</pre>
+                  </div>
+                )}
+
+                {audit.length > 0 && (
+                  <div className="env-audit">
+                    <strong>最近操作</strong>
+                    {audit.map((a) => (
+                      <div className="env-audit-row" key={a.id}>
+                        <span className="muted small">{fmtTime(a.created_at)}</span>
+                        <span>{ENV_ACTION_LABEL[a.action] || a.action_label || a.action}</span>
+                        <span className="muted small">{a.project_name || a.project_id} · {a.target || '—'}</span>
+                        <span className="muted small">{a.actor || '—'}</span>
+                        <Badge status={a.status} />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )
+          })}
+        </div>
+      )}
+
+      {dialog && (
+        <EnvActionModal
+          group={dialog.group}
+          project={dialog.project}
+          action={dialog.action}
+          role={role}
+          onClose={() => setDialog(null)}
+          onDone={() => void refreshAudit(dialog.group.host)}
+        />
+      )}
+    </div>
+  )
+}
+
+// ---------- Agent / Text2SQL ----------
+
+const AGENT_HISTORY_KEY = 'cicdkit_agent_history'
+
+const AGENT_EXAMPLES = [
+  '每个项目最近一次部署的状态和时间',
+  '最近 20 条失败的运行，分别是什么项目',
+  '最近 7 天有哪些项目部署过',
+  '最近 30 天运行失败最多的 5 个项目',
+  '当前探测异常的服务有哪些',
+  '各部署方式的成功率和数量',
+]
+
+function readAgentHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(AGENT_HISTORY_KEY)
+    const arr = raw ? JSON.parse(raw) : []
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string' && x.trim()).slice(0, 5) : []
+  } catch {
+    return []
+  }
+}
+
+function writeAgentHistory(next: string[]) {
+  try {
+    localStorage.setItem(AGENT_HISTORY_KEY, JSON.stringify(next.slice(0, 5)))
+  } catch {
+    /* 隐私模式忽略 */
+  }
+}
+
+const AGENT_COL_LABEL: Record<string, string> = {
+  project_name: '项目',
+  name: '项目',
+  status: '状态',
+  trigger: '触发',
+  method: '方式',
+  target: '目标',
+  primary_target: '主目标',
+  cluster: '集群',
+  namespace: '命名空间',
+  image_ref: '镜像',
+  created_at: '时间',
+  updated_at: '更新时间',
+  duration_sec: '耗时',
+  stage_summary: '阶段',
+  probe_status: '探测',
+  probe_url: '探测地址',
+  branch: '分支',
+  id: 'ID',
+  project_id: '项目 ID',
+  n: '数量',
+  count: '数量',
+}
+
+function agentCell(v: unknown): string {
+  if (v === null || v === undefined) return '—'
+  if (typeof v === 'object') return JSON.stringify(v)
+  return String(v)
+}
+
+function fmtDurationSec(v: unknown): string {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) return '—'
+  if (n < 60) return `${Math.round(n)} 秒`
+  const m = Math.floor(n / 60)
+  const s = Math.round(n % 60)
+  return s ? `${m} 分 ${s} 秒` : `${m} 分`
+}
+
+function agentValue(col: string, v: unknown) {
+  if (v === null || v === undefined || v === '') return <span className="muted">—</span>
+  if ((col === 'status' || col === 'probe_status') && typeof v === 'string') {
+    return <Badge status={v} />
+  }
+  if (col === 'created_at' || col === 'updated_at') {
+    return <span className="mono small">{fmtTime(String(v))}</span>
+  }
+  if (col === 'duration_sec') return fmtDurationSec(v)
+  const text = agentCell(v)
+  if (text.length > 56) {
+    return (
+      <span className="agent-clip" title={text}>
+        {text}
+      </span>
+    )
+  }
+  return text
+}
+
+function AgentPage({
+  role,
+  llmEnabled,
+  onOpenLLM,
+}: {
+  role: string
+  llmEnabled?: boolean
+  onOpenLLM?: () => void
+}) {
+  const [question, setQuestion] = useState('')
+  const [result, setResult] = useState<AgentResult | null>(null)
+  const [error, setError] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [elapsed, setElapsed] = useState(0)
+  const [showSql, setShowSql] = useState(true)
+  const [copied, setCopied] = useState(false)
+  const [history, setHistory] = useState<string[]>(() => readAgentHistory())
+  const inputRef = useRef<HTMLTextAreaElement | null>(null)
+
+  const ask = async (text?: string) => {
+    const q = (text ?? question).trim()
+    if (!q) return
+    setQuestion(q)
+    setLoading(true)
+    setError('')
+    setCopied(false)
+    const started = performance.now()
+    try {
+      const res = await API.agentQuery(q, role)
+      setResult(res)
+      setElapsed((performance.now() - started) / 1000)
+      setHistory((prev) => {
+        const next = [q, ...prev.filter((x) => x !== q)].slice(0, 5)
+        writeAgentHistory(next)
+        return next
+      })
+    } catch (e: any) {
+      setResult(null)
+      setElapsed(0)
+      setError(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const clear = () => {
+    setQuestion('')
+    setResult(null)
+    setError('')
+    setElapsed(0)
+    setCopied(false)
+    inputRef.current?.focus()
+  }
+
+  const copySql = async () => {
+    if (!result?.sql) return
+    try {
+      await navigator.clipboard.writeText(result.sql)
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1800)
+    } catch {
+      setCopied(false)
+    }
+  }
+
+  const columns = result?.columns?.length
+    ? result.columns
+    : result && result.rows.length > 0
+      ? Object.keys(result.rows[0])
+      : []
+
+  return (
+    <div className="page">
+      <div className="page-head">
+        <div>
+          <h1>Agent · Text2SQL</h1>
+          <p className="muted">
+            用自然语言查项目 / 运行 / 部署。模型只生成一条受限 SELECT，后端校验后执行，不写库、不触发发布
+          </p>
+        </div>
+        <div className="row wrap">
+          {llmEnabled === true ? (
+            <span className="chip">LLM 已就绪</span>
+          ) : llmEnabled === false ? (
+            <span className="chip warn">LLM 未配置</span>
+          ) : (
+            <span className="chip">LLM 检测中</span>
+          )}
+          <span className="chip">只读</span>
+        </div>
+      </div>
+
+      {llmEnabled === false && (
+        <div className="notice warn agent-llm-warn">
+          <div>
+            <strong>LLM 还没启用</strong>
+            <p className="small" style={{ margin: '2px 0 0' }}>
+              查询需要先配置模型接口，否则只能看到校验失败提示。
+            </p>
+          </div>
+          {onOpenLLM && (
+            <button className="btn" onClick={onOpenLLM}>
+              去设置
+            </button>
+          )}
+        </div>
+      )}
+
+      <section className="panel agent-composer">
+        <div className="agent-composer-body">
+          <div className="agent-avatar" aria-hidden="true">
+            AI
+          </div>
+          <div className="agent-composer-main">
+            <textarea
+              ref={inputRef}
+              className="input agent-input"
+              placeholder="例如：最近 7 天有哪些项目部署过？"
+              value={question}
+              onChange={(e) => setQuestion(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                  e.preventDefault()
+                  ask()
+                }
+              }}
+            />
+            <div className="agent-actions">
+              <span className="muted small">⌘/Ctrl + Enter 提交 · 每分钟最多 5 次 · 仅生成 SELECT</span>
+              <div className="row">
+                {(question || result || error) && (
+                  <button className="btn ghost" onClick={clear} disabled={loading}>
+                    清空
+                  </button>
+                )}
+                <button className="btn primary" onClick={() => ask()} disabled={loading || !question.trim()}>
+                  {loading ? (
+                    <>
+                      <span className="spin" /> 生成中…
+                    </>
+                  ) : (
+                    '查询'
+                  )}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="agent-suggest">
+          <div className="agent-suggest-head">
+            <span className="small">示例问题</span>
+            <span className="muted small">点击直接查询</span>
+          </div>
+          <div className="agent-example-grid">
+            {AGENT_EXAMPLES.map((x) => (
+              <button key={x} className="agent-example" onClick={() => ask(x)} disabled={loading}>
+                <span>{x}</span>
+                <span className="agent-example-arrow" aria-hidden="true">
+                  →
+                </span>
+              </button>
+            ))}
+          </div>
+          {history.length > 0 && (
+            <div className="agent-history">
+              <span className="muted small">历史</span>
+              {history.map((x) => (
+                <button key={x} className="chip" onClick={() => ask(x)} disabled={loading} title={x}>
+                  {x.length > 28 ? x.slice(0, 28) + '…' : x}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </section>
+
+      {error && <ErrorBox error={error} onRetry={() => ask()} />}
+
+      {loading && (
+        <section className="panel agent-loading">
+          <div className="agent-loading-head">
+            <span className="spin" />
+            <div>
+              <strong>正在生成 SQL 并执行</strong>
+              <p className="muted small">模型响应可能需要 10–90 秒，请稍候，不需要刷新页面</p>
+            </div>
+          </div>
+          <div className="agent-skeleton" />
+          <div className="agent-skeleton short" />
+          <div className="agent-skeleton" />
+        </section>
+      )}
+
+      {!loading && result && (
+        <section className="panel agent-result">
+          <div className="panel-head">
+            <div className="row">
+              <h2>查询结果</h2>
+              <span className="chip">{result.count} 行</span>
+            </div>
+            <span className="muted small">
+              {elapsed > 0 ? `耗时 ${elapsed.toFixed(1)} 秒 · ` : ''}
+              {result.read_only === false ? '非只读' : '只读'}
+            </span>
+          </div>
+          <div className="agent-result-body">
+            <p className="agent-question-line">
+              <span className="muted">问题</span>
+              {result.question || question}
+            </p>
+            {result.summary ? (
+              <div className="agent-summary">
+                <span className="agent-summary-label">AI 总结</span>
+                <p>{result.summary}</p>
+              </div>
+            ) : result.explain ? (
+              <p className="muted small agent-explain">{result.explain}</p>
+            ) : null}
+
+            <div className="agent-sql">
+              <div className="agent-sql-head">
+                <span className="mono small">GENERATED SQL</span>
+                <div className="row">
+                  <button className="btn ghost tiny" onClick={copySql}>
+                    {copied ? '已复制' : '复制'}
+                  </button>
+                  <button className="btn ghost tiny" onClick={() => setShowSql((v) => !v)}>
+                    {showSql ? '收起' : '展开'}
+                  </button>
+                </div>
+              </div>
+              {showSql && <pre className="mono small">{result.sql}</pre>}
+            </div>
+
+            {result.rows.length === 0 || columns.length === 0 ? (
+              <div className="empty">查询完成，没有匹配的数据</div>
+            ) : (
+              <div className="agent-table-wrap">
+                <table className="table agent-table">
+                  <thead>
+                    <tr>
+                      {columns.map((c) => (
+                        <th key={c}>{AGENT_COL_LABEL[c] || c}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.rows.map((row, i) => (
+                      <tr key={i}>
+                        {columns.map((c) => (
+                          <td key={c} className={c === 'id' || c === 'project_id' ? 'mono small' : ''}>
+                            {agentValue(c, row[c])}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {!result && !error && !loading && (
+        <div className="agent-guard">
+          <div>
+            <strong>只读执行</strong>
+            <span>仅允许三张 agent_* 表的单条 SELECT，禁 JOIN / 子查询 / 写操作。</span>
+          </div>
+          <div>
+            <strong>结果可核对</strong>
+            <span>每次查询都返回生成 SQL，可展开、复制，再自行验证口径。</span>
+          </div>
+          <div>
+            <strong>受控调用</strong>
+            <span>全局每分钟最多 5 次；数据窗口为最近 500 项目 / 300 运行 / 300 部署。</span>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------- 授权判定审计 ----------
+
+function exportAudit(rows: unknown[], prefix: string) {
+  const blob = new Blob([JSON.stringify(rows, null, 2)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `cicdkit-${prefix}-${new Date().toISOString().slice(0, 10)}.json`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function localEpoch(value: string): number | undefined {
+  if (!value) return undefined
+  const ms = new Date(value).getTime()
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined
+}
+
+function AuditPage() {
+  const [kind, setKind] = useState<'access' | 'env'>('access')
+  const [events, setEvents] = useState<AccessEvent[]>([])
+  const [envActions, setEnvActions] = useState<EnvironmentAction[]>([])
+  const [user, setUser] = useState('')
+  const [resource, setResource] = useState('')
+  const [host, setHost] = useState('')
+  const [since, setSince] = useState('')
+  const [until, setUntil] = useState('')
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      const from = localEpoch(since)
+      const to = localEpoch(until)
+      if (from && to && from > to) throw new Error('开始时间不能晚于结束时间')
+      if (kind === 'access') {
+        const res = await API.auditAccess({
+          user: user.trim() || undefined,
+          resource: resource.trim() || undefined,
+          since: from,
+          until: to,
+          limit: 100,
+        })
+        setEvents(res.events || [])
+      } else {
+        const res = await API.listEnvironmentActions(host.trim() || undefined, 100, from, to)
+        setEnvActions(res.actions || [])
+      }
+      setError('')
+    } catch (e: any) {
+      setError(e.message || String(e))
+    } finally {
+      setLoading(false)
+    }
+  }, [kind, user, resource, host, since, until])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  const rows = kind === 'access' ? events : envActions
+  const current = kind === 'access' ? events : envActions
+
+  return (
+    <div className="page">
+      <div className="page-head">
+        <div>
+          <h1>审计</h1>
+          <p className="muted">
+            {kind === 'access'
+              ? '每次资源/动作授权判定都留痕：谁、什么角色、放行还是拒绝'
+              : '云环境受控动作的执行审计：主机、目标、动作和最终状态'}
+          </p>
+        </div>
+        <div className="row">
+          {kind === 'access' ? (
+            <>
+              <input
+                className="input"
+                placeholder="按用户过滤…"
+                value={user}
+                onChange={(e) => setUser(e.target.value)}
+              />
+              <input
+                className="input"
+                placeholder="按资源过滤…"
+                value={resource}
+                onChange={(e) => setResource(e.target.value)}
+              />
+            </>
+          ) : (
+            <input
+              className="input"
+              placeholder="按主机过滤…"
+              value={host}
+              onChange={(e) => setHost(e.target.value)}
+            />
+          )}
+          <button className="btn" onClick={load} disabled={loading}>
+            刷新
+          </button>
+          <button className="btn ghost" onClick={() => exportAudit(rows, kind)} disabled={current.length === 0}>
+            导出
+          </button>
+        </div>
+      </div>
+
+      <div className="row wrap" style={{ marginBottom: 14, justifyContent: 'space-between' }}>
+        <div className="row">
+          <button className={kind === 'access' ? 'btn' : 'btn ghost'} onClick={() => setKind('access')}>
+            授权判定
+          </button>
+          <button className={kind === 'env' ? 'btn' : 'btn ghost'} onClick={() => setKind('env')}>
+            云环境动作
+          </button>
+        </div>
+        <div className="row wrap">
+          <span className="muted small">时间范围</span>
+          <input
+            className="input"
+            type="datetime-local"
+            value={since}
+            onChange={(e) => setSince(e.target.value)}
+            aria-label="开始时间"
+          />
+          <span className="muted small">至</span>
+          <input
+            className="input"
+            type="datetime-local"
+            value={until}
+            onChange={(e) => setUntil(e.target.value)}
+            aria-label="结束时间"
+          />
+          {(since || until) && (
+            <button
+              className="btn ghost"
+              onClick={() => {
+                setSince('')
+                setUntil('')
+              }}
+            >
+              清除时间
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && <ErrorBox error={error} onRetry={load} />}
+
+      {loading && current.length === 0 ? (
+        <Spinner label={kind === 'access' ? '正在读取审计记录…' : '正在读取云环境动作…'} />
+      ) : current.length === 0 ? (
+        <div className="empty">
+          {kind === 'access'
+            ? '还没有授权记录。触发一次写操作或拒绝后，这里会出现。'
+            : '还没有云环境动作。到「云环境」页执行一次 helm-history 或重启后，这里会出现。'}
+        </div>
+      ) : (
+        <>
+          <p className="muted small">最近 {current.length} 条，按时间倒序</p>
+          {kind === 'access' ? (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>用户</th>
+                  <th>角色</th>
+                  <th>资源</th>
+                  <th>动作</th>
+                  <th>判定</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody>
+                {events.map((e, i) => (
+                  <tr key={e.id || `audit-${i}`}>
+                    <td className="muted small">{fmtTime(e.created_at)}</td>
+                    <td>{e.user || '—'}</td>
+                    <td className="muted">{ROLE_LABEL[e.role || ''] || e.role || '—'}</td>
+                    <td className="mono small">{e.resource || '—'}</td>
+                    <td className="mono small">{e.action || '—'}</td>
+                    <td>
+                      <span className={e.allowed ? 'badge ok' : 'badge err'}>
+                        {e.allowed ? '放行' : '拒绝'}
+                      </span>
+                    </td>
+                    <td className="muted small" title={e.reason || ''}>
+                      {e.allowed ? e.label || '—' : e.reason || e.label || '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>主机</th>
+                  <th>项目 / 目标</th>
+                  <th>动作</th>
+                  <th>状态</th>
+                  <th>操作者</th>
+                  <th>job</th>
+                </tr>
+              </thead>
+              <tbody>
+                {envActions.map((e, i) => (
+                  <tr key={e.id || `env-audit-${i}`}>
+                    <td className="muted small">{fmtTime(e.created_at)}</td>
+                    <td className="mono small">{e.host || '—'}</td>
+                    <td className="muted small">
+                      {e.project_name || e.project_id || '—'} / {e.target || '—'}
+                    </td>
+                    <td className="mono small">{e.action_label || e.action || '—'}</td>
+                    <td>
+                      <Badge status={e.status} />
+                    </td>
+                    <td>{e.actor || '—'}</td>
+                    <td className="mono small" title={e.error || ''}>
+                      {e.job_id || '—'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
 // ---------- 知识库 ----------
 
 // 只读列表 + 删除：BFF 透传上游 /api/kb。新增条目只能通过运行页的「采纳」，
 // 所以这里不提供手工新建/编辑，避免前端自己拼一条没有 signature 的记录。
-function KBPage() {
+function KBPage({ role }: { role: string }) {
   const [entries, setEntries] = useState<KBEntry[]>([])
   const [q, setQ] = useState('')
   const [loading, setLoading] = useState(true)
@@ -2022,7 +3333,7 @@ function KBPage() {
     setRemoving(entry.id)
     setNotice('')
     try {
-      await API.removeKb(entry.id)
+      await API.removeKb(entry.id, role)
       setEntries((prev) => prev.filter((e) => e.id !== entry.id))
       setNotice('已删除该知识库条目')
     } catch (e: any) {
@@ -2202,6 +3513,19 @@ function App() {
   }, [meta])
 
   const approvalMode = meta?.approval.mode || 'off'
+  const identityBound = meta?.approval.auth === 'identity'
+  const roleOptions = identityBound ? meta?.approval.roles || [] : Object.keys(ROLE_LABEL)
+
+  // 身份绑定后，顶栏只能选该账号被授予的角色；localStorage 里的旧角色
+  // 如果不在授予列表里，自动落到第一个可用角色。
+  useEffect(() => {
+    if (!identityBound) return
+    // 身份模式不需要角色口令；清掉旧模式可能留下的明文，避免继续跟着 URL 走。
+    setRolePass('')
+    writeRolePass('')
+    if (roleOptions.length === 0) return
+    if (!roleOptions.includes(role)) changeRole(roleOptions[0])
+  }, [identityBound, roleOptions.join(','), role])
 
   return (
     <div className="app">
@@ -2229,25 +3553,32 @@ function App() {
         <div className="row">
           <label className="role">
             <span className="muted small">角色</span>
-            <select className="input small" value={role} onChange={(e) => changeRole(e.target.value)}>
-              {Object.keys(ROLE_LABEL).map((r) => (
+            <select
+              className="input small"
+              value={role}
+              onChange={(e) => changeRole(e.target.value)}
+              title={identityBound ? `Basic Auth 用户 ${meta?.approval.user || ''} 被授予的角色` : ''}
+            >
+              {roleOptions.map((r) => (
                 <option key={r} value={r}>
-                  {ROLE_LABEL[r]}
+                  {ROLE_LABEL[r] || r}
                 </option>
               ))}
             </select>
           </label>
 
-          <label className="role" title="控制面配了 CICD_ROLE_MAP 时，角色由口令反查（?pass=）；没配就留空">
-            <span className="muted small">口令</span>
-            <input
-              className="input small"
-              style={{ width: 104 }}
-              placeholder="可选"
-              value={rolePass}
-              onChange={(e) => changePass(e.target.value)}
-            />
-          </label>
+          {!identityBound && (
+            <label className="role" title="控制面配了 CICD_ROLE_MAP 时，角色由口令反查（?pass=）；没配就留空">
+              <span className="muted small">口令</span>
+              <input
+                className="input small"
+                style={{ width: 104 }}
+                placeholder="可选"
+                value={rolePass}
+                onChange={(e) => changePass(e.target.value)}
+              />
+            </label>
+          )}
 
           <span className={approvalMode === 'off' ? 'chip' : 'chip warn'} title="发布审批闸门（CICD_DEPLOY_APPROVAL）">
             闸门 {approvalMode}
@@ -2255,6 +3586,14 @@ function App() {
           {meta?.approval.auth === 'role-map' && (
             <span className="chip" title="CICD_ROLE_MAP 已启用：角色只能由口令反查">
               口令绑定
+            </span>
+          )}
+          {identityBound && (
+            <span
+              className={meta?.approval.identity_ok ? 'chip' : 'chip warn'}
+              title={meta?.approval.identity_reason || '角色来自 Basic Auth 用户的账号表'}
+            >
+              {meta?.approval.identity_ok ? `身份 ${meta?.approval.user}` : '身份未绑定'}
             </span>
           )}
 
@@ -2282,7 +3621,12 @@ function App() {
         {route === 'projects' && <ProjectsPage role={role} />}
         {route === 'runs' && <RunsPage role={role} />}
         {route === 'deployments' && <DeploymentsPage role={role} />}
-        {route === 'kb' && <KBPage />}
+        {route === 'environments' && <EnvironmentsPage role={role} />}
+        {route === 'agent' && (
+          <AgentPage role={role} llmEnabled={meta?.llm?.enabled} onOpenLLM={() => setShowLLM(true)} />
+        )}
+        {route === 'kb' && <KBPage role={role} />}
+        {route === 'audit' && <AuditPage />}
       </main>
 
       {showLLM && (

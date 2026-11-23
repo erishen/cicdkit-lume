@@ -120,7 +120,10 @@ export func start(project, kind, opts) {
     let rd = validate.resolve_deploy(p, get(opts, "target", ""), get(opts, "method", ""));
     if (not get(rd, "ok", false)) { return { ok: false, run_id: "", err: str(get(rd, "err", "发布目标解析失败")) }; }
     target = str(get(rd, "target", ""));
-    let d = exec.deploy_steps(p, get(rd, "spec", {}), image, {});
+    let spec = get(rd, "spec", {});
+    let pp = validate.apply_target_port(spec, target, get(opts, "port", ""));
+    if (not get(pp, "ok", false)) { return { ok: false, run_id: "", err: str(get(pp, "err", "发布端口校验失败")) }; }
+    let d = exec.deploy_steps(p, spec, image, {});
     if (not get(d, "ok", false)) { return { ok: false, run_id: "", err: str(get(d, "err", "发布计划生成失败")) }; }
     let ds = get(d, "steps", []);
     let j = 0;

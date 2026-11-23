@@ -1,0 +1,187 @@
+// src/access.lume — 身份到角色的绑定（kb-abac 的最小落地）
+//
+// 参考 work/knowledge/kb-abac 的两条原则：
+//   1. 身份来自 HTTP 运行时注入的 Basic Auth 用户（req.user），不是 ?role= 自报；
+//   2. 授权默认拒绝：账号表读不到、账号不存在、角色未授予，都 DENY。
+//
+// 这里只做「身份 → 角色集合」这一层，不搬完整的 8 步 ABAC 引擎：
+// 角色门槛仍由 guard.role_allowed / role_any 判定。这样改造面小，
+// 但把「谁都能写 ?role=human_admin」这个口子关掉。
+//
+// 配置：
+//   CICD_ACCOUNTS_ENFORCE=1   开启身份绑定；未开启保持原来的 ?role= 开发模式
+//   CICD_ACCOUNTS_FILE        账号表路径，默认 data/accounts.json
+//
+// 账号表格式（兼容单个 role 和 roles 数组）：
+//   {"accounts":{"cicd":{"roles":["agent_operator","human_admin"],"title":"运维"}}}
+//
+// ?role= 在开启后只能从该账号被授予的角色里选；选了未授予的角色会回落到第一个
+// 已授予角色，而不是提权。审计里应记录 req.user + 实际生效角色。
+
+func accounts_file() {
+  let f = env("CICD_ACCOUNTS_FILE");
+  if (f != null and len(trim(str(f))) > 0) { return trim(str(f)); }
+  return "data/accounts.json";
+}
+
+export func enabled() {
+  let v = env("CICD_ACCOUNTS_ENFORCE");
+  return (v != null and trim(str(v)) == "1");
+}
+
+func load_accounts() {
+  let raw = read_file(accounts_file());
+  if (raw == null) { return null; }
+  let r = try(() => json(raw));
+  if (get(r, "err", null) != null) { return null; }
+  let root = get(r, "ok", null);
+  if (root == null) { return null; }
+  let acc = get(root, "accounts", null);
+  if (acc == null) { return null; }
+  return acc;
+}
+
+func has_role(roles, want) {
+  let i = 0;
+  while (i < len(roles)) {
+    if (str(get(roles, i)) == str(want)) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+func roles_of(rec) {
+  let out = [];
+  let rs = get(rec, "roles", null);
+  if (rs != null) {
+    let i = 0;
+    while (i < len(rs)) {
+      let r = trim(str(get(rs, i, "")));
+      if (len(r) > 0 and not has_role(out, r)) { push(out, r); }
+      i = i + 1;
+    }
+    return out;
+  }
+  let one = trim(str(get(rec, "role", "")));
+  if (len(one) > 0) { push(out, one); }
+  return out;
+}
+
+func requested_role(req) {
+  let qp = get(req, "query_params", null);
+  if (qp == null) { return ""; }
+  return trim(str(get(qp, "role", "")));
+}
+
+// 返回：
+//   enabled=false  → 调用方走旧的 ?role= 模式
+//   enabled=true, ok=false → 身份/账号表问题，调用方必须 DENY
+//   enabled=true, ok=true  → user / roles / role（实际生效角色）
+export func identity(req) {
+  if (not enabled()) {
+    return { enabled: false, ok: false, user: "", roles: [], role: "", requested: "", reason: "" };
+  }
+  let user = get(req, "user", null);
+  if (user == null or len(trim(str(user))) == 0) {
+    return { enabled: true, ok: false, user: "", roles: [], role: "", requested: "",
+      reason: "身份绑定已开启，但请求没有 Basic Auth 用户（req.user 为空）" };
+  }
+  let accounts = load_accounts();
+  if (accounts == null) {
+    return { enabled: true, ok: false, user: str(user), roles: [], role: "", requested: "",
+      reason: "账号表读不到或格式错误：" + accounts_file() + "（按 fail-closed 拒绝）" };
+  }
+  let rec = get(accounts, str(user), null);
+  if (rec == null) {
+    return { enabled: true, ok: false, user: str(user), roles: [], role: "", requested: "",
+      reason: "账号 " + str(user) + " 未在账号表登记" };
+  }
+  let roles = roles_of(rec);
+  if (len(roles) == 0) {
+    return { enabled: true, ok: false, user: str(user), roles: [], role: "", requested: "",
+      reason: "账号 " + str(user) + " 没有授予任何角色" };
+  }
+  let want = requested_role(req);
+  let selected = get(roles, 0, "");
+  if (has_role(roles, want)) { selected = want; }
+  return { enabled: true, ok: true, user: str(user), roles: roles, role: str(selected),
+    requested: want, reason: "" };
+}
+
+// ============ 资源 / 动作授权（kb-abac 资源表的最小版） ============
+
+func resources_file() {
+  let f = env("CICD_ACCESS_RESOURCES_FILE");
+  if (f != null and len(trim(str(f))) > 0) { return trim(str(f)); }
+  return "data/access-resources.json";
+}
+
+func load_resources() {
+  let raw = read_file(resources_file());
+  if (raw == null) { return null; }
+  let r = try(() => json(raw));
+  if (get(r, "err", null) != null) { return null; }
+  let root = get(r, "ok", null);
+  if (root == null) { return null; }
+  let rs = get(root, "resources", null);
+  if (rs == null) { return null; }
+  return rs;
+}
+
+// 角色等级只用于“最低角色”门槛；具体动作能不能做仍由资源表 actions 枚举。
+func role_level(role) {
+  if (role == "human_admin") { return 3; }
+  if (role == "agent_reviewer_second") { return 2; }
+  if (role == "agent_reviewer") { return 2; }
+  if (role == "agent_operator") { return 1; }
+  return 0;
+}
+
+func action_allowed(actions, action) {
+  let i = 0;
+  while (i < len(actions)) {
+    if (str(get(actions, i)) == str(action)) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+// 返回 {enabled, allowed, role, user, reason, resource, action}。
+// enabled=false 表示没开身份绑定，调用方回退旧 guard；enabled=true 时
+// 一律以 allowed 为准，不再二次判断角色。
+export func decide(req, resource, action) {
+  let id = identity(req);
+  if (not get(id, "enabled", false)) {
+    return { enabled: false, allowed: false, role: "", user: "", reason: "",
+      resource: str(resource), action: str(action) };
+  }
+  if (not get(id, "ok", false)) {
+    return { enabled: true, allowed: false, role: "", user: str(get(id, "user", "")),
+      reason: str(get(id, "reason", "身份校验失败")), resource: str(resource), action: str(action) };
+  }
+  let role = str(get(id, "role", ""));
+  let rs = load_resources();
+  if (rs == null) {
+    return { enabled: true, allowed: false, role: role, user: str(get(id, "user", "")),
+      reason: "资源表读不到或格式错误：" + resources_file() + "（按 fail-closed 拒绝）",
+      resource: str(resource), action: str(action) };
+  }
+  let meta = get(rs, str(resource), null);
+  if (meta == null) {
+    return { enabled: true, allowed: false, role: role, user: str(get(id, "user", "")),
+      reason: "资源 " + str(resource) + " 未在资源表登记", resource: str(resource), action: str(action) };
+  }
+  let acts = get(meta, "actions", []);
+  if (not action_allowed(acts, action)) {
+    return { enabled: true, allowed: false, role: role, user: str(get(id, "user", "")),
+      reason: "资源 " + str(resource) + " 不允许动作 " + str(action), resource: str(resource), action: str(action) };
+  }
+  let min_role = trim(str(get(meta, "min_role", "")));
+  if (len(min_role) > 0 and role_level(role) < role_level(min_role)) {
+    return { enabled: true, allowed: false, role: role, user: str(get(id, "user", "")),
+      reason: "资源 " + str(resource) + " 需要 " + min_role + "，当前是 " + role,
+      resource: str(resource), action: str(action) };
+  }
+  return { enabled: true, allowed: true, role: role, user: str(get(id, "user", "")),
+    reason: "", resource: str(resource), action: str(action) };
+}

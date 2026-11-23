@@ -26,6 +26,7 @@ export interface Project {
   }
   deploy?: {
     method?: string
+    environment?: string
     namespace?: string
     deployment?: string
     container?: string
@@ -51,7 +52,18 @@ export interface Project {
     ssh_transfer?: boolean
     ssh_build_platforms?: string[]
   }
-  targets?: Array<{ name: string; method?: string }>
+  targets?: Array<{
+    name: string
+    method?: string
+    environment?: string
+    ssh_host?: string
+    ssh_user?: string
+    ssh_port?: string
+    ssh_probe_port?: string
+    ssh_container_port?: string
+    namespace?: string
+    release_name?: string
+  }>
   primary_target?: string
   probe?: { enabled?: boolean; url?: string }
   created_at?: string
@@ -94,6 +106,56 @@ export interface Deployment {
   status?: string
   created_at?: string
   run_id?: string
+}
+
+export interface EnvironmentProjectRow {
+  id: string
+  name: string
+  target?: string
+  method?: string
+  environment?: string
+  port?: string
+  container_port?: string
+  container?: string
+  namespace?: string
+  release?: string
+  last_deploy?: LastDeploy | null
+  last_status?: string
+}
+
+export interface EnvironmentGroup {
+  host: string
+  user?: string
+  port?: string
+  environments: Record<string, number>
+  projects: EnvironmentProjectRow[]
+  latest_at?: string
+}
+
+export interface EnvironmentSnapshot {
+  ok: boolean
+  job_id: string
+  status: string
+  exit: number
+  done: boolean
+  log: string
+  log_len: number
+  error?: string
+}
+
+export interface EnvironmentAction {
+  id: string
+  host: string
+  project_id: string
+  project_name?: string
+  target?: string
+  action: string
+  action_label?: string
+  status: string
+  actor?: string
+  job_id?: string
+  created_at?: string
+  error?: string
 }
 
 export interface RunLog {
@@ -139,10 +201,33 @@ export interface LLMStatus {
   model?: string
 }
 
+export interface AccessEvent {
+  id: string
+  ts?: number
+  created_at?: string
+  user?: string
+  role?: string
+  resource?: string
+  action?: string
+  label?: string
+  allowed?: boolean
+  reason?: string
+  auth?: string
+}
+
 export interface Meta {
   service: string
   upstream: string
-  approval: { mode: string; chain: string[]; roles: string[]; auth?: string; default_role?: string }
+  approval: {
+    mode: string
+    chain: string[]
+    roles: string[]
+    auth?: string
+    default_role?: string
+    user?: string
+    identity_ok?: boolean
+    identity_reason?: string
+  }
   llm?: LLMStatus
 }
 
@@ -178,6 +263,20 @@ export interface Diagnosis {
   adopted?: boolean
   rejected?: boolean
   similar?: KBEntry[]
+}
+
+// Agent / Text2SQL：模型只生成一条受限 SELECT，后端校验后执行。
+export interface AgentResult {
+  ok: boolean
+  question: string
+  sql: string
+  explain?: string
+  summary?: string
+  columns: string[]
+  rows: Array<Record<string, unknown>>
+  count: number
+  read_only?: boolean
+  error?: string
 }
 
 export interface FsEntry {
@@ -247,12 +346,21 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 const ROLE_PASS_KEY = 'cicdkit_lume_role_pass'
+const ROLE_PASS_SESSION_KEY = 'cicdkit_lume_role_pass_session'
 
 // 控制面配了 CICD_ROLE_MAP 时，角色只能由口令反查，?role= 自报不再作数。
-// 口令存在 localStorage，只在 query 里带 pass=（Lume 请求对象读不到请求头）。
+// 口令只放 sessionStorage，不落持久存储；旧版本写在 localStorage 的值会迁移
+// 到当前标签页并立刻删掉，避免关闭浏览器后仍留明文。
 export function readRolePass(): string {
   try {
-    return localStorage.getItem(ROLE_PASS_KEY) || ''
+    const current = sessionStorage.getItem(ROLE_PASS_SESSION_KEY) || ''
+    if (current) return current
+    const legacy = localStorage.getItem(ROLE_PASS_KEY) || ''
+    if (legacy) {
+      sessionStorage.setItem(ROLE_PASS_SESSION_KEY, legacy)
+      localStorage.removeItem(ROLE_PASS_KEY)
+    }
+    return legacy
   } catch {
     return ''
   }
@@ -260,8 +368,9 @@ export function readRolePass(): string {
 
 export function writeRolePass(pass: string) {
   try {
-    if (pass) localStorage.setItem(ROLE_PASS_KEY, pass)
-    else localStorage.removeItem(ROLE_PASS_KEY)
+    localStorage.removeItem(ROLE_PASS_KEY)
+    if (pass) sessionStorage.setItem(ROLE_PASS_SESSION_KEY, pass)
+    else sessionStorage.removeItem(ROLE_PASS_SESSION_KEY)
   } catch {
     /* 隐私模式忽略 */
   }
@@ -284,6 +393,15 @@ export const API = {
   health: () => request<Health>('/api/health'),
   meta: () => request<Meta>('/api/meta'),
   overview: () => request<Overview>('/api/overview'),
+  auditAccess: (opts: { user?: string; resource?: string; since?: number; until?: number; limit?: number } = {}) => {
+    const p = new URLSearchParams()
+    if (opts.user) p.set('user', opts.user)
+    if (opts.resource) p.set('resource', opts.resource)
+    if (opts.since) p.set('since', String(opts.since))
+    if (opts.until) p.set('until', String(opts.until))
+    p.set('limit', String(opts.limit || 100))
+    return request<{ events: AccessEvent[] }>(`/api/audit/access?${p.toString()}`)
+  },
 
   listProjects: (q?: string) =>
     request<ProjectPage>(`/api/projects?limit=200${q ? `&q=${encodeURIComponent(q)}` : ''}`),
@@ -434,18 +552,26 @@ export const API = {
       method: 'POST',
       body: '{}',
     }),
+
+  // ---- Agent / Text2SQL（只读）----
+  // 自然语言 → 受限 SELECT → 只查 agent_projects / agent_runs / agent_deployments。
+  agentQuery: (question: string, role?: string) =>
+    request<AgentResult>(`/api/agent/query${roleQuery(role)}`, {
+      method: 'POST',
+      body: JSON.stringify({ question }),
+    }),
   // 采纳会把结论写入上游知识库；重复诊断时可直接复用。
-  adoptDiagnosis: (id: string, adopt: boolean) =>
+  adoptDiagnosis: (id: string, adopt: boolean, role?: string) =>
     request<{ adopted?: boolean; rejected?: boolean; kb_id?: string }>(
-      `/api/runs/${encodeURIComponent(id)}/diagnosis/adopt`,
+      `/api/runs/${encodeURIComponent(id)}/diagnosis/adopt${roleQuery(role)}`,
       { method: 'POST', body: JSON.stringify({ adopt }) },
     ),
 
   // ---- 知识库：只读列表 + 删除（新增只能通过诊断「采纳」）----
   listKb: (q?: string) =>
     request<{ entries: KBEntry[] }>(`/api/kb${q ? `?q=${encodeURIComponent(q)}` : ''}`),
-  removeKb: (id: string) =>
-    request<{ deleted: string }>(`/api/kb/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  removeKb: (id: string, role?: string) =>
+    request<{ deleted: string }>(`/api/kb/${encodeURIComponent(id)}${roleQuery(role)}`, { method: 'DELETE' }),
 
   // ---- 服务器目录浏览（编辑 build.context，需 human_admin）----
   fsRoots: (role?: string) => request<{ roots: string[] }>(`/api/fs/roots${roleQuery(role)}`),
@@ -469,6 +595,50 @@ export const API = {
     if (opts.project_id) p.set('project_id', opts.project_id)
     p.set('limit', String(opts.limit || 100))
     return request<DeploymentPage>(`/api/deployments?${p.toString()}`)
+  },
+
+  // 云环境：按 ssh_host 聚合项目/target/最近部署（只读，不写 runs 表）
+  listEnvironments: () =>
+    request<{ ok: boolean; environments: EnvironmentGroup[] }>('/api/environments'),
+
+  // 固定只读快照：docker ps + k3s nodes/pods/svc/workloads，不接受自由命令
+  environmentSnapshot: (host: string, role?: string) =>
+    request<{ ok: boolean; job_id: string; host: string; project_id: string; target: string }>(
+      `/api/environments/${encodeURIComponent(host)}/snapshot${roleQuery(role)}`,
+      { method: 'POST' },
+    ),
+
+  environmentSnapshotGet: (jobId: string) =>
+    request<EnvironmentSnapshot>(
+      `/api/environments/snapshot/${encodeURIComponent(jobId)}`,
+    ),
+
+  // 受控动作：action = helm-history | rollout-restart | docker-logs | docker-restart
+  environmentAction: (
+    host: string,
+    body: { project_id: string; target: string; action: string },
+    role?: string,
+  ) =>
+    request<{
+      ok: boolean
+      job_id: string
+      host: string
+      project_id: string
+      target: string
+      action: string
+      audit_id: string
+    }>(`/api/environments/${encodeURIComponent(host)}/actions${roleQuery(role)}`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+
+  listEnvironmentActions: (host?: string, limit = 20, since?: number, until?: number) => {
+    const p = new URLSearchParams()
+    if (host) p.set('host', host)
+    if (since) p.set('since', String(since))
+    if (until) p.set('until', String(until))
+    p.set('limit', String(limit))
+    return request<{ actions: EnvironmentAction[] }>(`/api/environments/actions?${p.toString()}`)
   },
 }
 

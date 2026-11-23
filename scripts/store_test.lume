@@ -233,6 +233,81 @@ ok("GitHub token 打码", len(str_match("ghp_abcdefghijklmnop", leaky)) == 0);
 ok("AWS key 打码", len(str_match("AKIAABCDEFGHIJKLMNOP", leaky)) == 0);
 ok("Slack token 打码", len(str_match("xoxb-123456789012", leaky)) == 0);
 
+// ---- 云环境动作审计 ----
+print("store: env actions");
+store.put_env_action({ host: "1.2.3.4", project_id: "p1", target: "t1", action: "helm-history",
+  status: "submitted", actor: "human_admin", job_id: "job-1" });
+store.put_env_action({ host: "5.6.7.8", project_id: "p2", target: "t2", action: "docker-logs",
+  status: "submitted", actor: "agent_operator", job_id: "job-2" });
+let ea = store.list_env_actions("1.2.3.4", 0, 0, 10);
+let eas = get(ea, "actions", []);
+ok("审计按 host 过滤", len(eas) == 1);
+ok("审计按时间下界过滤", len(get(store.list_env_actions("1.2.3.4", 1, 0, 10), "actions", [])) == 1);
+ok("审计按时间上界过滤", len(get(store.list_env_actions("1.2.3.4", 0, 1, 10), "actions", [])) == 0);
+let first = get(eas, 0, {});
+ok("审计保留动作与 job", str(get(first, "action", "")) == "helm-history"
+  and str(get(first, "job_id", "")) == "job-1");
+ok("审计全局列表", len(get(store.list_env_actions("", 0, 0, 10), "actions", [])) >= 2);
+let fin = store.finish_env_action("job-1", "success", 0);
+ok("审计回写成功", get(fin, "ok", false) and not get(fin, "unchanged", false));
+let ea2 = get(get(store.list_env_actions("1.2.3.4", 0, 0, 10), "actions", []), 0, {});
+ok("审计状态变成功", str(get(ea2, "status", "")) == "success" and int(get(ea2, "exit", -1)) == 0);
+let fin2 = store.finish_env_action("job-1", "failed", 1);
+ok("终态不覆盖", get(fin2, "ok", false) and get(fin2, "unchanged", false)
+  and str(get(get(get(store.list_env_actions("1.2.3.4", 0, 0, 10), "actions", []), 0, {}), "status", "")) == "success");
+
+// ---- 授权判定审计 ----
+print("store: access events");
+store.put_access_event({ user: "audit-a", role: "agent_operator", resource: "project-admin",
+  action: "update", label: "修改项目配置", allowed: false, reason: "需要 human_admin", auth: "identity" });
+store.put_access_event({ user: "audit-b", role: "human_admin", resource: "project-admin",
+  action: "update", label: "修改项目配置", allowed: true, reason: "", auth: "identity" });
+let ae = store.list_access_events("audit-a", "", 0, 0, 10);
+let aes = get(ae, "events", []);
+ok("授权审计按 user 过滤", len(aes) == 1);
+ok("授权审计按时间下界过滤", len(get(store.list_access_events("audit-a", "", 1, 0, 10), "events", [])) == 1);
+ok("授权审计按时间上界过滤", len(get(store.list_access_events("audit-a", "", 0, 1, 10), "events", [])) == 0);
+let ev = get(aes, 0, {});
+ok("授权审计保留资源动作", str(get(ev, "resource", "")) == "project-admin"
+  and str(get(ev, "action", "")) == "update");
+ok("授权审计保留拒绝原因", not get(ev, "allowed", true)
+  and len(str(get(ev, "reason", ""))) > 0 and str(get(ev, "auth", "")) == "identity");
+let ae2 = store.list_access_events("", "project-admin", 0, 0, 10);
+ok("授权审计按 resource 过滤", len(get(ae2, "events", [])) >= 2);
+let ap = get(get(store.list_access_events("audit-b", "", 0, 0, 10), "events", []), 0, {});
+ok("授权审计保留放行", get(ap, "allowed", false) and len(str(get(ap, "created_at", ""))) > 0);
+
+// 保留策略：每次写入后裁到 keep 条，测试用 105 条压过 100 的下限。
+print("store: access retention");
+let i = 0;
+while (i < 105) {
+  store.put_access_event({ user: "audit-prune", role: "agent_operator", resource: "test",
+    action: "write", label: "保留策略", allowed: true, reason: "", auth: "identity" });
+  i = i + 1;
+}
+let all = get(store.list_access_events("", "", 0, 0, 500), "events", []);
+ok("审计保留上限生效", len(all) == 100);
+
+// 云环境终态审计同样有上限，但 submitted 不能被裁掉。
+print("store: env retention");
+store.put_env_action({ host: "9.9.9.9", project_id: "p9", target: "t9", action: "docker-logs",
+  status: "submitted", actor: "human_admin", job_id: "job-keep" });
+let k = 0;
+while (k < 105) {
+  store.put_env_action({ host: "9.9.9.9", project_id: "p9", target: "t9", action: "docker-logs",
+    status: "success", actor: "human_admin", job_id: "job-old-" + str(k) });
+  k = k + 1;
+}
+let eall = get(store.list_env_actions("", 0, 0, 500), "actions", []);
+let submitted = 0;
+let x = 0;
+while (x < len(eall)) {
+  if (str(get(eall[x], "status", "")) == "submitted") { submitted = submitted + 1; }
+  x = x + 1;
+}
+ok("环境审计总条数不超过上限", len(eall) <= 100);
+ok("submitted 记录不被裁剪", submitted >= 2);
+
 // ---- 清空 ----
 print("store: clear");
 // 上面的保留策略留下 3 条、恢复回来 1 条，清空必须把它们全删掉。

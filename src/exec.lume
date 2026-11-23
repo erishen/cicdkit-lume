@@ -284,7 +284,7 @@ func kube_args(spec) {
 
 // kubeconfig 解析顺序：项目字段 → KUBECONFIG → CICD_DEFAULT_KUBECONFIG。
 // 三者都空就没戏了：runner 里 kubectl 只会回一句 "no config file"，没人看得懂。
-func resolve_kubeconfig(spec) {
+export func resolve_kubeconfig(spec) {
   let kc = trim(str(get(spec, "kubeconfig", "")));
   if (len(kc) > 0) { return kc; }
   let e = env("KUBECONFIG");
@@ -298,7 +298,14 @@ func kubeconfig_missing(spec) {
   return len(resolve_kubeconfig(spec)) == 0;
 }
 
-func ssh_base_args(spec) {
+export func helm_list_step(spec) {
+  if (trim(str(get(spec, "method", ""))) != "helm") { return []; }
+  let kc = resolve_kubeconfig(spec);
+  if (len(kc) == 0) { return []; }
+  return [{ label: "helm", argv: ["helm", "list", "-A", "--kubeconfig", kc], timeout_s: 30 }];
+}
+
+export func ssh_base_args(spec) {
   let out = [];
   let key = validate.env_or(get(spec, "ssh_key_path", ""), "CICD_SSH_KEY_PATH");
   if (len(key) > 0) { push(out, "-i"); push(out, key); }
@@ -311,10 +318,55 @@ func ssh_base_args(spec) {
   return out;
 }
 
-func ssh_target(spec) {
+export func ssh_target(spec) {
   let host = trim(str(get(spec, "ssh_host", "")));
   let user = validate.env_or(get(spec, "ssh_user", ""), "CICD_SSH_USER");
   return user + "@" + host;
+}
+
+// 测试环境 8080 是「最新部署应用」独占槽位：
+// 先清掉任何正在 publish 8080 的 Docker 容器，再删掉所有以 8080 暴露的 K8s Service
+// （k3s ServiceLB 删除 Service 后会连带释放 svclb 的 hostPort）。
+// 这样 SSH Docker 与 k3s/Helm 互相切换时，不会因为旧占用者导致新发布起不来。
+func docker_slot_cleanup_script(port) {
+  return "for cid in $(docker ps -q --filter \"publish=" + str(port) + "\"); do [ -n \"$cid\" ] && docker rm -f \"$cid\"; done";
+}
+
+export func test_slot_cleanup_script(port) {
+  let p = str(port);
+  let lines = [];
+  push(lines, docker_slot_cleanup_script(p));
+  push(lines, "if command -v k3s >/dev/null 2>&1; then k3s kubectl get svc -A --no-headers 2>/dev/null | awk '$6 ~ /^" + p + ":/ {print $1\" \"$2}' | while read ns name; do [ -n \"$name\" ] && k3s kubectl -n \"$ns\" delete svc \"$name\" --ignore-not-found; done; fi");
+  return join(lines, "\n");
+}
+
+// 云环境只读快照：命令全部写死，不接受任何用户拼接。
+// 输出按 === 分节，前端只负责展示，不解析成可执行动作。
+export func env_snapshot_script() {
+  let lines = [];
+  push(lines, "set +e");
+  push(lines, "echo '===DOCKER==='");
+  push(lines, "if command -v docker >/dev/null 2>&1; then docker ps --format '{{.Names}}\\t{{.Image}}\\t{{.Status}}\\t{{.Ports}}' 2>&1; else echo 'docker 未安装'; fi");
+  push(lines, "echo '===K3S==='");
+  push(lines, "if command -v k3s >/dev/null 2>&1; then");
+  push(lines, "  echo '---NODES---'; k3s kubectl get nodes -o wide 2>&1");
+  push(lines, "  echo '---PODS---'; k3s kubectl get pods -A -o wide 2>&1");
+  push(lines, "  echo '---SERVICES---'; k3s kubectl get svc -A 2>&1");
+  push(lines, "  echo '---WORKLOADS---'; k3s kubectl get deploy,sts -A 2>&1");
+  push(lines, "else echo 'k3s 未安装'; fi");
+  push(lines, "echo '===END==='");
+  return join(lines, "\n") + "\n";
+}
+
+// 受控动作：参数只来自项目配置，调用方不传自由命令。
+export func env_docker_logs_script(container) {
+  let c = str(container);
+  return "docker logs --tail 200 '" + c + "' 2>&1\n";
+}
+
+export func env_docker_restart_script(container) {
+  let c = str(container);
+  return "docker restart '" + c + "' 2>&1\n";
 }
 
 // 远端脚本：先清掉占端口的旧容器，再 docker rm -f 本项目容器，最后 docker run -d。
@@ -338,8 +390,12 @@ func ssh_run_script(p, spec, image, remote_tar, transfer) {
   let run_args = validate.env_or(get(spec, "ssh_run_args", ""), "CICD_SSH_RUN_ARGS");
   run_args = strip_publish(run_args);
 
-  // 端口释放：残留容器（换过名字、手工 docker run 的）会占着宿主端口，新容器就直接失败。
-  push(lines, "for cid in $(docker ps -q --filter \"publish=" + probe_port + "\"); do [ -n \"$cid\" ] && docker rm -f \"$cid\"; done");
+  // 端口释放：Docker 容器总是先让位；测试环境 8080 还要清掉 k3s 上的旧 Service。
+  if (validate.target_env(spec, "") == "test" and probe_port == "8080") {
+    push(lines, test_slot_cleanup_script(probe_port));
+  } else {
+    push(lines, docker_slot_cleanup_script(probe_port));
+  }
   push(lines, "docker rm -f '" + container + "' 2>/dev/null || true");
   let runline = "docker run -d --name '" + container + "' -p " + probe_port + ":" + container_port +
     " --restart unless-stopped";
@@ -442,6 +498,23 @@ export func deploy_steps(p, spec, ref, opts) {
       return { ok: false, steps: [], err: "deploy.release_name 与 deploy.chart_path 为必填 (helm)" };
     }
     if (kubeconfig_missing(spec)) { return { ok: false, steps: [], err: "缺少 kubeconfig（deploy.kubeconfig / KUBECONFIG / CICD_DEFAULT_KUBECONFIG 都为空）" }; }
+
+    // 腾讯云测试环境的 8080 是独占槽位：Helm 部署前先经 SSH 清掉旧 Docker 容器
+    // 和旧 K8s Service，否则上一版（或 SSH Docker 版）还占着 8080，新 Pod 起不来。
+    let env = validate.target_env(spec, "");
+    if (env == "test") {
+      let host = trim(str(get(spec, "ssh_host", "")));
+      let user = validate.env_or(get(spec, "ssh_user", ""), "CICD_SSH_USER");
+      if (len(host) == 0 or len(user) == 0) {
+        return { ok: false, steps: [], err: "测试环境 Helm 目标需要 ssh_host / ssh_user，用于释放 8080 上的旧占用" };
+      }
+      let cleanup = ["ssh"];
+      concat(cleanup, ssh_base_args(spec));
+      push(cleanup, ssh_target(spec));
+      push(cleanup, test_slot_cleanup_script("8080"));
+      push(steps, { label: "release-8080", argv: cleanup, timeout_s: 180 });
+    }
+
     let argv = ["helm"];
     concat(argv, kube_args(spec));
     push(argv, "upgrade");
@@ -449,8 +522,10 @@ export func deploy_steps(p, spec, ref, opts) {
     push(argv, release);
     push(argv, chart);
     let hv = get(spec, "helm_values", null);
-    if (hv != null) {
-      let ks = sort(keys(hv));
+    // 前端把空输入序列化成 ""，不能直接 keys("")；只有真正的 map 才展开 --set。
+    let hv_keys = try(() => keys(hv));
+    if (hv_keys.err == null) {
+      let ks = sort(hv_keys.ok);
       let i = 0;
       while (i < len(ks)) {
         push(argv, "--set");

@@ -275,6 +275,7 @@ export func webhook(id, raw, secret) {
     tag: tag,
     method: method,
     target: tn,
+    port: trim(str(get(body, "port", ""))),
     image_ref: trim(str(get(body, "image_ref", ""))),
   };
   let r = jobs.start(p, "pipeline", opts);
@@ -332,7 +333,12 @@ export func project_action(id, action, raw) {
   }
 
   if (action == "build" or action == "pipeline") {
-    let opts = { trigger: action, image_ref: str(get(body, "image_ref", "")) };
+    let opts = {
+      trigger: action,
+      target: str(get(body, "target", "")),
+      port: str(get(body, "port", "")),
+      image_ref: str(get(body, "image_ref", "")),
+    };
     let r = jobs.start(p, action, opts);
     if (not get(r, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(r, "err", "")) } }; }
     return { status: 200, body: { ok: true, run_id: str(get(r, "run_id", "")), image_ref: str(get(r, "image_ref", "")) } };
@@ -350,6 +356,7 @@ export func project_deploy(id, raw) {
     trigger: "deploy",
     target: str(get(body, "target", "")),
     method: str(get(body, "method", "")),
+    port: trim(str(get(body, "port", ""))),
     image_ref: str(get(body, "image_ref", "")),
   };
   let r = jobs.start(p, "deploy", opts);
@@ -401,6 +408,7 @@ export func project_rollback(id, raw) {
     trigger: "rollback",
     target: rtarget,
     method: "",
+    port: trim(str(get(body, "port", ""))),
     image_ref: str(get(prev, "image_ref", "")),
   });
   if (not get(r, "ok", false)) { return { status: 400, body: { ok: false, error: str(get(r, "err", "")) } }; }
@@ -530,6 +538,350 @@ export func run_clear() {
 
 // ---------- 部署历史 ----------
 
+// ---------- 云环境（只读） ----------
+//
+// 这里只做两件事：
+// 1. 按 ssh_host 把项目/target/最近部署聚合起来，给前端一个「云环境」视图。
+// 2. 对某个已配置的主机跑一条写死的只读快照命令（docker ps + k3s kubectl 查询）。
+// 不接受自由命令，也不通过 Web 暴露交互式 shell。
+
+func env_targets(p) {
+  let ts = get(p, "targets", null);
+  if (ts != null and len(ts) > 0) { return ts; }
+  let d = get(p, "deploy", null);
+  if (d != null) { return [d]; }
+  return [];
+}
+
+func env_bump(g, key) {
+  let m = get(g, "environments", {});
+  put(m, key, int(get(m, key, 0)) + 1);
+  put(g, "environments", m);
+}
+
+func env_last_deploy(p, tname) {
+  let lds = get(p, "last_deploys", null);
+  if (lds != null) {
+    if (len(tname) > 0) { return get(lds, tname, null); }
+    return get(p, "last_deploy", null);
+  }
+  // 没有多目标记录时，才把项目级 last_deploy 当作该目标的最近发布。
+  return get(p, "last_deploy", null);
+}
+
+func env_iso_key(s) {
+  let t = str(s);
+  if (len(t) < 19 or substr(t, 4, 1) != "-" or substr(t, 7, 1) != "-" or substr(t, 10, 1) != "T") {
+    return 0;
+  }
+  return int(substr(t, 0, 4)) * 10000000000 +
+    int(substr(t, 5, 2)) * 100000000 +
+    int(substr(t, 8, 2)) * 1000000 +
+    int(substr(t, 11, 2)) * 10000 +
+    int(substr(t, 14, 2)) * 100 +
+    int(substr(t, 17, 2));
+}
+
+export func environment_list() {
+  let page = store.list_projects("", 1000, 0);
+  let items = get(page, "projects", []);
+  let by_host = {};
+  let order = [];
+  let i = 0;
+  while (i < len(items)) {
+    let p = items[i];
+    let targets = env_targets(p);
+    let j = 0;
+    while (j < len(targets)) {
+      let t = targets[j];
+      let host = trim(str(get(t, "ssh_host", "")));
+      if (len(host) > 0) {
+        let g = get(by_host, host, null);
+        if (g == null) {
+          g = {
+            host: host, user: "", port: "", environments: { test: 0, prod: 0, other: 0 },
+            projects: [], latest_at: "",
+          };
+          put(by_host, host, g);
+          push(order, host);
+        }
+        let user = trim(str(get(t, "ssh_user", "")));
+        if (len(user) > 0 and len(str(get(g, "user", ""))) == 0) { put(g, "user", user); }
+        let port = trim(str(get(t, "ssh_port", "")));
+        if (len(port) > 0 and len(str(get(g, "port", ""))) == 0) { put(g, "port", port); }
+
+        let tname = trim(str(get(t, "name", "")));
+        let env = validate.target_env(t, tname);
+        if (len(env) == 0) { env = "other"; }
+        env_bump(g, env);
+
+        let last = env_last_deploy(p, tname);
+        let last_at = "";
+        if (last != null) { last_at = str(get(last, "at", "")); }
+        if (env_iso_key(last_at) > env_iso_key(str(get(g, "latest_at", "")))) {
+          put(g, "latest_at", last_at);
+        }
+
+        let row = {
+          id: str(get(p, "id", "")),
+          name: str(get(p, "name", "")),
+          target: tname,
+          method: str(get(t, "method", "")),
+          environment: env,
+          port: str(get(t, "ssh_probe_port", "")),
+          container_port: str(get(t, "ssh_container_port", "")),
+          container: str(get(t, "ssh_container", "")),
+          namespace: str(get(t, "namespace", "")),
+          release: str(get(t, "release_name", "")),
+          last_deploy: last,
+          last_status: (last != null ? "success" : ""),
+        };
+        push(get(g, "projects", []), row);
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+
+  let out = [];
+  let k = 0;
+  while (k < len(order)) {
+    let g = get(by_host, get(order, k, ""), null);
+    if (g != null) { push(out, g); }
+    k = k + 1;
+  }
+  return { ok: true, environments: out };
+}
+
+func find_env_target(host) {
+  let want = trim(str(host));
+  let page = store.list_projects("", 1000, 0);
+  let items = get(page, "projects", []);
+  let i = 0;
+  while (i < len(items)) {
+    let p = items[i];
+    let targets = env_targets(p);
+    let j = 0;
+    while (j < len(targets)) {
+      let t = targets[j];
+      if (trim(str(get(t, "ssh_host", ""))) == want) {
+        return { project: p, target: t };
+      }
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return null;
+}
+
+export func environment_snapshot(host) {
+  let h = trim(str(host));
+  if (len(h) == 0) { return { status: 400, body: { ok: false, error: "host 不能为空" } }; }
+  let found = find_env_target(h);
+  if (found == null) {
+    return { status: 404, body: { ok: false, error: "没有项目配置到这个 SSH 主机：" + h } };
+  }
+  let p = get(found, "project", {});
+  let t = get(found, "target", {});
+  let argv = ["ssh"];
+  let base = exec.ssh_base_args(t);
+  let i = 0;
+  while (i < len(base)) { push(argv, get(base, i, "")); i = i + 1; }
+  let target = exec.ssh_target(t);
+  if (len(target) == 0 or substr(target, 0, 1) == "@") {
+    return { status: 400, body: { ok: false, error: "该目标的 ssh_user 为空，且没有配置 CICD_SSH_USER" } };
+  }
+  push(argv, target);
+  push(argv, exec.env_snapshot_script());
+
+  let steps = [{ label: "snapshot", argv: argv, timeout_s: 45 }];
+  // Helm 发布的目标再补一条 runner 侧 helm list：runner 里有 helm，
+  // 并且通过 k3s-tunnel 能访问集群；不依赖宿主机装 helm。
+  let hs = exec.helm_list_step(t);
+  let k = 0;
+  while (k < len(hs)) { push(steps, get(hs, k, {})); k = k + 1; }
+
+  let name = jobs.new_id("env-" + h);
+  let sub = exec.submit(name, steps, 90);
+  if (not get(sub, "ok", false)) {
+    return { status: 502, body: { ok: false, error: str(get(sub, "err", "提交快照任务失败")) } };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true, job_id: str(get(sub, "id", "")), host: h,
+      project_id: str(get(p, "id", "")), target: str(get(t, "name", "")),
+    },
+  };
+}
+
+func find_env_project(host, project_id, target_name) {
+  let h = trim(str(host));
+  let pid = trim(str(project_id));
+  let tn = trim(str(target_name));
+  let p = store.get_project(pid);
+  if (p == null) { return null; }
+  let targets = env_targets(p);
+  let j = 0;
+  while (j < len(targets)) {
+    let t = targets[j];
+    if (trim(str(get(t, "ssh_host", ""))) == h and trim(str(get(t, "name", ""))) == tn) {
+      return { project: p, target: t };
+    }
+    j = j + 1;
+  }
+  return null;
+}
+
+func env_safe_token(s) {
+  let v = trim(str(s));
+  if (len(v) == 0 or len(v) > 128) { return false; }
+  let ok_chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/@";
+  let i = 0;
+  while (i < len(v)) {
+    if (not contains(ok_chars, substr(v, i, 1))) { return false; }
+    i = i + 1;
+  }
+  return true;
+}
+
+// 云环境受控动作：
+// - helm-history / docker-logs 只读
+// - rollout-restart / docker-restart 会改变运行状态，路由层要求 human_admin
+// 所有参数都从项目配置里取；请求只选“对哪个 target 做哪个动作”。
+export func environment_action(host, raw_body, actor) {
+  let h = trim(str(host));
+  let body = parse_body(raw_body);
+  if (body == null) { body = {}; }
+  let pid = trim(str(get(body, "project_id", "")));
+  let tname = trim(str(get(body, "target", "")));
+  let action = trim(str(get(body, "action", "")));
+  if (len(pid) == 0 or len(action) == 0) {
+    return { status: 400, body: { ok: false, error: "project_id 与 action 不能为空" } };
+  }
+  let found = find_env_project(h, pid, tname);
+  if (found == null) {
+    return { status: 404, body: { ok: false, error: "项目 / 目标 / 主机不匹配：" + pid + " / " + tname + " / " + h } };
+  }
+  let p = get(found, "project", {});
+  let t = get(found, "target", {});
+  let method = trim(str(get(t, "method", "")));
+  let cmd_label = "";
+  let steps = [];
+
+  if (action == "helm-history") {
+    if (method != "helm") { return { status: 400, body: { ok: false, error: "仅 Helm 目标支持 helm history" } }; }
+    let release = trim(str(get(t, "release_name", "")));
+    let ns = trim(str(get(t, "namespace", "")));
+    let kc = exec.resolve_kubeconfig(t);
+    if (not env_safe_token(release) or not env_safe_token(ns) or len(kc) == 0) {
+      return { status: 400, body: { ok: false, error: "Helm 目标缺少 release_name / namespace / kubeconfig" } };
+    }
+    let argv = ["helm", "history", release, "--max", "10", "--kubeconfig", kc];
+    if (len(ns) > 0) { push(argv, "-n"); push(argv, ns); }
+    steps = [{ label: "helm-history", argv: argv, timeout_s: 30 }];
+    cmd_label = "helm history";
+  } else if (action == "rollout-restart") {
+    if (method != "helm") { return { status: 400, body: { ok: false, error: "仅 Helm 目标支持 rollout restart" } }; }
+    let dep = trim(str(get(t, "deployment", "")));
+    if (len(dep) == 0) { dep = trim(str(get(t, "release_name", ""))); }
+    let ns = trim(str(get(t, "namespace", "")));
+    let kc = exec.resolve_kubeconfig(t);
+    if (not env_safe_token(dep) or not env_safe_token(ns) or len(kc) == 0) {
+      return { status: 400, body: { ok: false, error: "Helm 目标缺少 deployment / namespace / kubeconfig" } };
+    }
+    let argv = ["kubectl", "rollout", "restart", "deployment/" + dep, "--kubeconfig", kc];
+    if (len(ns) > 0) { push(argv, "-n"); push(argv, ns); }
+    steps = [{ label: "rollout-restart", argv: argv, timeout_s: 90 }];
+    cmd_label = "rollout restart";
+  } else if (action == "docker-logs" or action == "docker-restart") {
+    if (method != "ssh") { return { status: 400, body: { ok: false, error: "仅 SSH Docker 目标支持容器操作" } }; }
+    let c = trim(str(get(t, "ssh_container", "")));
+    if (not env_safe_token(c)) {
+      return { status: 400, body: { ok: false, error: "该目标没有配置合法的 ssh_container" } };
+    }
+    let argv = ["ssh"];
+    let base = exec.ssh_base_args(t);
+    let i = 0;
+    while (i < len(base)) { push(argv, get(base, i, "")); i = i + 1; }
+    let ssh_to = exec.ssh_target(t);
+    if (len(ssh_to) == 0 or substr(ssh_to, 0, 1) == "@") {
+      return { status: 400, body: { ok: false, error: "该目标的 ssh_user 为空，且没有配置 CICD_SSH_USER" } };
+    }
+    push(argv, ssh_to);
+    if (action == "docker-logs") {
+      push(argv, exec.env_docker_logs_script(c));
+      cmd_label = "docker logs";
+    } else {
+      push(argv, exec.env_docker_restart_script(c));
+      cmd_label = "docker restart";
+    }
+    steps = [{ label: action, argv: argv, timeout_s: 60 }];
+  } else {
+    return { status: 400, body: { ok: false, error: "不支持的动作：" + action } };
+  }
+
+  let name = jobs.new_id("act-" + h);
+  let sub = exec.submit(name, steps, 120);
+  let ok = bool(get(sub, "ok", false));
+  let jid = str(get(sub, "id", ""));
+  // 审计先落库：失败也要留“谁尝试过这个动作”，不是只留成功。
+  let audit = store.put_env_action({
+    host: h, project_id: pid, project_name: str(get(p, "name", "")),
+    target: tname, action: action, action_label: cmd_label,
+    status: (ok ? "submitted" : "submit_failed"), actor: str(actor),
+    job_id: jid, error: str(get(sub, "err", "")),
+  });
+  if (not ok) {
+    return { status: 502, body: { ok: false, error: str(get(sub, "err", "提交动作失败")), audit_id: str(get(audit, "id", "")) } };
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true, job_id: jid, host: h, project_id: pid, target: tname,
+      action: action, audit_id: str(get(audit, "id", "")),
+    },
+  };
+}
+
+export func environment_actions(host, since, until, limit) {
+  return store.list_env_actions(host, since, until, limit);
+}
+
+export func environment_snapshot_get(job_id) {
+  let jid = trim(str(job_id));
+  if (len(jid) == 0) { return { status: 400, body: { ok: false, error: "job_id 不能为空" } }; }
+  let st = exec.status(jid);
+  if (get(st, "missing", true)) {
+    return { status: 404, body: { ok: false, error: "任务不存在或 runner 已重启，无法读取输出" } };
+  }
+  if (not get(st, "ok", false)) {
+    return { status: 502, body: { ok: false, error: str(get(st, "err", "runner 不可达")) } };
+  }
+  let job = get(st, "job", {});
+  let js = str(get(job, "status", ""));
+  let g = exec.log_range(jid, 0, 262144);
+  let log = "";
+  if (get(g, "ok", false)) { log = str(get(g, "log", "")); }
+  let done = (js == "done" or js == "failed" or js == "canceled" or js == "error");
+  let ex = int(get(job, "exit", -1));
+  if (done) {
+    // 审计行的 status 是提交态；这里回写 runner 终态，避免页面一直显示“已提交”。
+    let fin = "failed";
+    if (js == "done" and ex == 0) { fin = "success"; }
+    if (js == "canceled") { fin = "canceled"; }
+    store.finish_env_action(jid, fin, ex);
+  }
+  return {
+    status: 200,
+    body: {
+      ok: true, job_id: jid, status: js, exit: ex,
+      done: done, log: log, log_len: int(get(g, "log_len", 0)),
+      error: str(get(job, "error", "")),
+    },
+  };
+}
+
 export func deployment_list(project_id, limit, offset) {
   let page = store.list_deployments(project_id, limit, offset);
   return { deployments: get(page, "deployments", []), total: int(get(page, "total", 0)) };
@@ -604,8 +956,9 @@ export func ssh_defaults() {
     container: env_str("CICD_SSH_CONTAINER"),
     container_port: env_str("CICD_SSH_CONTAINER_PORT"),
     probe_port: env_str("CICD_SSH_PROBE_PORT"),
-    run_args: env_str("CICD_SSH_RUN_ARGS"),
-    command: env_str("CICD_SSH_COMMAND"),
+    // 这里可能含 -e XXX_VISIT_PIN=... 之类真值；接口只给脱敏后的形态。
+    run_args: redact.mask_log(env_str("CICD_SSH_RUN_ARGS")),
+    command: redact.mask_log(env_str("CICD_SSH_COMMAND")),
   };
 }
 
@@ -830,7 +1183,7 @@ func chat_url(cfg) {
   return base + "/v1/chat/completions";
 }
 
-func chat(cfg, sys_prompt, user_prompt, secs) {
+func chat(cfg, sys_prompt, user_prompt, secs, max_tokens) {
   let key = s(get(cfg, "api_key", ""), "");
   if (len(key) == 0) { return { ok: false, status: 0, text: "", err: "未配置 api_key" }; }
   let hdrs = { "Content-Type": "application/json", "Authorization": "Bearer " + key };
@@ -841,6 +1194,7 @@ func chat(cfg, sys_prompt, user_prompt, secs) {
     messages: msgs,
     temperature: 0.2,
   };
+  if (max_tokens > 0) { put(payload, "max_tokens", max_tokens); }
   let o = { headers: hdrs, timeout: secs, max_bytes: 4194304, body: stringify(payload), allow_private: true };
   let r = null;
   let re = try(() => http_post(chat_url(cfg), o));
@@ -868,6 +1222,16 @@ func chat(cfg, sys_prompt, user_prompt, secs) {
   return { ok: true, status: code, text: str(get(msg, "content", "")), err: "" };
 }
 
+// 供 Text2SQL / Agent 页复用同一份 LLM 配置与 HTTP 调用路径。
+// 只读查询同样要受 enabled 控制，避免「诊断没开、Agent 却在偷偷调模型」。
+export func llm_chat(sys_prompt, user_prompt, secs, max_tokens) {
+  let cfg = llm_raw();
+  if (not bool(get(cfg, "enabled", false))) {
+    return { ok: false, status: 0, text: "", err: "LLM 未启用，请先到设置页配置并启用" };
+  }
+  return chat(cfg, sys_prompt, user_prompt, secs, max_tokens);
+}
+
 export func llm_test(raw) {
   let body = parse_body(raw);
   if (body == null) { body = {}; }
@@ -881,7 +1245,7 @@ export func llm_test(raw) {
   if (len(m) > 0) { put(cfg, "model", m); }
   // 60s：网关对部分模型的排队/冷启动会超过 30s，30s 时客户端先超时，
   // 只能看到一个没有意义的 HTTP 0（上游其实已经 200 了）。
-  let r = chat(cfg, "", "回复两个字：可用", 60);
+  let r = chat(cfg, "", "回复两个字：可用", 60, 0);
   if (not get(r, "ok", false)) { return { status: 200, body: { ok: false, error: str(get(r, "err", "")) } }; }
   return { status: 200, body: { ok: true, reply: str(get(r, "text", "")) } };
 }
@@ -961,7 +1325,7 @@ export func run_diagnose(id) {
   }
   let user_prompt = "项目：" + str(get(r, "project_name", proj)) + "\n阶段：" + stage + "\n镜像：" + str(get(r, "image_ref", "")) + "\n状态：" + str(get(r, "status", "")) + "\n\n构建/发布日志（已截断）：\n" + log + "\n\n请用中文回答：最可能的根因是什么？给出 1-3 条可执行的修复步骤。不要泛泛而谈。";
   let sys = s(get(cfg, "system", ""), "你是一名资深 CI/CD 与容器运维工程师，回答要短、具体、可执行。");
-  let c = chat(cfg, sys, user_prompt, 150);
+  let c = chat(cfg, sys, user_prompt, 150, 0);
   if (not get(c, "ok", false)) {
     return { status: 502, body: { ok: false, error: "模型调用失败：" + str(get(c, "err", "")) } };
   }

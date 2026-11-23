@@ -55,6 +55,14 @@ services:
       CICD_ARCHIVE_KEEP: ${CICD_ARCHIVE_KEEP:-}
       # Basic Auth：凭据由 `make auth` 生成在 ~/.config/cicdkit-lume，不进仓库。
       HTPASSWD_FILE: /auth/htpasswd
+      # 身份绑定（参考 kb-abac）：Basic Auth 用户 → 账号表角色；读不到即 fail-closed。
+      CICD_ACCOUNTS_FILE: /auth/accounts.json
+      CICD_ACCOUNTS_ENFORCE: ${CICD_ACCOUNTS_ENFORCE:-1}
+      # 资源/动作白名单：云环境快照、只读动作、重启动作分别登记。
+      CICD_ACCESS_RESOURCES_FILE: /auth/resources.json
+      CICD_AUDIT_KEEP: ${CICD_AUDIT_KEEP:-5000}
+      CICD_ENV_AUDIT_KEEP: ${CICD_ENV_AUDIT_KEEP:-5000}
+      CICD_A2A_TASK_KEEP: ${CICD_A2A_TASK_KEEP:-1000}
       # 顶栏默认角色；单人用 cicd 账号时设为 human_admin，省去每次手切。
       CICD_DEFAULT_ROLE: ${CICD_DEFAULT_ROLE:-agent_operator}
     volumes:
@@ -65,9 +73,8 @@ services:
       - ${PROJECTS_ROOT:?}:${PROJECTS_ROOT:?}
       # 历史凭据（kubeconfig、ssh key）也按宿主原路径挂，配置里存的就是这个路径。
       - ${LEGACY_DATA:-./.data/legacy}:${LEGACY_DATA:-/legacy}:ro
-      # 只读挂两份凭据：htpasswd 给 Lume，health-header 给容器健康检查。
-      - ${HOME}/.config/cicdkit-lume/htpasswd:/auth/htpasswd:ro
-      - ${HOME}/.config/cicdkit-lume/health-header:/auth/health-header:ro
+      # 整个 auth 目录只读挂载：htpasswd、health-header、accounts.json 都在这里。
+      - ${HOME}/.config/cicdkit-lume:/auth:ro
     # 开了 Basic Auth 后 /api/health 也要认证，健康检查必须带同一份凭据；
     # 这里覆盖 Dockerfile 里的匿名探针，否则容器会一直 unhealthy。
     healthcheck:
@@ -111,6 +118,35 @@ services:
       - ${PROJECTS_ROOT:?}:${PROJECTS_ROOT:?}
       # SSH 私钥 / kubeconfig：项目配置里写的是宿主绝对路径，原路径挂进来才认。
       - ${LEGACY_DATA:-./.data/legacy}:${LEGACY_DATA:-/legacy}:ro
+    restart: unless-stopped
+
+  # 腾讯云安全组只开 8080 和 SSH，k3s API 6443 不对外。这里用 SSH 隧道把
+  # 远端 6443 映到 compose 内网的 k3s-tunnel:16443，runner 里的 helm/kubectl
+  # 就能用同一份 kubeconfig 访问；kubeconfig 里 server 写 k3s-tunnel:16443，
+  # 并加 tls-server-name: 127.0.0.1 过 k3s 证书校验。
+  k3s-tunnel:
+    image: cicdkit-runner:dev
+    container_name: cicdkit-k3s-tunnel
+    entrypoint:
+      - ssh
+      - -N
+      - -o
+      - ExitOnForwardFailure=yes
+      - -o
+      - BatchMode=yes
+      - -o
+      - StrictHostKeyChecking=accept-new
+      - -i
+      - ${TENCENT_K3S_SSH_KEY:-/legacy/ssh_tencent_key}
+      - -L
+      - 0.0.0.0:16443:127.0.0.1:6443
+      - ${TENCENT_K3S_SSH_HOST:-root@your-k3s-host}
+    volumes:
+      - ${LEGACY_DATA:-./.data/legacy}:/legacy:ro
+    # 这个容器只跑 ssh -N 端口转发，不提供 runner 的 8899 健康检查；
+    # 复用 cicdkit-runner 镜像时会被镜像里的 healthcheck 判成 unhealthy。
+    healthcheck:
+      disable: true
     restart: unless-stopped
 
 networks:

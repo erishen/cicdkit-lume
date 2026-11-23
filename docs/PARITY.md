@@ -56,8 +56,12 @@ HTTP 面逐条摊开对齐的结果：**能对齐的都对齐了**，剩下的�
 
 3. **身份边界换成 `HTPASSWD_FILE` + 角色口令。** 上游用 `X-API-Token` /
    `Authorization: Bearer` 做常量时间比较；Lume 的请求对象读不到请求头，所以
-   本仓用 Basic Auth 做真身份、用 `CICD_ROLE_MAP` + `?pass=` 做角色绑定。
-   `?role=` 单独出现只是流程门禁，不是认证。
+   本仓用 Basic Auth 做真身份，并用 `CICD_ACCOUNTS_FILE` + `CICD_ACCOUNTS_ENFORCE` 把用户绑定到角色
+   （参考 kb-abac 的身份/授权分离）。`?role=` 只能在该账号被授予的角色里选，不再自报提权；
+   `CICD_ACCESS_RESOURCES_FILE` 再把每个入口写成 `资源 → 动作 + min_role`，路由不再写死角色。
+   资源表读不到或条目缺失按 fail-closed 拒绝；只读数据接口（项目/运行/部署/知识库/
+   LLM 配置/云环境/审计）也在身份模式下接入 `*-read` 资源，旧 `?role=` 模式仍保持
+   Basic Auth 登录可读。`CICD_ROLE_MAP` 仅保留为旧部署兼容路径。
 
 4. **`GET /a2a` 回 405，不是 302。** 上游 302 到 `/`；Lume 的路由信封发不出
    `Location` 头，伪造一个「没有 Location 的 302」只会让客户端困惑，所以显式 405。
@@ -65,9 +69,10 @@ HTTP 面逐条摊开对齐的结果：**能对齐的都对齐了**，剩下的�
 5. **`POST /peer/relay` 固定 410 Gone。** 上游也是退役语义，这里保留同样的状态码
    让旧调用方知道「这条路没了」，而不是 404。
 
-6. **A2A 任务没有保留策略。** 上游一任务一文件，删就删了；本仓落 SQLite 且
-   Lume 没有 `remove_file`/无事务，目前只增不减（`a2a_tasks` 表）。量级很小
-   （只读能力的调用记录），但**长期跑会缓慢增长**，需要时再定 `CICDKIT_A2A_KEEP`。
+6. **A2A 任务有保留上限，但不删除原始日志。** 任务落在 SQLite 的 `a2a_tasks`，
+   默认保留 1000 条（`CICD_A2A_TASK_KEEP`，最少 10）；只裁终态任务，
+   `submitted` / `working` / `input-required` 不参与。上游一任务一文件、删了就删，
+   这里不引入文件删除，避免 Lume 无 `remove_file` 的问题。
 
 7. **peer 面不加密。** 与上游一致：HMAC 只保证完整性和身份，不保证机密性；
    要跨公网就跑在 WireGuard / 反代 TLS 后面。

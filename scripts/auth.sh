@@ -44,6 +44,39 @@ if [ -z "$PASS" ]; then
   echo "auth: 已在 .env 生成用户名/口令"
 fi
 
+# 身份绑定账号表：只在不存在时生成，之后由用户手改（角色、多人账号）。
+# 与 kb-abac 一样，Basic Auth 用户是身份，roles 是本地授权，不做自报角色。
+if [ ! -f "$AUTH_DIR/accounts.json" ]; then
+  umask 077
+  mkdir -p "$AUTH_DIR"
+  cat > "$AUTH_DIR/accounts.json" <<EOF
+{
+  "accounts": {
+    "$USER_NAME": {
+      "roles": ["agent_operator", "human_admin"],
+      "title": "Basic Auth user"
+    }
+  }
+}
+EOF
+  chmod 600 "$AUTH_DIR/accounts.json"
+  echo "auth: 已生成 $AUTH_DIR/accounts.json（${USER_NAME}: 操作员 + 终审）"
+fi
+
+# 资源/动作白名单：首次从默认表生成；已有文件只补新增资源，不覆盖人工改过的条目。
+# 默认表带 defaults_version：版本追平后不再自动补，管理员删掉的默认资源不会被加回。
+RES_DEFAULT="$ROOT/scripts/resources.default.json"
+if [ ! -f "$AUTH_DIR/resources.json" ]; then
+  umask 077
+  mkdir -p "$AUTH_DIR"
+  cp "$RES_DEFAULT" "$AUTH_DIR/resources.json"
+  chmod 600 "$AUTH_DIR/resources.json"
+  echo "auth: 已生成 $AUTH_DIR/resources.json"
+else
+  python3 "$ROOT/scripts/merge_resources.py" "$AUTH_DIR/resources.json" "$RES_DEFAULT"
+  chmod 600 "$AUTH_DIR/resources.json" 2>/dev/null || true
+fi
+
 command -v htpasswd >/dev/null || { echo "auth: 需要 htpasswd（apache2-utils）" >&2; exit 1; }
 
 NEED=0

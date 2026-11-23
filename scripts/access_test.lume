@@ -1,0 +1,90 @@
+// scripts/access_test.lume — 身份绑定自测（不启服务器）
+//
+// 覆盖 kb-abac 落地的最小约束：
+//   - Basic Auth 用户 → accounts.json 角色，?role= 不能提权
+//   - 未登记用户 / 账号表损坏 → fail-closed
+//   - 审计可见的“实际生效角色”是授权集合里的角色
+//
+// 用法：
+//   CICD_ACCOUNTS_ENFORCE=1 CICD_ACCOUNTS_FILE=/tmp/accounts.json \
+//     ./vendor/lume/bin/lume scripts/access_test.lume
+
+import "../src/access.lume" as access;
+import "../src/guard.lume" as guard;
+
+let st = { fails: 0, checks: 0 };
+func ok(label, cond) {
+  put(st, "checks", int(get(st, "checks", 0)) + 1);
+  if (cond) {
+    print("  ok  " + label);
+  } else {
+    print("  FAIL " + label);
+    put(st, "fails", int(get(st, "fails", 0)) + 1);
+  }
+}
+
+let file = env("CICD_ACCOUNTS_FILE");
+if (file == null) { file = "/tmp/cicdkit-access-accounts.json"; }
+write_file(file, "{\"accounts\":{\"cicd\":{\"roles\":[\"agent_operator\",\"human_admin\"]},\"op\":{\"roles\":[\"agent_operator\"]}}}");
+
+let rf = env("CICD_ACCESS_RESOURCES_FILE");
+if (rf == null) { rf = "/tmp/cicdkit-access-resources.json"; }
+write_file(rf, "{\"resources\":{\"env-snapshot\":{\"actions\":[\"read\"],\"min_role\":\"agent_operator\"},\"env-action-read\":{\"actions\":[\"read\"],\"min_role\":\"agent_operator\"},\"env-action-mutate\":{\"actions\":[\"restart\"],\"min_role\":\"human_admin\"},\"project-admin\":{\"actions\":[\"create\",\"update\"],\"min_role\":\"human_admin\"},\"deploy-publish\":{\"actions\":[\"publish\"],\"min_role\":\"agent_operator\"}}}");
+
+let op_req = { user: "cicd", query_params: { role: "agent_operator" } };
+let admin_req = { user: "cicd", query_params: { role: "human_admin" } };
+let unknown_req = { user: "mallory", query_params: { role: "human_admin" } };
+
+print("access: identity");
+let id1 = access.identity(op_req);
+ok("身份绑定已开启", get(id1, "enabled", false));
+ok("用户从 req.user 读取", str(get(id1, "user", "")) == "cicd");
+ok("选中已授予角色", str(get(id1, "role", "")) == "agent_operator");
+let id2 = access.identity(admin_req);
+ok("可切到另一个已授予角色", str(get(id2, "role", "")) == "human_admin");
+
+print("access: no escalation");
+write_file(file, "{\"accounts\":{\"op\":{\"roles\":[\"agent_operator\"]}}}");
+let op = access.identity({ user: "op", query_params: { role: "human_admin" } });
+ok("未授予的 role 不提权", get(op, "ok", false) and str(get(op, "role", "")) == "agent_operator");
+let gate = guard.role_allowed({ user: "op", query_params: { role: "human_admin" } }, "human_admin", "重启");
+ok("操作员选终审仍被拒", not get(gate, "allowed", true));
+ok("拒绝原因带实际角色", contains(str(get(gate, "reason", "")), "agent_operator"));
+
+write_file(file, "{\"accounts\":{\"cicd\":{\"roles\":[\"agent_operator\",\"human_admin\"]},\"op\":{\"roles\":[\"agent_operator\"]}}}");
+
+print("access: resources");
+let d_read = access.decide({ user: "op", query_params: { role: "agent_operator" } }, "env-action-read", "read");
+ok("操作员可读动作", get(d_read, "enabled", false) and get(d_read, "allowed", false));
+let d_mut = access.decide({ user: "op", query_params: { role: "agent_operator" } }, "env-action-mutate", "restart");
+ok("操作员不能重启", get(d_mut, "enabled", true) and not get(d_mut, "allowed", true));
+let d_admin = access.decide(admin_req, "env-action-mutate", "restart");
+ok("终审可重启", get(d_admin, "allowed", false));
+let p_op = access.decide(op_req, "project-admin", "update");
+ok("操作员不能改项目", not get(p_op, "allowed", true));
+let p_admin = access.decide(admin_req, "project-admin", "update");
+ok("终审可改项目", get(p_admin, "allowed", false));
+let dep = access.decide(op_req, "deploy-publish", "publish");
+ok("操作员可发布", get(dep, "allowed", false));
+let d_bad = access.decide(admin_req, "env-action-mutate", "delete");
+ok("资源表未登记动作被拒", not get(d_bad, "allowed", true));
+let d_unknown = access.decide(admin_req, "not-a-resource", "read");
+ok("资源表未登记资源被拒", not get(d_unknown, "allowed", true));
+write_file(rf, "bad-json");
+let d_nores = access.decide(admin_req, "env-action-read", "read");
+ok("资源表损坏被拒", not get(d_nores, "allowed", true));
+write_file(rf, "{\"resources\":{\"env-snapshot\":{\"actions\":[\"read\"],\"min_role\":\"agent_operator\"},\"env-action-read\":{\"actions\":[\"read\"],\"min_role\":\"agent_operator\"},\"env-action-mutate\":{\"actions\":[\"restart\"],\"min_role\":\"human_admin\"},\"project-admin\":{\"actions\":[\"create\",\"update\"],\"min_role\":\"human_admin\"},\"deploy-publish\":{\"actions\":[\"publish\"],\"min_role\":\"agent_operator\"}}}");
+
+print("access: fail closed");
+let miss = access.identity(unknown_req);
+ok("未登记用户被拒", get(miss, "enabled", true) and not get(miss, "ok", true));
+write_file(file, "not-json");
+let broken = access.identity({ user: "op", query_params: { role: "agent_operator" } });
+ok("账号表损坏被拒", not get(broken, "ok", true));
+write_file(file, "{\"accounts\":{\"cicd\":{\"roles\":[\"agent_operator\",\"human_admin\"]}}}");
+
+
+print("");
+let nc = int(get(st, "checks", 0));
+let nf = int(get(st, "fails", 0));
+if (nf == 0) { print("access_test: " + str(nc) + " checks passed"); } else { print("access_test: " + str(nf) + " of " + str(nc) + " FAILED"); }

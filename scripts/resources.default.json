@@ -1,0 +1,158 @@
+{
+  "defaults_version": 4,
+  "resources": {
+    "agent-query": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "project-admin": {
+      "actions": [
+        "create",
+        "scan",
+        "generate",
+        "update",
+        "delete"
+      ],
+      "min_role": "human_admin"
+    },
+    "project-run": {
+      "actions": [
+        "build",
+        "pipeline"
+      ],
+      "min_role": "agent_operator"
+    },
+    "project-inspect": {
+      "actions": [
+        "validate",
+        "probe"
+      ],
+      "min_role": "agent_operator"
+    },
+    "deploy-publish": {
+      "actions": [
+        "publish"
+      ],
+      "min_role": "agent_operator"
+    },
+    "run-admin": {
+      "actions": [
+        "clear",
+        "restore"
+      ],
+      "min_role": "human_admin"
+    },
+    "run-control": {
+      "actions": [
+        "cancel"
+      ],
+      "min_role": "agent_operator"
+    },
+    "run-adopt": {
+      "actions": [
+        "adopt"
+      ],
+      "min_role": "human_admin"
+    },
+    "run-diagnose": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "deployment-admin": {
+      "actions": [
+        "clear"
+      ],
+      "min_role": "human_admin"
+    },
+    "deployment-diagnose": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "kb-write": {
+      "actions": [
+        "write",
+        "delete"
+      ],
+      "min_role": "human_admin"
+    },
+    "llm-config": {
+      "actions": [
+        "update",
+        "test"
+      ],
+      "min_role": "human_admin"
+    },
+    "fs-browse": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "human_admin"
+    },
+    "env-snapshot": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "env-action-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "env-action-mutate": {
+      "actions": [
+        "restart"
+      ],
+      "min_role": "human_admin"
+    },
+    "project-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "run-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "deployment-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "kb-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "llm-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "audit-read": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "agent_operator"
+    },
+    "project-visits": {
+      "actions": [
+        "read"
+      ],
+      "min_role": "human_admin"
+    }
+  }
+}

@@ -1,0 +1,475 @@
+// src/agent.lume — Agent / Text2SQL 只读查询面
+//
+// 用户用自然语言问「哪个项目最近部署失败」「哪些项目一周没发布」，
+// 模型只负责把问题翻译成一条受限的 SQLite SELECT，执行仍在本进程内。
+//
+// 安全边界：
+//   * 只同步三张扁平表（agent_projects / agent_runs / agent_deployments），
+//     不含项目配置、build_args、日志、settings、密钥。
+//   * SQL 必须单表 SELECT，禁 JOIN/UNION/子查询/写操作；表名白名单。
+//   * LIMIT 强制不超过 100，模型漏写就补 LIMIT 100。
+//   * 每次查询前重建三张表，数据窗口是最近 500 项目 / 300 运行 / 300 部署。
+//
+// 这不是「自主 Agent」：没有工具循环、没有写权限，也不会替你发布。
+
+import "store.lume" as store;
+import "app_api.lume" as api;
+
+func s(v, def) {
+  if (v == null) { return def; }
+  return str(v);
+}
+
+func jmap(m, k) {
+  if (m == null) { return {}; }
+  let v = get(m, k, null);
+  if (v == null) { return {}; }
+  return v;
+}
+
+func jlist(m, k) {
+  if (m == null) { return []; }
+  let v = get(m, k, null);
+  if (v == null) { return []; }
+  return v;
+}
+
+export func init() {
+  sql_write(store.db(), "CREATE TABLE IF NOT EXISTS agent_projects (id TEXT PRIMARY KEY, name TEXT, branch TEXT, primary_target TEXT, created_at TEXT, updated_at TEXT)");
+  sql_write(store.db(), "CREATE TABLE IF NOT EXISTS agent_runs (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, trigger TEXT, status TEXT, image_ref TEXT, created_at TEXT, duration_sec INTEGER, stage_summary TEXT)");
+  sql_write(store.db(), "CREATE TABLE IF NOT EXISTS agent_deployments (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, method TEXT, target TEXT, cluster TEXT, namespace TEXT, image_ref TEXT, status TEXT, probe_status TEXT, probe_url TEXT, created_at TEXT)");
+}
+
+func stages_text(run) {
+  let st = jlist(run, "stages");
+  let out = [];
+  for (x in st) {
+    let name = s(get(x, "name", ""), "");
+    let status = s(get(x, "status", ""), "");
+    if (len(name) > 0) { push(out, name + ":" + status); }
+  }
+  return join(out, ",");
+}
+
+func duration_sec(run) {
+  let a = int(get(run, "started_ts", 0));
+  let b = int(get(run, "ended_ts", 0));
+  if (a <= 0 or b <= 0 or b < a) { return 0; }
+  return b - a;
+}
+
+// 每次查询前重建：数据量小（几百行），比维护增量同步简单，也不会读到旧状态。
+export func sync() {
+  sql_write(store.db(), "DELETE FROM agent_projects WHERE 1=1");
+  sql_write(store.db(), "DELETE FROM agent_runs WHERE 1=1");
+  sql_write(store.db(), "DELETE FROM agent_deployments WHERE 1=1");
+
+  let ps = jlist(store.list_projects("", 500, 0), "projects");
+  for (p in ps) {
+    sql_write(store.db(),
+      "INSERT OR REPLACE INTO agent_projects (id, name, branch, primary_target, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+      [
+        s(get(p, "id", ""), ""),
+        s(get(p, "name", ""), ""),
+        s(get(p, "branch", ""), ""),
+        s(get(p, "primary_target", ""), ""),
+        s(get(p, "created_at", ""), ""),
+        s(get(p, "updated_at", ""), ""),
+      ]);
+  }
+
+  let rs = jlist(store.list_runs("", 300, 0), "runs");
+  for (r in rs) {
+    sql_write(store.db(),
+      "INSERT OR REPLACE INTO agent_runs (id, project_id, project_name, trigger, status, image_ref, created_at, duration_sec, stage_summary) VALUES (?,?,?,?,?,?,?,?,?)",
+      [
+        s(get(r, "id", ""), ""),
+        s(get(r, "project_id", ""), ""),
+        s(get(r, "project_name", ""), ""),
+        s(get(r, "trigger", ""), ""),
+        s(get(r, "status", ""), ""),
+        s(get(r, "image_ref", ""), ""),
+        s(get(r, "created_at", ""), ""),
+        duration_sec(r),
+        stages_text(r),
+      ]);
+  }
+
+  let ds = jlist(store.list_deployments("", 300, 0), "deployments");
+  for (d in ds) {
+    let pr = jmap(d, "probe");
+    sql_write(store.db(),
+      "INSERT OR REPLACE INTO agent_deployments (id, project_id, project_name, method, target, cluster, namespace, image_ref, status, probe_status, probe_url, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+      [
+        s(get(d, "id", ""), ""),
+        s(get(d, "project_id", ""), ""),
+        s(get(d, "project_name", ""), ""),
+        s(get(d, "method", ""), ""),
+        s(get(d, "target", ""), ""),
+        s(get(d, "cluster", ""), ""),
+        s(get(d, "namespace", ""), ""),
+        s(get(d, "image_ref", ""), ""),
+        s(get(d, "status", ""), ""),
+        s(get(pr, "status", ""), ""),
+        s(get(pr, "url", ""), ""),
+        s(get(d, "created_at", ""), ""),
+      ]);
+  }
+}
+
+func schema_text() {
+  return "表结构（只允许这三张表）：\n" +
+    "agent_projects(id, name, branch, primary_target, created_at, updated_at)\n" +
+    "agent_runs(id, project_id, project_name, trigger, status, image_ref, created_at, duration_sec, stage_summary)\n" +
+    "agent_deployments(id, project_id, project_name, method, target, cluster, namespace, image_ref, status, probe_status, probe_url, created_at)\n" +
+    "取值：runs/deployments.status = success / failed / running / queued / canceled；trigger = manual / webhook；probe_status = ok / skip / fail / err。\n" +
+    "created_at 是 ISO 文本，可用 date(created_at) 或 substr(created_at,1,10) 过滤日期。\n" +
+    "数据窗口：最多 500 个项目、300 条最近运行、300 条最近部署。";
+}
+
+func has_word(tokens, w) {
+  for (t in tokens) {
+    if (trim(str(t)) == w) { return true; }
+  }
+  return false;
+}
+
+func word_count(tokens, w) {
+  let n = 0;
+  for (t in tokens) {
+    if (trim(str(t)) == w) { n = n + 1; }
+  }
+  return n;
+}
+
+func normalize(sql) {
+  let s0 = trim(str(sql));
+  s0 = join(split(s0, "\n"), " ");
+  s0 = join(split(s0, "\r"), " ");
+  s0 = join(split(s0, "\t"), " ");
+  return trim(s0);
+}
+
+// 返回 {ok, sql, err}。调用方只执行这里放行的 SQL。
+export func validate_sql(raw) {
+  let sql = normalize(raw);
+  if (len(sql) == 0) { return { ok: false, sql: "", err: "SQL 为空" }; }
+  if (len(sql) > 1000) { return { ok: false, sql: "", err: "SQL 太长（上限 1000 字符）" }; }
+
+  // 模型经常在单条语句末尾带一个分号；只容忍「末尾单个 ;」，其余一律拒绝。
+  let semis = len(split(sql, ";")) - 1;
+  if (semis == 1 and substr(sql, len(sql) - 1, 1) == ";") {
+    sql = trim(substr(sql, 0, len(sql) - 1));
+  } else if (semis > 0) {
+    return { ok: false, sql: "", err: "不允许多条语句（;）" };
+  }
+
+  let lo = lower(sql);
+  if (contains(lo, "--") or contains(lo, "/*") or contains(lo, "*/")) {
+    return { ok: false, sql: "", err: "不允许 SQL 注释" };
+  }
+
+  let tokens = split(lo, " ");
+  if (word_count(tokens, "select") != 1) {
+    return { ok: false, sql: "", err: "只允许一条单表 SELECT（禁止子查询/UNION）" };
+  }
+  if (has_word(tokens, "join") or has_word(tokens, "union") or has_word(tokens, "intersect") or has_word(tokens, "except")) {
+    return { ok: false, sql: "", err: "只允许单表查询，禁止 JOIN/UNION" };
+  }
+  if (word_count(tokens, "from") != 1) {
+    return { ok: false, sql: "", err: "只允许一个 FROM（禁止子查询）" };
+  }
+
+  let bad = ["insert", "update", "delete", "drop", "alter", "create", "replace", "attach", "detach",
+             "pragma", "vacuum", "reindex", "trigger", "view", "load_extension", "readfile", "writefile"];
+  for (w in bad) {
+    if (has_word(tokens, w)) {
+      return { ok: false, sql: "", err: "SQL 含禁用词：" + w };
+    }
+  }
+  for (t in tokens) {
+    let tok = trim(str(t));
+    if (len(tok) >= 7 and substr(tok, 0, 7) == "sqlite_") {
+      return { ok: false, sql: "", err: "SQL 引用 sqlite_ 内部对象" };
+    }
+  }
+
+  let table = "";
+  let i = 0;
+  while (i < len(tokens)) {
+    if (trim(str(tokens[i])) == "from") {
+      let j = i + 1;
+      while (j < len(tokens) and len(trim(str(tokens[j]))) == 0) { j = j + 1; }
+      if (j < len(tokens)) { table = trim(str(tokens[j])); }
+      break;
+    }
+    i = i + 1;
+  }
+  if (len(table) == 0) { return { ok: false, sql: "", err: "没有找到 FROM 后的表名" }; }
+  let allowed = ["agent_projects", "agent_runs", "agent_deployments"];
+  let ok_table = false;
+  for (t in allowed) { if (table == t) { ok_table = true; } }
+  if (not ok_table) {
+    return { ok: false, sql: "", err: "表不在白名单内：" + table + "（只允许 agent_projects / agent_runs / agent_deployments）" };
+  }
+
+  let lim = -1;
+  let lim_count = 0;
+  i = 0;
+  while (i < len(tokens)) {
+    if (trim(str(tokens[i])) == "limit") {
+      lim_count = lim_count + 1;
+      let j = i + 1;
+      while (j < len(tokens) and len(trim(str(tokens[j]))) == 0) { j = j + 1; }
+      if (j < len(tokens)) { lim = int(trim(str(tokens[j]))); }
+    }
+    i = i + 1;
+  }
+  if (lim_count > 1) { return { ok: false, sql: "", err: "只允许一个 LIMIT" }; }
+  if (lim_count == 1 and (lim < 1 or lim > 100)) {
+    return { ok: false, sql: "", err: "LIMIT 必须在 1..100 之间" };
+  }
+  if (lim_count == 0) { sql = sql + " LIMIT 100"; }
+  return { ok: true, sql: sql, err: "" };
+}
+
+// 执行已校验的 SQL；列名从第一行的 keys 取，空结果没有列名。
+export func execute(sql) {
+  let got = try(() => sql_query(store.db(), str(sql), []));
+  if (got.err != null) { return { ok: false, rows: [], count: 0, columns: [], err: str(got.err) }; }
+  let rows = got.ok;
+  if (rows == null) { rows = []; }
+  let columns = [];
+  if (len(rows) > 0) { columns = keys(rows[0]); }
+  return { ok: true, rows: rows, count: len(rows), columns: columns, err: "" };
+}
+
+func short_time(v) {
+  let t = str(v);
+  if (len(t) >= 16) { return substr(t, 0, 16); }
+  return t;
+}
+
+func iso_num(v) {
+  let t = str(v);
+  if (len(t) < 19) { return 0; }
+  let digits = substr(t, 0, 4) + substr(t, 5, 2) + substr(t, 8, 2) +
+               substr(t, 11, 2) + substr(t, 14, 2) + substr(t, 17, 2);
+  return int(digits);
+}
+
+// 规则兜底：模型没返回摘要时，至少给出行数、时间范围和状态分布。
+func fallback_summary(rows, columns) {
+  if (len(rows) == 0) { return "没有匹配的数据。"; }
+  if (len(rows) == 1 and len(columns) == 1) {
+    let c = str(columns[0]);
+    return "查询返回 1 行，" + c + " 为 " + str(get(rows[0], c, "—")) + "。";
+  }
+  let parts = [];
+  push(parts, "查询返回 " + str(len(rows)) + " 行");
+  for (c in columns) {
+    let col = str(c);
+    if (col == "created_at" or col == "updated_at") {
+      let mn = "";
+      let mx = "";
+      for (r in rows) {
+        let v = str(get(r, col, ""));
+        if (len(v) > 0) {
+          if (len(mn) == 0) {
+            mn = v;
+            mx = v;
+          } else {
+            let n = iso_num(v);
+            if (n < iso_num(mn)) { mn = v; }
+            if (n > iso_num(mx)) { mx = v; }
+          }
+        }
+      }
+      if (len(mn) > 0) { push(parts, "时间 " + short_time(mn) + " 至 " + short_time(mx)); }
+    }
+    if (col == "status" or col == "probe_status") {
+      let cnt = {};
+      for (r in rows) {
+        let v = str(get(r, col, ""));
+        if (len(v) > 0) { put(cnt, v, int(get(cnt, v, 0)) + 1); }
+      }
+      let bits = [];
+      for (k in keys(cnt)) { push(bits, str(k) + " " + str(int(get(cnt, k, 0)))); }
+      if (len(bits) > 0) { push(parts, join(bits, " / ")); }
+    }
+    if (col == "project_name" or col == "name") {
+      let seen = {};
+      let names = [];
+      for (r in rows) {
+        let v = str(get(r, col, ""));
+        if (len(v) > 0 and get(seen, v, null) == null) {
+          put(seen, v, 1);
+          if (len(names) < 5) { push(names, v); }
+        }
+      }
+      if (len(names) > 0) {
+        let more = "";
+        if (len(seen) > 5) { more = " 等 " + str(len(seen)) + " 个项目"; }
+        push(parts, "涉及 " + join(names, "、") + more);
+      }
+    }
+  }
+  return join(parts, "；") + "。";
+}
+
+func compact_summary(text) {
+  let clean = join(split(str(text), "‑"), "-");
+  let out = "";
+  for (line in split(clean, "\n")) {
+    let l = trim(str(line));
+    if (len(l) == 0) { continue; }
+    if (substr(l, 0, 1) == "-" or substr(l, 0, 1) == "*") { continue; }
+    if (contains(lower(l), "关键事实")) { continue; }
+    if (len(out) == 0) { out = l; }
+  }
+  if (len(out) == 0) { out = trim(clean); }
+  return out;
+}
+
+// 让模型基于真实结果写结论；失败就用规则摘要，绝不编造数字。
+func summarize(question, sql, rows, columns) {
+  let base = fallback_summary(rows, columns);
+  if (len(rows) == 0) { return base; }
+  if (len(rows) == 1 and len(columns) == 1) { return base; }
+
+  let sample = [];
+  let i = 0;
+  for (row in rows) {
+    if (i >= 10) { break; }
+    push(sample, row);
+    i = i + 1;
+  }
+  let digest = stringify({ count: len(rows), columns: columns, rows: sample });
+  let sys = "你是 CI/CD 数据分析助手。只根据用户问题、SQL 和查询结果写一段简体中文结论摘要。" +
+            "必须保留关键数字、项目名和时间；不得编造，不得复述 SQL，不得使用 Markdown。";
+  let prompt = "用户问题：" + str(question) + "\n" +
+               "SQL：" + str(sql) + "\n" +
+               "查询结果：" + digest + "\n\n" +
+               "要求：只写一段话，最多两句，80 字以内；不要列表、不要逐项罗列、不要分点；" +
+               "保留关键项目名和时间范围；使用普通连字符 -。";
+  let resp = api.llm_chat(sys, prompt, 45, 160);
+  if (not get(resp, "ok", false)) { return base; }
+  let t = trim(str(get(resp, "text", "")));
+  if (len(t) == 0) { return base; }
+  let compact = compact_summary(t);
+  if (len(compact) == 0) { return base; }
+  return compact;
+}
+
+func rate_ok() {
+  let ts = now();
+  let raw = store.get_setting("agent_rate");
+  let prev = "";
+  if (raw != null) { prev = str(raw); }
+  let keep = [];
+  for (part in split(prev, ",")) {
+    let t = int(trim(str(part)));
+    if (t > 0 and t > ts - 60) { push(keep, t); }
+  }
+  if (len(keep) >= 5) { return false; }
+  push(keep, ts);
+  store.put_setting("agent_rate", join(keep, ","));
+  return true;
+}
+
+func find_sub(text, needle) {
+  let i = 0;
+  while (i + len(needle) <= len(text)) {
+    if (substr(text, i, len(needle)) == needle) { return i; }
+    i = i + 1;
+  }
+  return -1;
+}
+
+func strip_ticks(s) {
+  let t = trim(str(s));
+  while (len(t) > 0 and substr(t, 0, 1) == "`") { t = trim(substr(t, 1, len(t) - 1)); }
+  while (len(t) > 0 and substr(t, len(t) - 1, 1) == "`") { t = trim(substr(t, 0, len(t) - 1)); }
+  return t;
+}
+
+// 模型被要求只输出一行 SQL。兜底也接受：```sql 代码块、或旧的 JSON 形状。
+func extract_sql(text) {
+  let t = trim(str(text));
+  let direct = store.parse_json(t, null);
+  if (direct != null) {
+    let q = trim(str(get(direct, "sql", "")));
+    if (len(q) > 0) { return q; }
+  }
+  for (part in split(t, "```")) {
+    let p = trim(str(part));
+    if (len(p) == 0) { continue; }
+    let lo = lower(p);
+    let idx = find_sub(lo, "select");
+    if (idx >= 0) { return strip_ticks(substr(p, idx, len(p) - idx)); }
+  }
+  for (line in split(t, "\n")) {
+    let l = strip_ticks(str(line));
+    let idx = find_sub(lower(l), "select");
+    if (idx >= 0) { return strip_ticks(substr(l, idx, len(l) - idx)); }
+  }
+  return "";
+}
+
+export func query(raw) {
+  let body = store.parse_json(str(raw), null);
+  if (body == null) { return { status: 400, body: { ok: false, error: "请求体不是合法 JSON" } }; }
+  let q = trim(str(get(body, "question", "")));
+  if (len(q) < 2) { return { status: 400, body: { ok: false, error: "问题太短" } }; }
+  if (len(q) > 300) { return { status: 400, body: { ok: false, error: "问题太长（上限 300 字）" } }; }
+  if (not rate_ok()) {
+    return { status: 429, body: { ok: false, error: "Agent 查询过于频繁（每分钟最多 5 次），请稍后再试" } };
+  }
+
+  sync();
+  let sys = "你是 Text2SQL 引擎。只输出一条 SQLite SELECT，单行，不要解释、不要 Markdown、不要分号。";
+  let prompt = schema_text() + "\n\n" +
+    "约束：\n" +
+    "1. 只允许单表 SELECT，禁止 JOIN、UNION、子查询、WITH。\n" +
+    "2. 表名只能是 agent_projects / agent_runs / agent_deployments；不能查 settings、kb、a2a_tasks 或其他表。\n" +
+    "3. 不要 SELECT *；显式列出需要的列。\n" +
+    "4. LIMIT 不超过 100；用户没要求条数时用 LIMIT 20。\n" +
+    "5. 直接输出 SQL 本身，不要 JSON、不要代码块、不要分号。\n\n" +
+    "当前时间：" + store.fmt_iso(now()) + "\n" +
+    "用户问题：" + q;
+  let r = api.llm_chat(sys, prompt, 150, 0);
+  if (not get(r, "ok", false)) {
+    return { status: 502, body: { ok: false, error: "模型调用失败：" + str(get(r, "err", "")) } };
+  }
+  let sql = extract_sql(str(get(r, "text", "")));
+  if (len(sql) == 0) {
+    return { status: 502, body: { ok: false, error: "模型没有返回 SQL", raw: str(get(r, "text", "")) } };
+  }
+  let explain = "模型生成的只读 SELECT，已通过表白名单与 LIMIT 校验。";
+  let v = validate_sql(sql);
+  if (not get(v, "ok", false)) {
+    return { status: 400, body: { ok: false, error: "生成的 SQL 未通过安全校验：" + str(get(v, "err", "")), sql: sql } };
+  }
+  let ex = execute(str(get(v, "sql", "")));
+  if (not get(ex, "ok", false)) {
+    return { status: 500, body: { ok: false, error: "SQL 执行失败：" + str(get(ex, "err", "")), sql: str(get(v, "sql", "")) } };
+  }
+  let sql2 = str(get(v, "sql", ""));
+  let rows = get(ex, "rows", []);
+  let cols = get(ex, "columns", []);
+  let summary = summarize(q, sql2, rows, cols);
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      question: q,
+      sql: sql2,
+      explain: explain,
+      summary: summary,
+      columns: cols,
+      rows: rows,
+      count: get(ex, "count", 0),
+      read_only: true,
+    },
+  };
+}

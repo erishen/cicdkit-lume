@@ -53,6 +53,12 @@ export func init() {
   sql_write(db(), "CREATE TABLE IF NOT EXISTS kb (id TEXT PRIMARY KEY, project_id TEXT, project_name TEXT, stage TEXT, signature TEXT, error_keyword TEXT, created_ts INTEGER, json TEXT)");
   sql_write(db(), "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_ts INTEGER)");
   sql_write(db(), "CREATE TABLE IF NOT EXISTS runs_archive (id TEXT PRIMARY KEY, project_id TEXT, json TEXT, archived_ts INTEGER, log_archived INTEGER, log_bytes INTEGER)");
+  // 云环境受控动作审计：只记谁在什么主机上提交了什么动作、对应哪个 runner job。
+  // 结果本身在 runner 日志里；这里保的是“动作发生过”的事实，runner 重启也不丢。
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS env_actions (id TEXT PRIMARY KEY, host TEXT, project_id TEXT, target TEXT, action TEXT, status TEXT, actor TEXT, job_id TEXT, created_ts INTEGER, json TEXT)");
+  // 授权审计：每条资源/动作判定都留痕，成功和拒绝都记。只记判定，
+  // 不代替 env_actions 的 job 终态；用户、角色、资源、动作、原因都在这里。
+  sql_write(db(), "CREATE TABLE IF NOT EXISTS access_events (id TEXT PRIMARY KEY, ts INTEGER, user TEXT, role TEXT, resource TEXT, action TEXT, allowed INTEGER, reason TEXT, label TEXT, json TEXT)");
   mkdir(archive_dir());
 }
 
@@ -602,6 +608,186 @@ export func put_kb(entry) {
 export func delete_kb(id) {
   let n = sql_write(db(), "DELETE FROM kb WHERE id = ?", [str(id)]);
   return int(n);
+}
+
+// ---------- 云环境动作审计 ----------
+
+// 终态审计保留上限：默认 5000 条，最少 100。submitted 的记录可能还有 runner
+// job 在跑，不参与裁剪，否则 finish_env_action 会找不到回写目标。
+func env_audit_keep() {
+  let v = env("CICD_ENV_AUDIT_KEEP");
+  let n = 5000;
+  if (v != null) { n = int(str(v)); }
+  if (n < 100) { n = 100; }
+  return n;
+}
+
+export func prune_env_actions(keep) {
+  let k = int(keep);
+  if (k < 100) { k = 100; }
+  let rows = sql_query(db(), "SELECT COUNT(*) AS n FROM env_actions", []);
+  let total = 0;
+  if (len(rows) > 0) { total = int(get(rows[0], "n", 0)); }
+  if (total <= k) { return 0; }
+  let cut = total - k;
+  let rows2 = sql_query(db(), "SELECT id FROM env_actions WHERE status <> 'submitted' ORDER BY created_ts ASC, id ASC LIMIT " + str(cut), []);
+  let n = 0;
+  let j = 0;
+  while (j < len(rows2)) {
+    let res = try(() => sql_write(db(), "DELETE FROM env_actions WHERE id = ?", [str(get(rows2[j], "id", ""))]));
+    if (res.err == null) { n = n + 1; }
+    j = j + 1;
+  }
+  return n;
+}
+
+export func put_env_action(e) {
+  let id = str(get(e, "id", ""));
+  if (len(id) == 0) { id = id_free("env_actions", "envact"); put(e, "id", id); }
+  let created = int(get(e, "created_ts", 0));
+  if (created == 0) { created = now(); }
+  put(e, "created_ts", created);
+  if (len(str(get(e, "created_at", ""))) == 0) { put(e, "created_at", fmt_iso(created)); }
+  let sql = "INSERT OR REPLACE INTO env_actions (id, host, project_id, target, action, status, actor, job_id, created_ts, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, " + str(created) + ", ?)";
+  let params = [id,
+    str(get(e, "host", "")), str(get(e, "project_id", "")), str(get(e, "target", "")),
+    str(get(e, "action", "")), str(get(e, "status", "")), str(get(e, "actor", "")),
+    str(get(e, "job_id", "")), stringify(e)];
+  let res = try(() => sql_write(db(), sql, params));
+  if (res.err != null) { return { ok: false, err: str(res.err), id: id }; }
+  prune_env_actions(env_audit_keep());
+  return { ok: true, err: "", id: id };
+}
+
+// 把 runner job 的终态回写到审计行。runner 重启后日志可能丢，但“动作最后
+// 成功还是失败”必须能在审计里看到；同一条记录只允许从 submitted 迁移一次。
+export func finish_env_action(job_id, status, exit) {
+  let jid = trim(str(job_id));
+  if (len(jid) == 0) { return { ok: false, err: "job_id 不能为空" }; }
+  let rows = sql_query(db(), "SELECT json FROM env_actions WHERE job_id = ?", [jid]);
+  if (len(rows) == 0) { return { ok: false, err: "审计记录不存在", job_id: jid }; }
+  let e = parse_json(get(rows[0], "json", ""), null);
+  if (e == null) { e = {}; }
+  let cur = str(get(e, "status", ""));
+  if (cur == "success" or cur == "failed" or cur == "canceled") {
+    return { ok: true, id: str(get(e, "id", "")), unchanged: true };
+  }
+  let ts = now();
+  put(e, "status", str(status));
+  put(e, "exit", int(exit));
+  put(e, "finished_ts", ts);
+  put(e, "finished_at", fmt_iso(ts));
+  let sql = "UPDATE env_actions SET status = ?, json = ? WHERE job_id = ?";
+  let res = try(() => sql_write(db(), sql, [str(status), stringify(e), jid]));
+  if (res.err != null) { return { ok: false, err: str(res.err), job_id: jid }; }
+  prune_env_actions(env_audit_keep());
+  return { ok: true, id: str(get(e, "id", "")), unchanged: false };
+}
+
+// ---------- 授权判定审计 ----------
+
+// 审计保留上限：默认 5000 条，最少 100。每次写入后裁掉最旧的多余记录，
+// 避免长期运行把 SQLite 撑大；环境变量用 CICD_AUDIT_KEEP 覆盖。
+func audit_keep() {
+  let v = env("CICD_AUDIT_KEEP");
+  let n = 5000;
+  if (v != null) { n = int(str(v)); }
+  if (n < 100) { n = 100; }
+  return n;
+}
+
+export func prune_access_events(keep) {
+  let k = int(keep);
+  if (k < 100) { k = 100; }
+  let rows = sql_query(db(), "SELECT COUNT(*) AS n FROM access_events", []);
+  let total = 0;
+  if (len(rows) > 0) { total = int(get(rows[0], "n", 0)); }
+  if (total <= k) { return 0; }
+  let cut = total - k;
+  // Lume 的 SQL 沙箱对 DELETE ... IN (SELECT ...) 支持不稳，先取最旧的 id 再逐条删。
+  let rows2 = sql_query(db(), "SELECT id FROM access_events ORDER BY ts ASC, id ASC LIMIT " + str(cut), []);
+  let n = 0;
+  let j = 0;
+  while (j < len(rows2)) {
+    let res = try(() => sql_write(db(), "DELETE FROM access_events WHERE id = ?", [str(get(rows2[j], "id", ""))]));
+    if (res.err == null) { n = n + 1; }
+    j = j + 1;
+  }
+  return n;
+}
+
+export func put_access_event(e) {
+  let id = str(get(e, "id", ""));
+  if (len(id) == 0) { id = id_free("access_events", "accevt"); put(e, "id", id); }
+  let ts = int(get(e, "ts", 0));
+  if (ts == 0) { ts = now(); }
+  put(e, "ts", ts);
+  if (len(str(get(e, "created_at", ""))) == 0) { put(e, "created_at", fmt_iso(ts)); }
+  let allowed = 0;
+  if (get(e, "allowed", false)) { allowed = 1; }
+  let sql = "INSERT OR REPLACE INTO access_events (id, ts, user, role, resource, action, allowed, reason, label, json) VALUES (?, " + str(ts) + ", ?, ?, ?, ?, " + str(allowed) + ", ?, ?, ?)";
+  let params = [id,
+    str(get(e, "user", "")), str(get(e, "role", "")), str(get(e, "resource", "")),
+    str(get(e, "action", "")), str(get(e, "reason", "")), str(get(e, "label", "")),
+    stringify(e)];
+  let res = try(() => sql_write(db(), sql, params));
+  if (res.err != null) { return { ok: false, err: str(res.err), id: id }; }
+  prune_access_events(audit_keep());
+  return { ok: true, err: "", id: id };
+}
+
+export func list_access_events(user, resource, since, until, limit) {
+  let u = trim(str(user));
+  let r = trim(str(resource));
+  let from = int(since);
+  let to = int(until);
+  if (from < 0) { from = 0; }
+  if (to < 0) { to = 0; }
+  let n = int(limit);
+  if (n < 1) { n = 50; }
+  if (n > 500) { n = 500; }
+  let range = "";
+  if (from > 0) { range = range + " AND ts >= " + str(from); }
+  if (to > 0) { range = range + " AND ts <= " + str(to); }
+  let rows = sql_query(db(),
+    "SELECT json FROM access_events WHERE (? = '' OR user = ?) AND (? = '' OR resource = ?)" +
+    range + " ORDER BY ts DESC, id DESC LIMIT " + str(n),
+    [u, u, r, r]);
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let e = parse_json(get(rows[i], "json", ""), null);
+    if (e != null) { push(out, e); }
+    i = i + 1;
+  }
+  return { events: out };
+}
+
+export func list_env_actions(host, since, until, limit) {
+  let h = trim(str(host));
+  let from = int(since);
+  let to = int(until);
+  if (from < 0) { from = 0; }
+  if (to < 0) { to = 0; }
+  let n = int(limit);
+  if (n < 1) { n = 20; }
+  if (n > 500) { n = 500; }
+  let where = "WHERE (? = '' OR host = ?)";
+  if (from > 0) { where = where + " AND created_ts >= " + str(from); }
+  if (to > 0) { where = where + " AND created_ts <= " + str(to); }
+  let params = [h, h];
+  let rows = sql_query(db(),
+    "SELECT json FROM env_actions " + where +
+    " ORDER BY created_ts DESC, id DESC LIMIT " + str(n),
+    params);
+  let out = [];
+  let i = 0;
+  while (i < len(rows)) {
+    let e = parse_json(get(rows[i], "json", ""), null);
+    if (e != null) { push(out, e); }
+    i = i + 1;
+  }
+  return { actions: out };
 }
 
 // ---------- 设置（LLM 配置等）----------
