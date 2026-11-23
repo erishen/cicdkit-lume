@@ -203,8 +203,9 @@ export func delete_project_cascade(id) {
   }
   let dep_count = int(sql_write(db(), "DELETE FROM deployments WHERE project_id = ?", [pid]));
   let kb_count = int(sql_write(db(), "DELETE FROM kb WHERE project_id = ?", [pid]));
+  let rel_count = int(sql_write(db(), "DELETE FROM releases WHERE project_id = ?", [pid]));
   let prj = int(sql_write(db(), "DELETE FROM projects WHERE id = ?", [pid]));
-  return { project: prj, runs: len(run_ids), archive: len(arc_ids), deployments: dep_count, kb: kb_count };
+  return { project: prj, runs: len(run_ids), archive: len(arc_ids), deployments: dep_count, kb: kb_count, releases: rel_count };
 }
 
 // ---------- 运行 ----------

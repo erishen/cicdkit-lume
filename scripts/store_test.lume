@@ -326,11 +326,13 @@ store.put_run({ id: "run-del", project_id: "proj-del", project_name: "del", trig
 store.write_log("run-del", "some log\n");
 store.put_deployment({ id: "dep-del", project_id: "proj-del", project_name: "del", method: "ssh", status: "success" });
 store.put_kb({ id: "kb-del", project_id: "proj-del", project_name: "del", stage: "build", signature: "x", error_keyword: "y" });
+store.put_release({ id: "rel-del", project_id: "proj-del", project_name: "del", status: "failed", stages: [] });
 let cas = store.delete_project_cascade("proj-del");
 ok("级联删掉项目", int(get(cas, "project", 0)) == 1 and store.get_project("proj-del") == null);
 ok("级联删掉运行", int(get(cas, "runs", 0)) == 1 and int(get(store.list_runs("proj-del", 10, 0), "total", 0)) == 0);
 ok("级联删掉部署", int(get(cas, "deployments", 0)) == 1);
 ok("级联删掉知识库", int(get(cas, "kb", 0)) == 1);
+ok("级联删掉发布链路", int(get(cas, "releases", 0)) == 1 and store.get_release("rel-del") == null);
 ok("级联清空运行日志", len(read_file(store.run_log_path("run-del"))) == 0);
 
 print("");
