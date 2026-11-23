@@ -398,6 +398,11 @@ curl -u "cicd:$CICDKIT_BASIC_PASS" -X POST \
 - **runner 写入侧**：日志按行过 `redactLog()`（KEY=VALUE、`sk-`、Bearer、
   `?secret=`、`sshpass -p` 等），`$` 命令行和 `GET /jobs/:id` 返回的 step argv
   也走同一套掩码；密钥即使出现在 stdout，也不会原样落盘。
+- **基础设施元数据按角色**：`ssh_host` / `ssh_user` / 发布阶段的 `host` /
+  部署记录的 `cluster` 对 `agent_operator` 返回 `********`；
+  `human_admin` / `agent_reviewer` / `agent_reviewer_second` 看原件。项目列表、
+  项目详情、总览、发布计划/详情、部署记录都走这层；PUT 时掩码会从库里回填，
+  不会把 `********` 存成真实 host。
 
 ### 切换前体检与路径重映射
 

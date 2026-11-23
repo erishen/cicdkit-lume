@@ -80,6 +80,22 @@ if (len(pub_targets) > 0) { t0 = pub_targets[0]; }
 ok("target 的 PIN 已掩码", not contains(str(get(t0, "ssh_run_args", "otherpin")), "otherpin"));
 ok("非密字段保留", str(get(get(pub, "deploy", {}), "ssh_host", "")) == "10.0.0.9");
 
+// 基础设施元数据按角色收口：操作员看不到 host/user，终审/复核看原件。
+let oppub = redact.scrub_infra(pub, "agent_operator");
+ok("operator 侧 ssh_host 已掩码", str(get(get(oppub, "deploy", {}), "ssh_host", "")) == "********");
+let opt = get(oppub, "targets", []);
+let opt0 = {};
+if (len(opt) > 0) { opt0 = opt[0]; }
+ok("operator 侧 target ssh_host 已掩码", str(get(opt0, "ssh_host", "")) == "********");
+let revpub = redact.scrub_infra(pub, "agent_reviewer");
+ok("reviewer 可看 ssh_host", str(get(get(revpub, "deploy", {}), "ssh_host", "")) == "10.0.0.9");
+let relrec = { id: "rel-t1", stages: [{ env: "prod", host: "10.0.0.9", target: "生产" }] };
+let oprel = redact.scrub_infra(relrec, "agent_operator");
+ok("operator 侧发布 host 已掩码", str(get(get(oprel, "stages", [])[0], "host", "")) == "********");
+let masked = redact.scrub_infra(got, "agent_operator");
+let restored = redact.merge_secrets(masked, got);
+ok("回填恢复 ssh_host", str(get(get(restored, "deploy", {}), "ssh_host", "")) == "10.0.0.9");
+
 let back = redact.merge_secrets(pub, got);
 ok("回填恢复私钥路径", str(get(get(back, "deploy", {}), "ssh_key_path", "")) == "/app/.data/demo_key");
 ok("回填恢复 PIN", contains(str(get(get(back, "deploy", {}), "ssh_run_args", "")), "p1n2s3cr3t"));

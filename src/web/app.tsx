@@ -255,13 +255,13 @@ function OverviewPage({ role }: { role: string }) {
     setLoading(true)
     setError('')
     try {
-      setData(await API.overview())
+      setData(await API.overview(role))
     } catch (e: any) {
       setError(e.message || String(e))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [role])
 
   useEffect(() => {
     load()
@@ -397,14 +397,14 @@ function ProjectsPage({
     setLoading(true)
     setError('')
     try {
-      const page = await API.listProjects()
+      const page = await API.listProjects(undefined, role)
       setProjects(page.projects || [])
     } catch (e: any) {
       setError(e.message || String(e))
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [role])
 
   useEffect(() => {
     load()
@@ -1764,7 +1764,7 @@ function EditProjectModal({
 
   useEffect(() => {
     let alive = true
-    API.getProject(project.id)
+    API.getProject(project.id, role)
       .then((p) => {
         if (alive) setDraft(p)
       })
@@ -1777,7 +1777,7 @@ function EditProjectModal({
     return () => {
       alive = false
     }
-  }, [project.id])
+  }, [project.id, role])
 
   const patch = (next: Partial<Project>) => setDraft((d) => (d ? { ...d, ...next } : d))
   const patchBuild = (next: Partial<NonNullable<Project['build']>>) =>

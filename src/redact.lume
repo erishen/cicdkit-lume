@@ -158,6 +158,75 @@ export func redact_project(p) {
   return copy;
 }
 
+// ---------- 基础设施元数据按角色脱敏 ----------
+//
+// `ssh_host` / `ssh_user` / `last_release.host` / 部署记录的 `cluster` 不是口令，
+// 但同样是「服务器在哪、谁在管」的内网拓扑。项目读接口对所有登录用户都返回，
+// 操作员不需要用它们发版（发版只认 target 名）；只有终审/复核需要看原件。
+// 这里做的是「角色视图」而不是回填层：GET 时按角色删掉，PUT 仍用真值回填。
+let INFRA_KEYS = ["ssh_host", "ssh_user", "host", "cluster"];
+
+export func can_view_infra(role) {
+  let r = str(role);
+  return r == "human_admin" or r == "agent_reviewer" or r == "agent_reviewer_second";
+}
+
+func is_infra_key(k) {
+  let key = str(k);
+  let i = 0;
+  while (i < len(INFRA_KEYS)) {
+    if (INFRA_KEYS[i] == key) { return true; }
+    i = i + 1;
+  }
+  return false;
+}
+
+func scrub_infra_node(node) {
+  if (node == null) { return null; }
+
+  let km = try(() => keys(node));
+  if (km.err == null) {
+    let ks = km.ok;
+    let i = 0;
+    while (i < len(ks)) {
+      let k = str(ks[i]);
+      let child = get(node, k, null);
+      if (is_infra_key(k) and child != null and len(str(child)) > 0 and str(child) != MASK) {
+        put(node, k, MASK);
+      } else {
+        put(node, k, scrub_infra_node(child));
+      }
+      i = i + 1;
+    }
+    return node;
+  }
+
+  // 字符串在 Lume 里也有 len()，必须先区分，否则会被按 list 逐字符拆开。
+  let ss = try(() => substr(node, 0, 0));
+  if (ss.err == null) { return node; }
+
+  let ln = try(() => len(node));
+  if (ln.err == null) {
+    let out = [];
+    let i = 0;
+    while (i < len(node)) {
+      push(out, scrub_infra_node(node[i]));
+      i = i + 1;
+    }
+    return out;
+  }
+  return node;
+}
+
+// role 能看原件就直接返回原对象，避免无谓的深拷贝；否则拷贝后再抹。
+export func scrub_infra(v, role) {
+  if (can_view_infra(role)) { return v; }
+  if (v == null) { return null; }
+  let cp = try(() => json(stringify(v)));
+  if (cp.err != null) { return v; }
+  return scrub_infra_node(cp.ok);
+}
+
 // 保持私钥/口令不回退：空值或掩码 = 「不修改」，沿用 stored 里的真值。
 export func merge_secrets(incoming, stored) {
   if (incoming == null) { return stored; }
@@ -207,6 +276,14 @@ export func merge_secrets(incoming, stored) {
     if (len(kc) == 0 or kc == MASK) {
       if (od != null) { put(dep, "kubeconfig", str(get(od, "kubeconfig", ""))); }
     }
+    let host = str(get(dep, "ssh_host", ""));
+    if (len(host) == 0 or host == MASK) {
+      if (od != null) { put(dep, "ssh_host", str(get(od, "ssh_host", ""))); }
+    }
+    let user = str(get(dep, "ssh_user", ""));
+    if (len(user) == 0 or user == MASK) {
+      if (od != null) { put(dep, "ssh_user", str(get(od, "ssh_user", ""))); }
+    }
     let ra = str(get(dep, "ssh_run_args", ""));
     if (od != null) {
       put(dep, "ssh_run_args", restore_secret_env(ra, str(get(od, "ssh_run_args", ""))));
@@ -227,6 +304,14 @@ export func merge_secrets(incoming, stored) {
         let kc = str(get(t, "kubeconfig", ""));
         if (len(kc) == 0 or kc == MASK) {
           if (ot != null and i < len(ot)) { put(t, "kubeconfig", str(get(ot[i], "kubeconfig", ""))); }
+        }
+        let host = str(get(t, "ssh_host", ""));
+        if (len(host) == 0 or host == MASK) {
+          if (ot != null and i < len(ot)) { put(t, "ssh_host", str(get(ot[i], "ssh_host", ""))); }
+        }
+        let user = str(get(t, "ssh_user", ""));
+        if (len(user) == 0 or user == MASK) {
+          if (ot != null and i < len(ot)) { put(t, "ssh_user", str(get(ot[i], "ssh_user", ""))); }
         }
         let ra = str(get(t, "ssh_run_args", ""));
         if (ot != null and i < len(ot)) {

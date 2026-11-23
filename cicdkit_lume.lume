@@ -71,6 +71,7 @@ import "src/app_api.lume" as api;
 import "src/store.lume" as store;
 import "src/guard.lume" as guard;
 import "src/access.lume" as access;
+import "src/redact.lume" as redact;
 import "src/validate.lume" as validate;
 import "src/a2a.lume" as a2a;
 import "src/agent.lume" as agent;
@@ -176,6 +177,36 @@ func actor_of(req) {
   return "local";
 }
 
+// 当前请求实际生效的角色。身份模式优先；旧模式回退 ?role=，最后才用默认角色。
+// 只用于「响应视图」选择，不参与授权判定，所以不写审计。
+func viewer_role(req) {
+  let id = access.identity(req);
+  if (get(id, "enabled", false)) {
+    if (get(id, "ok", false)) { return str(get(id, "role", "")); }
+    return "";
+  }
+  let g = guard.role_any(req, "");
+  if (get(g, "allowed", false)) { return str(get(g, "role", "")); }
+  let def = env("CICD_DEFAULT_ROLE");
+  if (def != null and len(trim(str(def))) > 0) { return trim(str(def)); }
+  return "";
+}
+
+// 把基础设施元数据（ssh_host / ssh_user / host / cluster）按角色从响应里抹掉。
+// 支持 {status, body} 包装和裸对象/列表两种返回形状。
+func infra_response(req, r) {
+  if (r == null) { return r; }
+  let role = viewer_role(req);
+  let km = try(() => keys(r));
+  if (km.err != null) { return redact.scrub_infra(r, role); }
+  let body = get(r, "body", null);
+  if (body != null) {
+    put(r, "body", redact.scrub_infra(body, role));
+    return r;
+  }
+  return redact.scrub_infra(r, role);
+}
+
 
 // 所有闸门判定都留一条授权审计：谁（Basic Auth 用户）、用什么角色、
 // 对哪个资源/动作、放行还是拒绝。写失败不影响主流程，审计不能把业务卡死。
@@ -272,7 +303,7 @@ get "/api/version", (req) => {
 get "/api/overview", (req) => {
   let blocked = read_gate(req, "project-read", "read", "总览");
   if (blocked != null) { return blocked; }
-  return { status: 200, body: api.overview() };
+  return infra_response(req, { status: 200, body: api.overview() });
 };
 
 // ---------- Agent / Text2SQL（只读）----------
@@ -327,13 +358,13 @@ get "/api/projects", (req) => {
   let blocked = read_gate(req, "project-read", "read", "项目列表");
   if (blocked != null) { return blocked; }
   let page = api.project_list(qstr(req, "q", ""), qlimit(req, "limit", 200), qint(req, "offset", 0));
-  return { status: 200, body: page };
+  return infra_response(req, { status: 200, body: page });
 };
 
 post "/api/projects", (req) => {
   let gate = abac(req, "project-admin", "create", "新建项目", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "新建项目"); }
-  return api.project_create(body_of(req));
+  return infra_response(req, api.project_create(body_of(req)));
 };
 
 // 放在 /api/projects/:id 之前：静态段优先匹配（路由按注册顺序，先命中先返回）。
@@ -433,13 +464,13 @@ post "/api/projects/:id/rollback", (req) => {
 get "/api/projects/:id/release-plan", (req) => {
   let blocked = read_gate(req, "project-read", "read", "发布链路计划");
   if (blocked != null) { return blocked; }
-  return api.project_release_plan(str(get(req.params, "id", "")));
+  return infra_response(req, api.project_release_plan(str(get(req.params, "id", ""))));
 };
 
 get "/api/projects/:id/releases", (req) => {
   let blocked = read_gate(req, "deployment-read", "read", "发布链路列表");
   if (blocked != null) { return blocked; }
-  return api.project_release_list(str(get(req.params, "id", "")), qlimit(req, "limit", 20));
+  return infra_response(req, api.project_release_list(str(get(req.params, "id", "")), qlimit(req, "limit", 20)));
 };
 
 post "/api/projects/:id/release", (req) => {
@@ -459,13 +490,13 @@ post "/api/projects/:id/release", (req) => {
     let pg = abac(req, "deploy-prod", "promote", "生产发布确认", "human_admin");
     if (not get(pg, "allowed", false)) { return denied(pg, "生产发布确认"); }
   }
-  return api.project_release_start(str(get(req.params, "id", "")), body_of(req), actor_of(req));
+  return infra_response(req, api.project_release_start(str(get(req.params, "id", "")), body_of(req), actor_of(req)));
 };
 
 get "/api/releases/:id", (req) => {
   let blocked = read_gate(req, "deployment-read", "read", "发布链路详情");
   if (blocked != null) { return blocked; }
-  return api.release_get(str(get(req.params, "id", "")));
+  return infra_response(req, api.release_get(str(get(req.params, "id", ""))));
 };
 
 post "/api/releases/:id/advance", (req) => {
@@ -485,13 +516,13 @@ post "/api/releases/:id/advance", (req) => {
     let pg = abac(req, "deploy-prod", "promote", "生产发布确认", "human_admin");
     if (not get(pg, "allowed", false)) { return denied(pg, "生产发布确认"); }
   }
-  return api.release_advance(id, body_of(req), actor_of(req));
+  return infra_response(req, api.release_advance(id, body_of(req), actor_of(req)));
 };
 
 post "/api/releases/:id/cancel", (req) => {
   let gate = abac(req, "run-control", "cancel", "取消发布链路", "agent_operator");
   if (not get(gate, "allowed", false)) { return denied(gate, "取消发布链路"); }
-  return api.release_cancel(str(get(req.params, "id", "")), actor_of(req));
+  return infra_response(req, api.release_cancel(str(get(req.params, "id", "")), actor_of(req)));
 };
 
 // 脚手架生成：必须在 :action 之前注册，否则会被当成未知动作。
@@ -546,13 +577,13 @@ post "/api/projects/:id/:action", (req) => {
 get "/api/projects/:id", (req) => {
   let blocked = read_gate(req, "project-read", "read", "项目详情");
   if (blocked != null) { return blocked; }
-  return api.project_get(str(get(req.params, "id", "")));
+  return infra_response(req, api.project_get(str(get(req.params, "id", ""))));
 };
 
 put "/api/projects/:id", (req) => {
   let gate = abac(req, "project-admin", "update", "修改项目配置", "human_admin");
   if (not get(gate, "allowed", false)) { return denied(gate, "项目配置"); }
-  return api.project_put(str(get(req.params, "id", "")), body_of(req));
+  return infra_response(req, api.project_put(str(get(req.params, "id", "")), body_of(req)));
 };
 
 delete "/api/projects/:id", (req) => {
@@ -702,13 +733,13 @@ get "/api/environments/snapshot/:job", (req) => {
 get "/api/deployments", (req) => {
   let blocked = read_gate(req, "deployment-read", "read", "部署列表");
   if (blocked != null) { return blocked; }
-  return { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qlimit(req, "limit", 100), qint(req, "offset", 0)) };
+  return infra_response(req, { status: 200, body: api.deployment_list(qstr(req, "project_id", ""), qlimit(req, "limit", 100), qint(req, "offset", 0)) });
 };
 
 get "/api/deployments/:id", (req) => {
   let blocked = read_gate(req, "deployment-read", "read", "部署详情");
   if (blocked != null) { return blocked; }
-  return api.deployment_get(str(get(req.params, "id", "")));
+  return infra_response(req, api.deployment_get(str(get(req.params, "id", ""))));
 };
 
 post "/api/deployments/:id/diagnose", (req) => {

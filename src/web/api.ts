@@ -440,7 +440,7 @@ const roleQuery = (role?: string) => {
 export const API = {
   health: () => request<Health>('/api/health'),
   meta: () => request<Meta>('/api/meta'),
-  overview: () => request<Overview>('/api/overview'),
+  overview: (role?: string) => request<Overview>(`/api/overview${roleQuery(role)}`),
   auditAccess: (opts: { user?: string; resource?: string; since?: number; until?: number; limit?: number } = {}) => {
     const p = new URLSearchParams()
     if (opts.user) p.set('user', opts.user)
@@ -451,9 +451,12 @@ export const API = {
     return request<{ events: AccessEvent[] }>(`/api/audit/access?${p.toString()}`)
   },
 
-  listProjects: (q?: string) =>
-    request<ProjectPage>(`/api/projects?limit=200${q ? `&q=${encodeURIComponent(q)}` : ''}`),
-  getProject: (id: string) => request<Project>(`/api/projects/${encodeURIComponent(id)}`),
+  listProjects: (q?: string, role?: string) =>
+    request<ProjectPage>(
+      `/api/projects?limit=200${q ? `&q=${encodeURIComponent(q)}` : ''}${roleQuery(role).replace('?', '&')}`,
+    ),
+  getProject: (id: string, role?: string) =>
+    request<Project>(`/api/projects/${encodeURIComponent(id)}${roleQuery(role)}`),
   // 新建：id 可选，缺省由 name 净化得到；重名返回 409
   createProject: (project: Project, role?: string) =>
     request<Project>(`/api/projects${roleQuery(role)}`, {
