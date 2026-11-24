@@ -415,10 +415,10 @@ make remap         # 干跑：按 PATH_MAP 打印「旧路径 → 新路径（�
 make remap-apply   # 先备份 store.db 再落库
 ```
 
-`PATH_MAP` 是「旧前缀:新前缀」的逗号分隔列表，例如本机实际的迁移：
+`PATH_MAP` 是「旧前缀:新前缀」的逗号分隔列表，例如本机迁移（把 `<workspace-root>` 换成你自己的工作区根目录）：
 
 ```bash
-PATH_MAP="/app/data:$PWD/../cicdkit/data-docker,/workspace:$HOME/Workspace/CNB/individular-invest/work" \
+PATH_MAP="/app/data:$PWD/../cicdkit/data-docker,/workspace:$HOME/<workspace-root>/work" \
   LUME_DATA=./.data APPLY=1 ./vendor/lume/bin/lume scripts/remap_paths.lume
 ```
 

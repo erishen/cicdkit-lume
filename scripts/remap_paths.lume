@@ -8,7 +8,7 @@
 //
 // 用 PATH_MAP 给出「旧前缀:新前缀」的映射，多个映射用逗号分隔：
 //
-//   export PATH_MAP="/app/data:$PWD/../cicdkit/data-docker,/workspace:$HOME/Workspace/CNB/individular-invest/work"
+//   export PATH_MAP="/app/data:$PWD/../cicdkit/data-docker,/workspace:$HOME/<workspace-root>/work"
 //   LUME_DATA=./.data ./vendor/lume/bin/lume scripts/remap_paths.lume            # 干跑
 //   LUME_DATA=./.data APPLY=1 ./vendor/lume/bin/lume scripts/remap_paths.lume    # 落库
 //
